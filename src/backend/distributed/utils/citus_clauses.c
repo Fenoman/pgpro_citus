@@ -148,7 +148,7 @@ PartiallyEvaluateExpression(Node *expression,
 		{
 			return (Node *) expression_tree_mutator(expression,
 													PartiallyEvaluateExpression,
-													coordinatorEvaluationContext);
+													coordinatorEvaluationContext, 0);
 		}
 
 		if (FindNodeMatchingCheckFunction(expression, IsVariableExpression))
@@ -166,7 +166,7 @@ PartiallyEvaluateExpression(Node *expression,
 			 */
 			return (Node *) expression_tree_mutator(expression,
 													PartiallyEvaluateExpression,
-													coordinatorEvaluationContext);
+													coordinatorEvaluationContext, 0);
 		}
 
 		return (Node *) citus_evaluate_expr((Expr *) expression,
@@ -199,7 +199,7 @@ PartiallyEvaluateExpression(Node *expression,
 	{
 		return (Node *) expression_tree_mutator(expression,
 												PartiallyEvaluateExpression,
-												coordinatorEvaluationContext);
+												coordinatorEvaluationContext, 0);
 	}
 
 	return expression;
