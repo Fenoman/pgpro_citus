@@ -906,7 +906,7 @@ WrapUngroupedVarsInAnyValueAggregate(Node *expression, List *groupClauseList,
 	MemoryContext oldContext = MemoryContextSwitchTo(nodeContext);
 
 	Node *result = expression_tree_mutator(expression, AddAnyValueAggregates,
-										   &context);
+										   &context, 0);
 
 	MemoryContextSwitchTo(oldContext);
 
@@ -1002,7 +1002,7 @@ AddAnyValueAggregates(Node *node, AddAnyValueAggregatesContext *context)
 		}
 	}
 
-	return expression_tree_mutator(node, AddAnyValueAggregates, context);
+	return expression_tree_mutator(node, AddAnyValueAggregates, context, 0);
 }
 
 

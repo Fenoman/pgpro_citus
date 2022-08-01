@@ -1566,7 +1566,7 @@ MasterAggregateMutator(Node *originalNode, MasterAggregateWalkerContext *walkerC
 	else
 	{
 		newNode = expression_tree_mutator(originalNode, MasterAggregateMutator,
-										  (void *) walkerContext);
+										  (void *) walkerContext, 0);
 	}
 
 	return newNode;

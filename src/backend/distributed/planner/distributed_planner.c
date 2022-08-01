@@ -1301,7 +1301,7 @@ ResolveExternalParams(Node *inputNode, ParamListInfo boundParams)
 										   boundParams, 0);
 	}
 
-	return expression_tree_mutator(inputNode, ResolveExternalParams, boundParams);
+	return expression_tree_mutator(inputNode, ResolveExternalParams, boundParams, 0);
 }
 
 
