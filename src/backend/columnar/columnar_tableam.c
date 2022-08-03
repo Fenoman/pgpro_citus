@@ -1158,11 +1158,11 @@ columnar_vacuum_rel(Relation rel, VacuumParams *params,
 						new_rel_allvisible, nindexes > 0,
 						newRelFrozenXid, newRelminMxid, false);
 #endif
-	ExtVacReport *vac;
+	ExtVacReport vac;
 	pgstat_report_vacuum(RelationGetRelid(rel),
 						 rel->rd_rel->relisshared,
 						 Max(new_live_tuples, 0),
-						 0, vac);
+						 0, &vac);
 	pgstat_progress_end_command();
 }
 
