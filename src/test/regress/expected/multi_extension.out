@@ -419,20 +419,20 @@ SELECT prosrc FROM pg_proc WHERE proname = 'master_update_table_statistics' ORDE
 ALTER EXTENSION citus UPDATE TO '9.4-2';
 -- should see the old source code
 SELECT prosrc FROM pg_proc WHERE proname = 'master_update_table_statistics' ORDER BY 1;
-                                  prosrc
+                               prosrc
 ---------------------------------------------------------------------
-                                                                          +
- DECLARE                                                                  +
-         colocated_tables regclass[];                                     +
- BEGIN                                                                    +
-         SELECT get_colocated_table_array(relation) INTO colocated_tables;+
-         PERFORM                                                          +
-                 master_update_shard_statistics(shardid)                  +
-         FROM                                                             +
-                 pg_dist_shard                                            +
-         WHERE                                                            +
-                 logicalrelid = ANY (colocated_tables);                   +
- END;                                                                     +
+                                                                   +
+ DECLARE                                                           +
+  colocated_tables regclass[];                                     +
+ BEGIN                                                             +
+  SELECT get_colocated_table_array(relation) INTO colocated_tables;+
+  PERFORM                                                          +
+   master_update_shard_statistics(shardid)                         +
+  FROM                                                             +
+   pg_dist_shard                                                   +
+  WHERE                                                            +
+   logicalrelid = ANY (colocated_tables);                          +
+ END;                                                              +
 
 (1 row)
 
@@ -460,20 +460,20 @@ SELECT * FROM multi_extension.print_extension_changes();
 ALTER EXTENSION citus UPDATE TO '9.4-1';
 -- should see the old source code
 SELECT prosrc FROM pg_proc WHERE proname = 'master_update_table_statistics' ORDER BY 1;
-                                  prosrc
+                               prosrc
 ---------------------------------------------------------------------
-                                                                          +
- DECLARE                                                                  +
-         colocated_tables regclass[];                                     +
- BEGIN                                                                    +
-         SELECT get_colocated_table_array(relation) INTO colocated_tables;+
-         PERFORM                                                          +
-                 master_update_shard_statistics(shardid)                  +
-         FROM                                                             +
-                 pg_dist_shard                                            +
-         WHERE                                                            +
-                 logicalrelid = ANY (colocated_tables);                   +
- END;                                                                     +
+                                                                   +
+ DECLARE                                                           +
+  colocated_tables regclass[];                                     +
+ BEGIN                                                             +
+  SELECT get_colocated_table_array(relation) INTO colocated_tables;+
+  PERFORM                                                          +
+   master_update_shard_statistics(shardid)                         +
+  FROM                                                             +
+   pg_dist_shard                                                   +
+  WHERE                                                            +
+   logicalrelid = ANY (colocated_tables);                          +
+ END;                                                              +
 
 (1 row)
 
@@ -556,20 +556,20 @@ SELECT prosrc FROM pg_proc WHERE proname = 'master_update_table_statistics' ORDE
 ALTER EXTENSION citus UPDATE TO '9.5-2';
 -- should see the old source code
 SELECT prosrc FROM pg_proc WHERE proname = 'master_update_table_statistics' ORDER BY 1;
-                                  prosrc
+                               prosrc
 ---------------------------------------------------------------------
-                                                                          +
- DECLARE                                                                  +
-         colocated_tables regclass[];                                     +
- BEGIN                                                                    +
-         SELECT get_colocated_table_array(relation) INTO colocated_tables;+
-         PERFORM                                                          +
-                 master_update_shard_statistics(shardid)                  +
-         FROM                                                             +
-                 pg_dist_shard                                            +
-         WHERE                                                            +
-                 logicalrelid = ANY (colocated_tables);                   +
- END;                                                                     +
+                                                                   +
+ DECLARE                                                           +
+  colocated_tables regclass[];                                     +
+ BEGIN                                                             +
+  SELECT get_colocated_table_array(relation) INTO colocated_tables;+
+  PERFORM                                                          +
+   master_update_shard_statistics(shardid)                         +
+  FROM                                                             +
+   pg_dist_shard                                                   +
+  WHERE                                                            +
+   logicalrelid = ANY (colocated_tables);                          +
+ END;                                                              +
 
 (1 row)
 
@@ -597,20 +597,20 @@ SELECT * FROM multi_extension.print_extension_changes();
 ALTER EXTENSION citus UPDATE TO '9.5-1';
 -- should see the old source code
 SELECT prosrc FROM pg_proc WHERE proname = 'master_update_table_statistics' ORDER BY 1;
-                                  prosrc
+                               prosrc
 ---------------------------------------------------------------------
-                                                                          +
- DECLARE                                                                  +
-         colocated_tables regclass[];                                     +
- BEGIN                                                                    +
-         SELECT get_colocated_table_array(relation) INTO colocated_tables;+
-         PERFORM                                                          +
-                 master_update_shard_statistics(shardid)                  +
-         FROM                                                             +
-                 pg_dist_shard                                            +
-         WHERE                                                            +
-                 logicalrelid = ANY (colocated_tables);                   +
- END;                                                                     +
+                                                                   +
+ DECLARE                                                           +
+  colocated_tables regclass[];                                     +
+ BEGIN                                                             +
+  SELECT get_colocated_table_array(relation) INTO colocated_tables;+
+  PERFORM                                                          +
+   master_update_shard_statistics(shardid)                         +
+  FROM                                                             +
+   pg_dist_shard                                                   +
+  WHERE                                                            +
+   logicalrelid = ANY (colocated_tables);                          +
+ END;                                                              +
 
 (1 row)
 
@@ -724,6 +724,14 @@ SELECT * FROM multi_extension.print_extension_changes();
 
 -- recreate public schema, and recreate citus_tables in the public schema by default
 CREATE SCHEMA public;
+-- In PG15, public schema is owned by pg_database_owner role
+-- Relevant PG commit: b073c3ccd06e4cb845e121387a43faa8c68a7b62
+SHOW server_version \gset
+SELECT substring(:'server_version', '\d+')::int >= 15 AS server_version_ge_15
+\gset
+\if :server_version_ge_15
+ALTER SCHEMA public OWNER TO pg_database_owner;
+\endif
 GRANT ALL ON SCHEMA public TO public;
 ALTER EXTENSION citus UPDATE TO '9.5-1';
 ALTER EXTENSION citus UPDATE TO '10.0-4';
@@ -901,6 +909,16 @@ SELECT * FROM multi_extension.print_extension_changes();
                  | function worker_fix_partition_shard_index_names(regclass,text,text) void
 (4 rows)
 
+-- Snapshot of state at 10.2-5
+ALTER EXTENSION citus UPDATE TO '10.2-5';
+SELECT * FROM multi_extension.print_extension_changes();
+ previous_object | current_object
+---------------------------------------------------------------------
+(0 rows)
+
+-- Test downgrade to 10.2-4 from 10.2-5
+ALTER EXTENSION citus UPDATE TO '10.2-4';
+ALTER EXTENSION citus UPDATE TO '10.2-5';
 -- Make sure that we defined dependencies from all rel objects (tables,
 -- indexes, sequences ..) to columnar table access method ...
 SELECT pg_class.oid INTO columnar_schema_members
@@ -955,7 +973,7 @@ FROM
                                        | t
 (1 row)
 
--- Test downgrade to 10.2-4 from 11.0-1
+-- Test downgrade to 10.2-5 from 11.0-1
 ALTER EXTENSION citus UPDATE TO '11.0-1';
 SELECT
 	(metadata->>'partitioned_citus_table_exists_pre_11')::boolean as partitioned_citus_table_exists_pre_11,
@@ -969,7 +987,7 @@ FROM
 
 DELETE FROM pg_dist_partition WHERE logicalrelid = 'e_transactions'::regclass;
 DROP TABLE e_transactions;
-ALTER EXTENSION citus UPDATE TO '10.2-4';
+ALTER EXTENSION citus UPDATE TO '10.2-5';
 -- Should be empty result since upgrade+downgrade should be a no-op
 SELECT * FROM multi_extension.print_extension_changes();
  previous_object | current_object
@@ -1060,8 +1078,8 @@ SELECT * FROM multi_extension.print_extension_changes();
 ---------------------------------------------------------------------
 (0 rows)
 
--- Test downgrade to 11.0-3 from 11.1-1
-ALTER EXTENSION citus UPDATE TO '11.1-1';
+-- Test downgrade to 11.0-3 from 11.0-4
+ALTER EXTENSION citus UPDATE TO '11.0-4';
 ALTER EXTENSION citus UPDATE TO '11.0-3';
 -- Should be empty result since upgrade+downgrade should be a no-op
 SELECT * FROM multi_extension.print_extension_changes();
@@ -1069,39 +1087,90 @@ SELECT * FROM multi_extension.print_extension_changes();
 ---------------------------------------------------------------------
 (0 rows)
 
+-- Snapshot of state at 11.0-4
+ALTER EXTENSION citus UPDATE TO '11.0-4';
+SELECT * FROM multi_extension.print_extension_changes();
+ previous_object | current_object
+---------------------------------------------------------------------
+(0 rows)
+
+-- Test downgrade to 11.0-4 from 11.1-1
+ALTER EXTENSION citus UPDATE TO '11.1-1';
+ALTER EXTENSION citus UPDATE TO '11.0-4';
+-- Should be empty result since upgrade+downgrade should be a no-op
+SELECT * FROM multi_extension.print_extension_changes();
+ previous_object | current_object
+---------------------------------------------------------------------
+(0 rows)
+
+-- Test CREATE EXTENSION when Citus already exists but Citus_Columnar does not. Should skip
+CREATE EXTENSION IF NOT EXISTS citus;
+NOTICE:  extension "citus" already exists, skipping
+CREATE EXTENSION citus;
+ERROR:  extension "citus" already exists
 -- Snapshot of state at 11.1-1
 ALTER EXTENSION citus UPDATE TO '11.1-1';
 SELECT * FROM multi_extension.print_extension_changes();
-                                    previous_object                                     |                                           current_object
+                                                                                                                          previous_object                                                                                                                          |                                                                                                                                     current_object
 ---------------------------------------------------------------------
- access method columnar                                                                 |
- function alter_columnar_table_reset(regclass,boolean,boolean,boolean,boolean) void     |
- function alter_columnar_table_set(regclass,integer,integer,name,integer) void          |
- function citus_internal.columnar_ensure_am_depends_catalog() void                      |
- function citus_internal.downgrade_columnar_storage(regclass) void                      |
- function citus_internal.upgrade_columnar_storage(regclass) void                        |
- function columnar.columnar_handler(internal) table_am_handler                          |
- function worker_cleanup_job_schema_cache() void                                        |
- function worker_create_schema(bigint,text) void                                        |
- function worker_fetch_foreign_file(text,text,bigint,text[],integer[]) void             |
- function worker_fetch_partition_file(bigint,integer,integer,integer,text,integer) void |
- function worker_hash_partition_table(bigint,integer,text,text,oid,anyarray) void       |
- function worker_merge_files_into_table(bigint,integer,text[],text[]) void              |
- function worker_range_partition_table(bigint,integer,text,text,oid,anyarray) void      |
- function worker_repartition_cleanup(bigint) void                                       |
- schema columnar                                                                        |
- sequence columnar.storageid_seq                                                        |
- table columnar.chunk                                                                   |
- table columnar.chunk_group                                                             |
- table columnar.options                                                                 |
- table columnar.stripe                                                                  |
-                                                                                        | function citus_locks() SETOF record
-                                                                                        | function citus_split_shard_by_split_points(bigint,text[],integer[],citus.shard_transfer_mode) void
-                                                                                        | function worker_copy_table_to_node(regclass,integer) void
-                                                                                        | function worker_split_copy(bigint,split_copy_info[]) void
-                                                                                        | type split_copy_info
-                                                                                        | view citus_locks
-(27 rows)
+ access method columnar                                                                                                                                                                                                                                            |
+ function alter_columnar_table_reset(regclass,boolean,boolean,boolean,boolean) void                                                                                                                                                                                |
+ function alter_columnar_table_set(regclass,integer,integer,name,integer) void                                                                                                                                                                                     |
+ function citus_copy_shard_placement(bigint,text,integer,text,integer,boolean,citus.shard_transfer_mode) void                                                                                                                                                      |
+ function citus_internal.columnar_ensure_am_depends_catalog() void                                                                                                                                                                                                 |
+ function citus_internal.downgrade_columnar_storage(regclass) void                                                                                                                                                                                                 |
+ function citus_internal.upgrade_columnar_storage(regclass) void                                                                                                                                                                                                   |
+ function columnar.columnar_handler(internal) table_am_handler                                                                                                                                                                                                     |
+ function get_rebalance_progress() TABLE(sessionid integer, table_name regclass, shardid bigint, shard_size bigint, sourcename text, sourceport integer, targetname text, targetport integer, progress bigint, source_shard_size bigint, target_shard_size bigint) |
+ function isolate_tenant_to_new_shard(regclass,"any",text) bigint                                                                                                                                                                                                  |
+ function replicate_reference_tables() void                                                                                                                                                                                                                        |
+ function worker_cleanup_job_schema_cache() void                                                                                                                                                                                                                   |
+ function worker_create_schema(bigint,text) void                                                                                                                                                                                                                   |
+ function worker_fetch_foreign_file(text,text,bigint,text[],integer[]) void                                                                                                                                                                                        |
+ function worker_fetch_partition_file(bigint,integer,integer,integer,text,integer) void                                                                                                                                                                            |
+ function worker_hash_partition_table(bigint,integer,text,text,oid,anyarray) void                                                                                                                                                                                  |
+ function worker_merge_files_into_table(bigint,integer,text[],text[]) void                                                                                                                                                                                         |
+ function worker_range_partition_table(bigint,integer,text,text,oid,anyarray) void                                                                                                                                                                                 |
+ function worker_repartition_cleanup(bigint) void                                                                                                                                                                                                                  |
+ schema columnar                                                                                                                                                                                                                                                   |
+ sequence columnar.storageid_seq                                                                                                                                                                                                                                   |
+ table columnar.chunk                                                                                                                                                                                                                                              |
+ table columnar.chunk_group                                                                                                                                                                                                                                        |
+ table columnar.options                                                                                                                                                                                                                                            |
+ table columnar.stripe                                                                                                                                                                                                                                             |
+                                                                                                                                                                                                                                                                   | function citus_cleanup_orphaned_resources()
+                                                                                                                                                                                                                                                                   | function citus_copy_shard_placement(bigint,text,integer,text,integer,citus.shard_transfer_mode) void
+                                                                                                                                                                                                                                                                   | function citus_internal_delete_partition_metadata(regclass) void
+                                                                                                                                                                                                                                                                   | function citus_job_cancel(bigint) void
+                                                                                                                                                                                                                                                                   | function citus_job_wait(bigint,citus_job_status) void
+                                                                                                                                                                                                                                                                   | function citus_locks() SETOF record
+                                                                                                                                                                                                                                                                   | function citus_rebalance_start(name,boolean,citus.shard_transfer_mode) bigint
+                                                                                                                                                                                                                                                                   | function citus_rebalance_stop() void
+                                                                                                                                                                                                                                                                   | function citus_rebalance_wait() void
+                                                                                                                                                                                                                                                                   | function citus_split_shard_by_split_points(bigint,text[],integer[],citus.shard_transfer_mode) void
+                                                                                                                                                                                                                                                                   | function create_distributed_table_concurrently(regclass,text,citus.distribution_type,text,integer) void
+                                                                                                                                                                                                                                                                   | function get_rebalance_progress() TABLE(sessionid integer, table_name regclass, shardid bigint, shard_size bigint, sourcename text, sourceport integer, targetname text, targetport integer, progress bigint, source_shard_size bigint, target_shard_size bigint, operation_type text)
+                                                                                                                                                                                                                                                                   | function isolate_tenant_to_new_shard(regclass,"any",text,citus.shard_transfer_mode) bigint
+                                                                                                                                                                                                                                                                   | function replicate_reference_tables(citus.shard_transfer_mode) void
+                                                                                                                                                                                                                                                                   | function worker_copy_table_to_node(regclass,integer) void
+                                                                                                                                                                                                                                                                   | function worker_split_copy(bigint,text,split_copy_info[]) void
+                                                                                                                                                                                                                                                                   | function worker_split_shard_release_dsm() void
+                                                                                                                                                                                                                                                                   | function worker_split_shard_replication_setup(split_shard_info[]) SETOF replication_slot_info
+                                                                                                                                                                                                                                                                   | sequence pg_dist_background_job_job_id_seq
+                                                                                                                                                                                                                                                                   | sequence pg_dist_background_task_task_id_seq
+                                                                                                                                                                                                                                                                   | sequence pg_dist_cleanup_recordid_seq
+                                                                                                                                                                                                                                                                   | sequence pg_dist_operationid_seq
+                                                                                                                                                                                                                                                                   | table pg_dist_background_job
+                                                                                                                                                                                                                                                                   | table pg_dist_background_task
+                                                                                                                                                                                                                                                                   | table pg_dist_background_task_depend
+                                                                                                                                                                                                                                                                   | table pg_dist_cleanup
+                                                                                                                                                                                                                                                                   | type citus_job_status
+                                                                                                                                                                                                                                                                   | type citus_task_status
+                                                                                                                                                                                                                                                                   | type replication_slot_info
+                                                                                                                                                                                                                                                                   | type split_copy_info
+                                                                                                                                                                                                                                                                   | type split_shard_info
+                                                                                                                                                                                                                                                                   | view citus_locks
+(57 rows)
 
 DROP TABLE multi_extension.prev_objects, multi_extension.extension_diff;
 -- show running version
@@ -1452,6 +1521,66 @@ SELECT count(*) FROM pg_stat_activity WHERE application_name = 'Citus Maintenanc
      1
 (1 row)
 
+-- confirm that we can create a distributed table concurrently on an empty node
+DROP EXTENSION citus;
+CREATE EXTENSION citus;
+CREATE TABLE test (x int, y int);
+INSERT INTO test VALUES (1,2);
+SET citus.shard_replication_factor TO 1;
+SET citus.defer_drop_after_shard_split TO off;
+SELECT create_distributed_table_concurrently('test','x');
+NOTICE:  relation test does not have a REPLICA IDENTITY or PRIMARY KEY
+DETAIL:  UPDATE and DELETE commands on the relation will error out during create_distributed_table_concurrently unless there is a REPLICA IDENTITY or PRIMARY KEY. INSERT commands will still work.
+ create_distributed_table_concurrently
+---------------------------------------------------------------------
+
+(1 row)
+
+DROP TABLE test;
+TRUNCATE pg_dist_node;
+-- confirm that we can create a distributed table on an empty node
+CREATE TABLE test (x int, y int);
+INSERT INTO test VALUES (1,2);
+SET citus.shard_replication_factor TO 1;
+SELECT create_distributed_table('test','x');
+NOTICE:  Copying data from local table...
+NOTICE:  copying the data has completed
+DETAIL:  The local data in the table is no longer visible, but is still on disk.
+HINT:  To remove the local data, run: SELECT truncate_local_data_after_distributing_table($$public.test$$)
+ create_distributed_table
+---------------------------------------------------------------------
+
+(1 row)
+
+DROP TABLE test;
+TRUNCATE pg_dist_node;
+-- confirm that we can create a reference table on an empty node
+CREATE TABLE test (x int, y int);
+INSERT INTO test VALUES (1,2);
+SELECT create_reference_table('test');
+NOTICE:  Copying data from local table...
+NOTICE:  copying the data has completed
+DETAIL:  The local data in the table is no longer visible, but is still on disk.
+HINT:  To remove the local data, run: SELECT truncate_local_data_after_distributing_table($$public.test$$)
+ create_reference_table
+---------------------------------------------------------------------
+
+(1 row)
+
+DROP TABLE test;
+TRUNCATE pg_dist_node;
+-- confirm that we can create a local table on an empty node
+CREATE TABLE test (x int, y int);
+INSERT INTO test VALUES (1,2);
+SELECT citus_add_local_table_to_metadata('test');
+ citus_add_local_table_to_metadata
+---------------------------------------------------------------------
+
+(1 row)
+
+DROP TABLE test;
+DROP EXTENSION citus;
+CREATE EXTENSION citus;
 DROP TABLE version_mismatch_table;
 DROP SCHEMA multi_extension;
 ERROR:  cannot drop schema multi_extension because other objects depend on it

@@ -10,6 +10,8 @@
 
 #include "postgres.h"
 
+#include "pg_version_compat.h"
+
 #include "distributed/pg_version_constants.h"
 
 #include "access/heapam.h"
@@ -59,6 +61,7 @@ static char * CreateCreateOrAlterRoleCommand(const char *roleName,
 											 CreateRoleStmt *createRoleStmt,
 											 AlterRoleStmt *alterRoleStmt);
 static DefElem * makeDefElemInt(char *name, int value);
+static DefElem * makeDefElemBool(char *name, bool value);
 static List * GenerateRoleOptionsList(HeapTuple tuple);
 static List * GenerateGrantRoleStmtsFromOptions(RoleSpec *roleSpec, List *options);
 static List * GenerateGrantRoleStmtsOfRole(Oid roleid);
@@ -88,7 +91,7 @@ bool EnableAlterRoleSetPropagation = true;
  * was unable to find the role that was the target of the statement.
  */
 List *
-AlterRoleStmtObjectAddress(Node *node, bool missing_ok)
+AlterRoleStmtObjectAddress(Node *node, bool missing_ok, bool isPostprocess)
 {
 	AlterRoleStmt *stmt = castNode(AlterRoleStmt, node);
 	return RoleSpecToObjectAddress(stmt->role, missing_ok);
@@ -101,7 +104,7 @@ AlterRoleStmtObjectAddress(Node *node, bool missing_ok)
  * was unable to find the role that was the target of the statement.
  */
 List *
-AlterRoleSetStmtObjectAddress(Node *node, bool missing_ok)
+AlterRoleSetStmtObjectAddress(Node *node, bool missing_ok, bool isPostprocess)
 {
 	AlterRoleSetStmt *stmt = castNode(AlterRoleSetStmt, node);
 	return RoleSpecToObjectAddress(stmt->role, missing_ok);
@@ -137,7 +140,7 @@ RoleSpecToObjectAddress(RoleSpec *role, bool missing_ok)
 List *
 PostprocessAlterRoleStmt(Node *node, const char *queryString)
 {
-	List *addresses = GetObjectAddressListFromParseTree(node, false);
+	List *addresses = GetObjectAddressListFromParseTree(node, false, true);
 
 	/*  the code-path only supports a single object */
 	Assert(list_length(addresses) == 1);
@@ -212,7 +215,7 @@ PreprocessAlterRoleSetStmt(Node *node, const char *queryString,
 		return NIL;
 	}
 
-	List *addresses = GetObjectAddressListFromParseTree(node, false);
+	List *addresses = GetObjectAddressListFromParseTree(node, false, false);
 
 	/*  the code-path only supports a single object */
 	Assert(list_length(addresses) == 1);
@@ -454,13 +457,13 @@ GenerateRoleOptionsList(HeapTuple tuple)
 	Form_pg_authid role = ((Form_pg_authid) GETSTRUCT(tuple));
 
 	List *options = NIL;
-	options = lappend(options, makeDefElemInt("superuser", role->rolsuper));
-	options = lappend(options, makeDefElemInt("createdb", role->rolcreatedb));
-	options = lappend(options, makeDefElemInt("createrole", role->rolcreaterole));
-	options = lappend(options, makeDefElemInt("inherit", role->rolinherit));
-	options = lappend(options, makeDefElemInt("canlogin", role->rolcanlogin));
-	options = lappend(options, makeDefElemInt("isreplication", role->rolreplication));
-	options = lappend(options, makeDefElemInt("bypassrls", role->rolbypassrls));
+	options = lappend(options, makeDefElemBool("superuser", role->rolsuper));
+	options = lappend(options, makeDefElemBool("createdb", role->rolcreatedb));
+	options = lappend(options, makeDefElemBool("createrole", role->rolcreaterole));
+	options = lappend(options, makeDefElemBool("inherit", role->rolinherit));
+	options = lappend(options, makeDefElemBool("canlogin", role->rolcanlogin));
+	options = lappend(options, makeDefElemBool("isreplication", role->rolreplication));
+	options = lappend(options, makeDefElemBool("bypassrls", role->rolbypassrls));
 	options = lappend(options, makeDefElemInt("connectionlimit", role->rolconnlimit));
 
 	/* load password from heap tuple, use NULL if not set */
@@ -613,6 +616,16 @@ static DefElem *
 makeDefElemInt(char *name, int value)
 {
 	return makeDefElem(name, (Node *) makeInteger(value), -1);
+}
+
+
+/*
+ * makeDefElemBool creates a DefElem with boolean typed value with -1 as location.
+ */
+static DefElem *
+makeDefElemBool(char *name, bool value)
+{
+	return makeDefElem(name, (Node *) makeBoolean(value), -1);
 }
 
 
@@ -1188,7 +1201,7 @@ ConfigGenericNameCompare(const void *a, const void *b)
  * to true.
  */
 List *
-CreateRoleStmtObjectAddress(Node *node, bool missing_ok)
+CreateRoleStmtObjectAddress(Node *node, bool missing_ok, bool isPostprocess)
 {
 	CreateRoleStmt *stmt = castNode(CreateRoleStmt, node);
 	Oid roleOid = get_role_oid(stmt->role, missing_ok);

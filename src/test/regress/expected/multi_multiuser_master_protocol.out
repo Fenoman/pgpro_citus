@@ -161,6 +161,7 @@ SELECT master_create_distributed_table('trivial_postgres', 'id', 'append');
 (1 row)
 
 GRANT ALL ON trivial_postgres TO full_access;
+GRANT CREATE ON SCHEMA public TO full_access;
 SET ROLE full_access;
 CREATE TABLE trivial_full_access (id int);
 SELECT master_create_distributed_table('trivial_full_access', 'id', 'append');
@@ -309,6 +310,7 @@ DROP TABLE stage_postgres;
 CREATE SCHEMA multiuser_schema;
 CREATE TABLE multiuser_schema.hash_table(a int, b int);
 CREATE TABLE multiuser_schema.reference_table(a int, b int);
+SET citus.shard_replication_factor TO 1;
 SELECT create_distributed_table('multiuser_schema.hash_table', 'a', colocate_with => 'none');
  create_distributed_table
 ---------------------------------------------------------------------
@@ -323,14 +325,10 @@ ORDER BY nodename, nodeport, shardid;
  nodename  | nodeport | shardid | success | result
 ---------------------------------------------------------------------
  localhost |    57637 |  109090 | t       | f
- localhost |    57637 |  109091 | t       | f
  localhost |    57637 |  109092 | t       | f
- localhost |    57637 |  109093 | t       | f
- localhost |    57638 |  109090 | t       | f
  localhost |    57638 |  109091 | t       | f
- localhost |    57638 |  109092 | t       | f
  localhost |    57638 |  109093 | t       | f
-(8 rows)
+(4 rows)
 
 -- grant select
 GRANT SELECT ON ALL TABLES IN SCHEMA multiuser_schema TO read_access;
@@ -340,14 +338,10 @@ ORDER BY nodename, nodeport, shardid;
  nodename  | nodeport | shardid | success | result
 ---------------------------------------------------------------------
  localhost |    57637 |  109090 | t       | t
- localhost |    57637 |  109091 | t       | t
  localhost |    57637 |  109092 | t       | t
- localhost |    57637 |  109093 | t       | t
- localhost |    57638 |  109090 | t       | t
  localhost |    57638 |  109091 | t       | t
- localhost |    57638 |  109092 | t       | t
  localhost |    57638 |  109093 | t       | t
-(8 rows)
+(4 rows)
 
 -- distribute the second table
 SELECT create_reference_table('multiuser_schema.reference_table');
@@ -378,14 +372,10 @@ ORDER BY nodename, nodeport, shardid;
  nodename  | nodeport | shardid | success | result
 ---------------------------------------------------------------------
  localhost |    57637 |  109095 | t       | f
- localhost |    57637 |  109096 | t       | f
  localhost |    57637 |  109097 | t       | f
- localhost |    57637 |  109098 | t       | f
- localhost |    57638 |  109095 | t       | f
  localhost |    57638 |  109096 | t       | f
- localhost |    57638 |  109097 | t       | f
  localhost |    57638 |  109098 | t       | f
-(8 rows)
+(4 rows)
 
 -- grant select again, verify it is granted
 GRANT SELECT ON ALL TABLES IN SCHEMA multiuser_schema TO read_access;
@@ -394,17 +384,13 @@ ORDER BY nodename, nodeport, shardid;
  nodename  | nodeport | shardid | success | result
 ---------------------------------------------------------------------
  localhost |    57637 |  109095 | t       | t
- localhost |    57637 |  109096 | t       | t
  localhost |    57637 |  109097 | t       | t
- localhost |    57637 |  109098 | t       | t
- localhost |    57638 |  109095 | t       | t
  localhost |    57638 |  109096 | t       | t
- localhost |    57638 |  109097 | t       | t
  localhost |    57638 |  109098 | t       | t
-(8 rows)
+(4 rows)
 
 -- verify isolate tenant carries grants
-SELECT isolate_tenant_to_new_shard('multiuser_schema.hash_table', 5);
+SELECT isolate_tenant_to_new_shard('multiuser_schema.hash_table', 5, shard_transfer_mode => 'block_writes');
  isolate_tenant_to_new_shard
 ---------------------------------------------------------------------
                       109100
@@ -414,19 +400,13 @@ SELECT * FROM run_command_on_placements('multiuser_schema.hash_table', $$ select
 ORDER BY nodename, nodeport, shardid;
  nodename  | nodeport | shardid | success | result
 ---------------------------------------------------------------------
- localhost |    57637 |  109091 | t       | t
  localhost |    57637 |  109092 | t       | t
- localhost |    57637 |  109093 | t       | t
  localhost |    57637 |  109099 | t       | t
  localhost |    57637 |  109100 | t       | t
  localhost |    57637 |  109101 | t       | t
  localhost |    57638 |  109091 | t       | t
- localhost |    57638 |  109092 | t       | t
  localhost |    57638 |  109093 | t       | t
- localhost |    57638 |  109099 | t       | t
- localhost |    57638 |  109100 | t       | t
- localhost |    57638 |  109101 | t       | t
-(12 rows)
+(6 rows)
 
 -- revoke select
 REVOKE SELECT ON ALL TABLES IN SCHEMA multiuser_schema FROM read_access;
@@ -434,19 +414,13 @@ SELECT * FROM run_command_on_placements('multiuser_schema.hash_table', $$ select
 ORDER BY nodename, nodeport, shardid;
  nodename  | nodeport | shardid | success | result
 ---------------------------------------------------------------------
- localhost |    57637 |  109091 | t       | f
  localhost |    57637 |  109092 | t       | f
- localhost |    57637 |  109093 | t       | f
  localhost |    57637 |  109099 | t       | f
  localhost |    57637 |  109100 | t       | f
  localhost |    57637 |  109101 | t       | f
  localhost |    57638 |  109091 | t       | f
- localhost |    57638 |  109092 | t       | f
  localhost |    57638 |  109093 | t       | f
- localhost |    57638 |  109099 | t       | f
- localhost |    57638 |  109100 | t       | f
- localhost |    57638 |  109101 | t       | f
-(12 rows)
+(6 rows)
 
 -- test multi-schema grants
 CREATE SCHEMA multiuser_second_schema;
@@ -462,19 +436,13 @@ SELECT * FROM run_command_on_placements('multiuser_schema.hash_table', $$ select
 ORDER BY nodename, nodeport, shardid;
  nodename  | nodeport | shardid | success | result
 ---------------------------------------------------------------------
- localhost |    57637 |  109091 | t       | t
  localhost |    57637 |  109092 | t       | t
- localhost |    57637 |  109093 | t       | t
  localhost |    57637 |  109099 | t       | t
  localhost |    57637 |  109100 | t       | t
  localhost |    57637 |  109101 | t       | t
  localhost |    57638 |  109091 | t       | t
- localhost |    57638 |  109092 | t       | t
  localhost |    57638 |  109093 | t       | t
- localhost |    57638 |  109099 | t       | t
- localhost |    57638 |  109100 | t       | t
- localhost |    57638 |  109101 | t       | t
-(12 rows)
+(6 rows)
 
 SELECT * FROM run_command_on_placements('multiuser_second_schema.hash_table', $$ select has_table_privilege('read_access', '%s', 'select') $$)
 ORDER BY nodename, nodeport, shardid;
@@ -483,12 +451,10 @@ ORDER BY nodename, nodeport, shardid;
  localhost |    57637 |  109102 | t       | t
  localhost |    57637 |  109103 | t       | t
  localhost |    57637 |  109104 | t       | t
- localhost |    57637 |  109105 | t       | t
- localhost |    57638 |  109102 | t       | t
- localhost |    57638 |  109103 | t       | t
- localhost |    57638 |  109104 | t       | t
+ localhost |    57637 |  109106 | t       | t
  localhost |    57638 |  109105 | t       | t
-(8 rows)
+ localhost |    57638 |  109107 | t       | t
+(6 rows)
 
 -- revoke from multiple schemas, verify result
 REVOKE SELECT ON ALL TABLES IN SCHEMA multiuser_schema, multiuser_second_schema FROM read_access;
@@ -496,19 +462,13 @@ SELECT * FROM run_command_on_placements('multiuser_schema.hash_table', $$ select
 ORDER BY nodename, nodeport, shardid;
  nodename  | nodeport | shardid | success | result
 ---------------------------------------------------------------------
- localhost |    57637 |  109091 | t       | f
  localhost |    57637 |  109092 | t       | f
- localhost |    57637 |  109093 | t       | f
  localhost |    57637 |  109099 | t       | f
  localhost |    57637 |  109100 | t       | f
  localhost |    57637 |  109101 | t       | f
  localhost |    57638 |  109091 | t       | f
- localhost |    57638 |  109092 | t       | f
  localhost |    57638 |  109093 | t       | f
- localhost |    57638 |  109099 | t       | f
- localhost |    57638 |  109100 | t       | f
- localhost |    57638 |  109101 | t       | f
-(12 rows)
+(6 rows)
 
 SELECT * FROM run_command_on_placements('multiuser_second_schema.hash_table', $$ select has_table_privilege('read_access', '%s', 'select') $$)
 ORDER BY nodename, nodeport, shardid;
@@ -517,12 +477,10 @@ ORDER BY nodename, nodeport, shardid;
  localhost |    57637 |  109102 | t       | f
  localhost |    57637 |  109103 | t       | f
  localhost |    57637 |  109104 | t       | f
- localhost |    57637 |  109105 | t       | f
- localhost |    57638 |  109102 | t       | f
- localhost |    57638 |  109103 | t       | f
- localhost |    57638 |  109104 | t       | f
+ localhost |    57637 |  109106 | t       | f
  localhost |    57638 |  109105 | t       | f
-(8 rows)
+ localhost |    57638 |  109107 | t       | f
+(6 rows)
 
 DROP SCHEMA multiuser_schema CASCADE;
 NOTICE:  drop cascades to 3 other objects

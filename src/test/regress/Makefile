@@ -16,15 +16,19 @@ MAKEFILE_DIR := $(dir $(realpath $(firstword $(MAKEFILE_LIST))))
 export PATH := $(MAKEFILE_DIR)/bin:$(PATH)
 export PG_REGRESS_DIFF_OPTS = -dU10 -w
 # Use lower isolation test timeout, the 5 minute default is waaay too long for
-# us so we use 20 seconds instead. We should detect blockages very quickly and
-# the queries we run are also very fast.
-export PGISOLATIONTIMEOUT = 20
+# us so we use 60 seconds instead. We should detect blockages very quickly and
+# most queries that we run are also very fast. So fast even that 60 seconds is
+# usually too long. However, any commands involving logical replication can be
+# quite slow, especially shard splits and especially on CI. So we still keep
+# this value at the pretty high 60 seconds because even those slow commands are
+# definitly stuck when they take longer than that.
+export PGISOLATIONTIMEOUT = 60
 
 ##
 ## Citus regression support
 ##
 MULTI_INSTALLDIR=$(CURDIR)/tmp_check/install
-pg_regress_multi_check = $(PERL) $(citus_abs_srcdir)/pg_regress_multi.pl --pgxsdir="$(pgxsdir)" --bindir="$(bindir)" --libdir="$(libdir)" --majorversion="$(MAJORVERSION)" --postgres-builddir="$(postgres_abs_builddir)"  --postgres-srcdir="$(postgres_abs_srcdir)"
+pg_regress_multi_check = $(PERL) $(citus_abs_srcdir)/pg_regress_multi.pl --pgxsdir="$(pgxsdir)" --bindir="$(bindir)" --libdir="$(libdir)" --majorversion="$(MAJORVERSION)" --postgres-builddir="$(postgres_abs_builddir)" --postgres-srcdir="$(postgres_abs_srcdir)" --citus_abs_srcdir="$(citus_abs_srcdir)"
 MULTI_REGRESS_OPTS = --inputdir=$(citus_abs_srcdir) $(pg_regress_locale_flags) --launcher="$(citus_abs_srcdir)/log_test_times"
 
 pg_upgrade_check = $(citus_abs_srcdir)/citus_tests/upgrade/pg_upgrade_test.py
@@ -34,10 +38,7 @@ arbitrary_config_check = $(citus_abs_srcdir)/citus_tests/arbitrary_configs/citus
 template_isolation_files = $(shell find $(citus_abs_srcdir)/spec/ -name '*.spec')
 generated_isolation_files = $(patsubst $(citus_abs_srcdir)/spec/%,$(citus_abs_srcdir)/build/specs/%,$(template_isolation_files))
 
-# Test input and expected files.  These are created by pg_regress itself, so we
-# don't have a rule to create them.  We do need rules to clean them however.
-input_files := $(patsubst $(citus_abs_srcdir)/input/%.source,sql/%.sql, $(wildcard $(citus_abs_srcdir)/input/*.source))
-output_files := $(patsubst $(citus_abs_srcdir)/output/%.source,expected/%.out, $(wildcard $(citus_abs_srcdir)/output/*.source))
+vanilla_diffs_file = $(citus_abs_srcdir)/pg_vanilla_outputs/$(MAJORVERSION)/regression.diffs
 
 # have make check actually run all tests, but keep check-full as an
 # intermediate, for muscle memory backward compatibility.
@@ -188,8 +189,9 @@ check-isolation-base: all  $(isolation_test_files)
 	$(pg_regress_multi_check) --load-extension=citus --isolationtester \
 	-- $(MULTI_REGRESS_OPTS) --inputdir=$(citus_abs_srcdir)/build --schedule=$(citus_abs_srcdir)/base_isolation_schedule $(EXTRA_TESTS)
 
+# ci takes regression.diffs output from another location, so copy diffs file at the end.
 check-vanilla:
-	$(pg_regress_multi_check) --vanillatest --vanilla-dev
+	$(pg_regress_multi_check) --vanillatest || (cp $(vanilla_diffs_file) $(citus_abs_srcdir)/regression.diffs)
 
 check-multi-mx: all
 	$(pg_regress_multi_check) --load-extension=citus \
@@ -268,7 +270,7 @@ clean-upgrade-artifacts:
 	rm -rf $(citus_abs_srcdir)/tmp_citus_tarballs/ $(citus_abs_srcdir)/tmp_citus_upgrade/ /tmp/citus_copy/
 
 clean distclean maintainer-clean:
-	rm -f $(output_files) $(input_files)
+	rm -rf input/ output/
 	rm -rf tmp_check/
 	rm -rf tmp_citus_test/
 

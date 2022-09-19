@@ -16,7 +16,6 @@ README.*	conflict-marker-size=32
 
 # Test output files that contain extra whitespace
 *.out					-whitespace
-src/test/regress/output/*.source	-whitespace
 
 # These files are maintained or generated elsewhere.  We take them as is.
 configure				-whitespace
@@ -28,6 +27,7 @@ configure				-whitespace
 src/backend/distributed/utils/citus_outfuncs.c -citus-style
 src/backend/distributed/deparser/ruleutils_13.c -citus-style
 src/backend/distributed/deparser/ruleutils_14.c -citus-style
+src/backend/distributed/deparser/ruleutils_15.c -citus-style
 src/backend/distributed/commands/index_pg_source.c -citus-style
 
 src/include/distributed/citus_nodes.h -citus-style

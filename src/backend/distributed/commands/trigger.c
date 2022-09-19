@@ -53,6 +53,9 @@ static void ExtractDropStmtTriggerAndRelationName(DropStmt *dropTriggerStmt,
 												  char **relationName);
 static void ErrorIfDropStmtDropsMultipleTriggers(DropStmt *dropTriggerStmt);
 static int16 GetTriggerTypeById(Oid triggerId);
+#if (PG_VERSION_NUM < PG_VERSION_15)
+static void ErrorOutIfCloneTrigger(Oid tgrelid, const char *tgname);
+#endif
 
 
 /* GUC that overrides trigger checks for distributed tables and reference tables */
@@ -182,8 +185,17 @@ GetExplicitTriggerIdList(Oid relationId)
 		 * Note that we mark truncate trigger that we create on citus tables as
 		 * internal. Hence, below we discard citus_truncate_trigger as well as
 		 * the implicit triggers created by postgres for foreign key validation.
+		 *
+		 * Pre PG15, tgisinternal is true for a "child" trigger on a partition
+		 * cloned from the trigger on the parent.
+		 * In PG15, tgisinternal is false in that case. However, we don't want to
+		 * create this trigger on the partition since it will create a conflict
+		 * when we try to attach the partition to the parent table:
+		 * ERROR: trigger "..." for relation "{partition_name}" already exists
+		 * Hence we add an extra check on whether the parent id is invalid to
+		 * make sure this is not a child trigger
 		 */
-		if (!triggerForm->tgisinternal)
+		if (!triggerForm->tgisinternal && (triggerForm->tgparentid == InvalidOid))
 		{
 			triggerIdList = lappend_oid(triggerIdList, triggerForm->oid);
 		}
@@ -224,7 +236,7 @@ PostprocessCreateTriggerStmt(Node *node, const char *queryString)
 	EnsureCoordinator();
 	ErrorOutForTriggerIfNotSupported(relationId);
 
-	List *objectAddresses = GetObjectAddressListFromParseTree(node, missingOk);
+	List *objectAddresses = GetObjectAddressListFromParseTree(node, missingOk, true);
 
 	/*  the code-path only supports a single object */
 	Assert(list_length(objectAddresses) == 1);
@@ -246,7 +258,7 @@ PostprocessCreateTriggerStmt(Node *node, const char *queryString)
  * was set to true.
  */
 List *
-CreateTriggerStmtObjectAddress(Node *node, bool missingOk)
+CreateTriggerStmtObjectAddress(Node *node, bool missingOk, bool isPostprocess)
 {
 	CreateTrigStmt *createTriggerStmt = castNode(CreateTrigStmt, node);
 
@@ -307,6 +319,40 @@ CreateTriggerEventExtendNames(CreateTrigStmt *createTriggerStmt, char *schemaNam
 
 	char **relationSchemaName = &(relation->schemaname);
 	SetSchemaNameIfNotExist(relationSchemaName, schemaName);
+}
+
+
+/*
+ * PreprocessAlterTriggerRenameStmt is called before a ALTER TRIGGER RENAME
+ * command has been executed by standard process utility. This function errors
+ * out if we are trying to rename a child trigger on a partition of a distributed
+ * table. In PG15, this is not allowed anyway.
+ */
+List *
+PreprocessAlterTriggerRenameStmt(Node *node, const char *queryString,
+								 ProcessUtilityContext processUtilityContext)
+{
+#if (PG_VERSION_NUM < PG_VERSION_15)
+	RenameStmt *renameTriggerStmt = castNode(RenameStmt, node);
+	Assert(renameTriggerStmt->renameType == OBJECT_TRIGGER);
+
+	RangeVar *relation = renameTriggerStmt->relation;
+
+	bool missingOk = false;
+	Oid relationId = RangeVarGetRelid(relation, ALTER_TRIGGER_LOCK_MODE, missingOk);
+
+	if (!IsCitusTable(relationId))
+	{
+		return NIL;
+	}
+
+	EnsureCoordinator();
+	ErrorOutForTriggerIfNotSupported(relationId);
+
+	ErrorOutIfCloneTrigger(relationId, renameTriggerStmt->subname);
+#endif
+
+	return NIL;
 }
 
 
@@ -600,6 +646,64 @@ ErrorOutForTriggerIfNotSupported(Oid relationId)
 
 	/* we always support triggers on citus local tables */
 }
+
+
+#if (PG_VERSION_NUM < PG_VERSION_15)
+
+/*
+ * ErrorOutIfCloneTrigger is a helper function to error
+ * out if we are trying to rename a child trigger on a
+ * partition of a distributed table.
+ * A lot of this code is borrowed from PG15 because
+ * renaming clone triggers isn't allowed in PG15 anymore.
+ */
+static void
+ErrorOutIfCloneTrigger(Oid tgrelid, const char *tgname)
+{
+	HeapTuple tuple;
+	ScanKeyData key[2];
+
+	Relation tgrel = table_open(TriggerRelationId, RowExclusiveLock);
+
+	/*
+	 * Search for the trigger to modify.
+	 */
+	ScanKeyInit(&key[0],
+				Anum_pg_trigger_tgrelid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(tgrelid));
+	ScanKeyInit(&key[1],
+				Anum_pg_trigger_tgname,
+				BTEqualStrategyNumber, F_NAMEEQ,
+				CStringGetDatum(tgname));
+	SysScanDesc tgscan = systable_beginscan(tgrel, TriggerRelidNameIndexId, true,
+											NULL, 2, key);
+
+	if (HeapTupleIsValid(tuple = systable_getnext(tgscan)))
+	{
+		Form_pg_trigger trigform = (Form_pg_trigger) GETSTRUCT(tuple);
+
+		/*
+		 * If the trigger descends from a trigger on a parent partitioned
+		 * table, reject the rename.
+		 * Appended shard ids to find the trigger on the partition's shards
+		 * are not correct. Hence we would fail to find the trigger on the
+		 * partition's shard.
+		 */
+		if (OidIsValid(trigform->tgparentid))
+		{
+			ereport(ERROR, (
+						errmsg(
+							"cannot rename child triggers on distributed partitions")));
+		}
+	}
+
+	systable_endscan(tgscan);
+	table_close(tgrel, RowExclusiveLock);
+}
+
+
+#endif
 
 
 /*

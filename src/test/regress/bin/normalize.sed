@@ -43,6 +43,11 @@ s/"citus_local_table_([0-9]+)_[0-9]+"/"citus_local_table_\1_xxxxxxx"/g
 # normalize relation oid suffix for the truncate triggers created by citus
 s/truncate_trigger_[0-9]+/truncate_trigger_xxxxxxx/g
 
+# shard move subscription and publication names contain the oid of the
+# table owner, which can change across runs
+s/(citus_shard_(move|split)_subscription_)[0-9]+/\1xxxxxxx/g
+s/(citus_shard_(move|split)_(slot|publication)_)[0-9]+_[0-9]+/\1xxxxxxx_xxxxxxx/g
+
 # In foreign_key_restriction_enforcement, normalize shard names
 s/"(on_update_fkey_table_|fkey_)[0-9]+"/"\1xxxxxxx"/g
 
@@ -110,6 +115,17 @@ s/(ERROR: |WARNING: |error:) server closed the connection unexpectedly/\1 connec
 /^\s*before or while processing the request.$/d
 /^\s*connection not open$/d
 #endif /* (PG_VERSION_NUM >= PG_VERSION_13) && (PG_VERSION_NUM < PG_VERSION_14) */
+
+# Changed outputs after minor bump to PG14.5 and PG13.8
+s/(ERROR: |WARNING: |error:) invalid socket/\1 connection not open/g
+
+# Extra outputs after minor bump to PG14.5 and PG13.8
+/^\s*invalid socket$/d
+
+# pg15 changes
+s/is not a PostgreSQL server process/is not a PostgreSQL backend process/g
+s/ AS "\?column\?"//g
+s/".*\.(.*)": (found .* removable)/"\1": \2/g
 
 # intermediate_results
 s/(ERROR.*)pgsql_job_cache\/([0-9]+_[0-9]+_[0-9]+)\/(.*).data/\1pgsql_job_cache\/xx_x_xxx\/\3.data/g
@@ -198,23 +214,10 @@ s/^(ERROR:  child table is missing constraint "\w+)_([0-9])+"/\1_xxxxxx"/g
     }
 }
 
-# normalize for random waits for CREATE INDEX CONCURRENTLY isolation tests.
-# <waiting ...> outputs can be in separate lines, or on the same line, and hence
-# we have a slightly more complex pattern.
-# All the flaky tests use a index name that starts with `flaky` so we limit the
-# normalization using that pattern.
-/CREATE INDEX CONCURRENTLY flaky/ {
-	N; s/ <waiting ...>//
-}
-
-# Remove completion lines in isolation tests for CREATE INDEX CONCURRENTLY commands.
-# This is needed because the commands that are executed on the shards can block each other
-# for a small window of time and we may see the completion output in different lines.
-/step s2-flaky.* <... completed>/d
-
 # normalize long table shard name errors for alter_table_set_access_method and alter_distributed_table
 s/^(ERROR:  child table is missing constraint "\w+)_([0-9])+"/\1_xxxxxx"/g
 s/^(DEBUG:  the name of the shard \(abcde_01234567890123456789012345678901234567890_f7ff6612)_([0-9])+/\1_xxxxxx/g
+s/^(ERROR:  cannot distribute relation: numeric_negative_scale)_([0-9]+)/\1_xxxxxx"/g
 
 # normalize long index name errors for multi_index_statements
 s/^(ERROR:  The index name \(test_index_creation1_p2020_09_26)_([0-9])+_(tenant_id_timeperiod_idx)/\1_xxxxxx_\3/g
@@ -280,3 +283,8 @@ s/^(DETAIL:  "[a-z\ ]+ )pg_temp_[0-9]+(\..*" will be created only locally)$/\1pg
 # will be replaced with
 #   WARNING:  "function func(bigint)" has dependency on unsupported object "schema pg_temp_xxx"
 s/^(WARNING|ERROR)(:  "[a-z\ ]+ .*" has dependency on unsupported object) "schema pg_temp_[0-9]+"$/\1\2 "schema pg_temp_xxx"/g
+
+# remove jobId's from the messages of the background rebalancer
+s/^ERROR:  A rebalance is already running as job [0-9]+$/ERROR:  A rebalance is already running as job xxx/g
+s/^NOTICE:  Scheduled ([0-9]+) moves as job [0-9]+$/NOTICE:  Scheduled \1 moves as job xxx/g
+s/^HINT: (.*) job_id = [0-9]+ (.*)$/HINT: \1 job_id = xxx \2/g

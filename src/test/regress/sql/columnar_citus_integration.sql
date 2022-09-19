@@ -428,11 +428,13 @@ SELECT create_distributed_table('weird_col_explain', 'bbbbbbbbbbbbbbbbbbbbbbbbb\
 EXPLAIN (COSTS OFF, SUMMARY OFF)
 SELECT * FROM weird_col_explain;
 
+\set VERBOSITY terse
 EXPLAIN (COSTS OFF, SUMMARY OFF)
 SELECT *, "bbbbbbbbbbbbbbbbbbbbbbbbb\!bbbb'bbbbbbbbbbbbbbbbbbbbb''bbbbbbbb"
 FROM weird_col_explain
 WHERE "bbbbbbbbbbbbbbbbbbbbbbbbb\!bbbb'bbbbbbbbbbbbbbbbbbbbb''bbbbbbbb" * 2 >
       "aaaaaaaaaaaa$aaaaaa$$aaaaaaaaaaaaaaaaaaaaaaaaaaaaa'aaaaaaaa'$a'!";
+\set VERBOSITY default
 
 -- should not project any columns
 EXPLAIN (COSTS OFF, SUMMARY OFF)

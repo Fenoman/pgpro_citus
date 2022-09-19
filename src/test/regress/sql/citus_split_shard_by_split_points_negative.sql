@@ -23,19 +23,7 @@ SELECT create_distributed_table('table_to_split','id');
 SELECT nodeid AS worker_1_node FROM pg_dist_node WHERE nodeport=:worker_1_port \gset
 SELECT nodeid AS worker_2_node FROM pg_dist_node WHERE nodeport=:worker_2_port \gset
 
--- UDF fails for any other shard_transfer_mode other than block_writes.
-SELECT citus_split_shard_by_split_points(
-	49761302,
-	ARRAY['50'],
-	ARRAY[101, 201],
-    'auto');
-
-SELECT citus_split_shard_by_split_points(
-	49761302,
-	ARRAY['50'],
-	ARRAY[101, 201],
-    'force_logical');
-
+-- UDF fails for any other shard_transfer_mode other than block_writes/force_logical/auto.
 SELECT citus_split_shard_by_split_points(
 	49761302,
 	ARRAY['50'],
@@ -104,7 +92,7 @@ FROM shard_ranges;
 
 -- UDF fails where source shard cannot be split further i.e min and max range is equal.
 -- Create a Shard where range cannot be split further
-SELECT isolate_tenant_to_new_shard('table_to_split', 1);
+SELECT isolate_tenant_to_new_shard('table_to_split', 1, shard_transfer_mode => 'block_writes');
 SELECT citus_split_shard_by_split_points(
 	49761305,
 	ARRAY['-1073741826'],
@@ -121,3 +109,8 @@ SELECT citus_split_shard_by_split_points(
 	51261400,
 	ARRAY['-1073741826'],
 	ARRAY[:worker_1_node, :worker_2_node]);
+
+--BEGIN : Cleanup
+\c - postgres - :master_port
+DROP SCHEMA "citus_split_shard_by_split_points_negative" CASCADE;
+--END : Cleanup

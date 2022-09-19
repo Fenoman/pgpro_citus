@@ -32,13 +32,17 @@
 #include "catalog/pg_type.h"
 #include "distributed/citus_depended_object.h"
 #include "distributed/metadata_cache.h"
+#include "distributed/commands.h"
 #include "distributed/listutils.h"
 #include "distributed/log_utils.h"
 #include "distributed/shared_library_init.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/parsenodes.h"
+#include "parser/parse_type.h"
+#include "storage/large_object.h"
 #include "utils/lsyscache.h"
+#include "utils/syscache.h"
 
 /*
  * GUC hides any objects, which depends on citus extension, from pg meta class queries,
@@ -48,6 +52,9 @@ bool HideCitusDependentObjects = false;
 
 static Node * CreateCitusDependentObjectExpr(int pgMetaTableVarno, int pgMetaTableOid);
 static List * GetCitusDependedObjectArgs(int pgMetaTableVarno, int pgMetaTableOid);
+static bool AlterRoleSetStatementContainsAll(Node *node);
+static bool HasDropCommandViolatesOwnership(Node *node);
+static bool AnyObjectViolatesOwnership(DropStmt *dropStmt);
 
 /*
  * IsPgLocksTable returns true if RTE is pg_locks table.
@@ -307,4 +314,182 @@ GetCitusDependedObjectArgs(int pgMetaTableVarno, int pgMetaTableOid)
 						  varType, -1, InvalidOid, 0);
 
 	return list_make2((Node *) metaTableOidConst, (Node *) oidVar);
+}
+
+
+/*
+ * DistOpsValidityState returns validation state for given dist ops.
+ */
+DistOpsValidationState
+DistOpsValidityState(Node *node, const DistributeObjectOps *ops)
+{
+	if (ops && ops->operationType == DIST_OPS_CREATE)
+	{
+		/*
+		 * We should not validate CREATE statements because no address exists
+		 * here yet.
+		 */
+		return NoAddressResolutionRequired;
+	}
+	else if (AlterRoleSetStatementContainsAll(node))
+	{
+		/*
+		 * We should not validate 'ALTER ROLE ALL [SET|UNSET] because for the role ALL
+		 * AlterRoleSetStmtObjectAddress returns an invalid address even though it should not.
+		 */
+		return NoAddressResolutionRequired;
+	}
+	else if (HasDropCommandViolatesOwnership(node))
+	{
+		/*
+		 * found object with an invalid ownership, PG will complain if there is any object
+		 * with an invalid ownership.
+		 */
+		return HasObjectWithInvalidOwnership;
+	}
+
+	if (ops && ops->address)
+	{
+		bool missingOk = true;
+		bool isPostprocess = false;
+		List *objectAddresses = ops->address(node, missingOk, isPostprocess);
+		ObjectAddress *objectAddress = NULL;
+		foreach_ptr(objectAddress, objectAddresses)
+		{
+			if (OidIsValid(objectAddress->objectId))
+			{
+				/* found one valid object */
+				return HasAtLeastOneValidObject;
+			}
+		}
+
+		/* no valid objects */
+		return HasNoneValidObject;
+	}
+	else
+	{
+		/* if the object doesn't have address defined, we donot validate */
+		return NoAddressResolutionRequired;
+	}
+}
+
+
+/*
+ * DistOpsInValidState returns true if given state is valid to execute
+ * preprocess and qualify steps.
+ */
+bool
+DistOpsInValidState(DistOpsValidationState distOpsValidationState)
+{
+	return distOpsValidationState == HasAtLeastOneValidObject || distOpsValidationState ==
+		   NoAddressResolutionRequired;
+}
+
+
+/*
+ * AlterRoleSetStatementContainsAll returns true if the statement is a
+ * ALTER ROLE ALL (SET / RESET).
+ */
+static bool
+AlterRoleSetStatementContainsAll(Node *node)
+{
+	if (node == NULL)
+	{
+		return false;
+	}
+
+	if (nodeTag(node) == T_AlterRoleSetStmt)
+	{
+		/* rolespec is null for the role 'ALL' */
+		AlterRoleSetStmt *alterRoleSetStmt = castNode(AlterRoleSetStmt, node);
+
+		return alterRoleSetStmt->role == NULL;
+	}
+
+	return false;
+}
+
+
+/*
+ * HasDropCommandViolatesOwnership returns true if any object in the given
+ * statement violates object ownership.
+ *
+ * Currently there is only one test which fails due to object ownership.
+ * The command that is failing is DROP. If in the future we hit other
+ * commands like this, we should expand this function.
+ */
+static bool
+HasDropCommandViolatesOwnership(Node *node)
+{
+	if (!IsA(node, DropStmt))
+	{
+		return false;
+	}
+
+	DropStmt *dropStmt = castNode(DropStmt, node);
+	if (AnyObjectViolatesOwnership(dropStmt))
+	{
+		return true;
+	}
+
+	return false;
+}
+
+
+/*
+ * AnyObjectViolatesOwnership return true if given object in stmt violates ownership.
+ */
+static bool
+AnyObjectViolatesOwnership(DropStmt *dropStmt)
+{
+	volatile ObjectAddress objectAddress = { 0 };
+	Relation relation = NULL;
+	bool objectViolatesOwnership = false;
+	ObjectType objectType = dropStmt->removeType;
+	bool missingOk = dropStmt->missing_ok;
+
+	Node *object = NULL;
+	foreach_ptr(object, dropStmt->objects)
+	{
+		PG_TRY();
+		{
+			objectAddress = get_object_address(objectType, object,
+											   &relation, AccessShareLock, missingOk);
+
+
+			if (OidIsValid(objectAddress.objectId))
+			{
+				/*
+				 * if object violates ownership, check_object_ownership will throw error.
+				 */
+				check_object_ownership(GetUserId(),
+									   objectType,
+									   objectAddress,
+									   object, relation);
+			}
+		}
+		PG_CATCH();
+		{
+			if (OidIsValid(objectAddress.objectId))
+			{
+				/* ownership violation */
+				objectViolatesOwnership = true;
+			}
+		}
+		PG_END_TRY();
+
+		if (relation != NULL)
+		{
+			relation_close(relation, AccessShareLock);
+			relation = NULL;
+		}
+
+		/* we found ownership violation, so can return here */
+		if (objectViolatesOwnership)
+		{
+			return true;
+		}
+	}
+
+	return false;
 }

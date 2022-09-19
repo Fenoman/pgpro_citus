@@ -151,6 +151,11 @@ List *
 PreprocessGrantOnSchemaStmt(Node *node, const char *queryString,
 							ProcessUtilityContext processUtilityContext)
 {
+	if (!ShouldPropagate())
+	{
+		return NIL;
+	}
+
 	GrantStmt *stmt = castNode(GrantStmt, node);
 	Assert(stmt->objtype == OBJECT_SCHEMA);
 
@@ -184,7 +189,7 @@ PreprocessGrantOnSchemaStmt(Node *node, const char *queryString,
  * the object of the CreateSchemaStmt. Errors if missing_ok is false.
  */
 List *
-CreateSchemaStmtObjectAddress(Node *node, bool missing_ok)
+CreateSchemaStmtObjectAddress(Node *node, bool missing_ok, bool isPostprocess)
 {
 	CreateSchemaStmt *stmt = castNode(CreateSchemaStmt, node);
 
@@ -214,7 +219,7 @@ CreateSchemaStmtObjectAddress(Node *node, bool missing_ok)
  * the object of the RenameStmt. Errors if missing_ok is false.
  */
 List *
-AlterSchemaRenameStmtObjectAddress(Node *node, bool missing_ok)
+AlterSchemaRenameStmtObjectAddress(Node *node, bool missing_ok, bool isPostprocess)
 {
 	RenameStmt *stmt = castNode(RenameStmt, node);
 	Assert(stmt->renameType == OBJECT_SCHEMA);

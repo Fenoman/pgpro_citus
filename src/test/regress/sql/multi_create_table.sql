@@ -260,10 +260,11 @@ DROP TABLE shard_count_table, shard_count_table_2;
 -- ensure there is no colocation group with 9 shards
 SELECT count(*) FROM pg_dist_colocation WHERE shardcount = 9;
 SET citus.shard_count TO 9;
+SET citus.shard_replication_factor TO 1;
 
 CREATE TABLE shard_split_table (a int, b int);
 SELECT create_distributed_table ('shard_split_table', 'a');
-SELECT 1 FROM isolate_tenant_to_new_shard('shard_split_table', 5);
+SELECT 1 FROM isolate_tenant_to_new_shard('shard_split_table', 5, shard_transfer_mode => 'block_writes');
 
 -- show the difference in pg_dist_colocation and citus_tables shard counts
 SELECT

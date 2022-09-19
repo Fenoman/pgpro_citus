@@ -159,6 +159,7 @@ PG_FUNCTION_INFO_V1(worker_record_sequence_dependency);
  * or regular users as long as the regular user owns the input object.
  */
 PG_FUNCTION_INFO_V1(citus_internal_add_partition_metadata);
+PG_FUNCTION_INFO_V1(citus_internal_delete_partition_metadata);
 PG_FUNCTION_INFO_V1(citus_internal_add_shard_metadata);
 PG_FUNCTION_INFO_V1(citus_internal_add_placement_metadata);
 PG_FUNCTION_INFO_V1(citus_internal_update_placement_metadata);
@@ -1212,6 +1213,24 @@ DistributionDeleteCommand(const char *schemaName, const char *tableName)
 
 
 /*
+ * DistributionDeleteMetadataCommand returns a query to delete pg_dist_partition
+ * metadata from a worker node for a given table.
+ */
+char *
+DistributionDeleteMetadataCommand(Oid relationId)
+{
+	StringInfo deleteCommand = makeStringInfo();
+	char *qualifiedRelationName = generate_qualified_relation_name(relationId);
+
+	appendStringInfo(deleteCommand,
+					 "SELECT pg_catalog.citus_internal_delete_partition_metadata(%s)",
+					 quote_literal_cstr(qualifiedRelationName));
+
+	return deleteCommand->data;
+}
+
+
+/*
  * TableOwnerResetCommand generates a commands that can be executed
  * to reset the table owner.
  */
@@ -1580,10 +1599,10 @@ GetAttributeTypeOid(Oid relationId, AttrNumber attnum)
  * attribute of the relationId.
  */
 void
-GetDependentSequencesWithRelation(Oid relationId, List **attnumList,
-								  List **dependentSequenceList, AttrNumber attnum)
+GetDependentSequencesWithRelation(Oid relationId, List **seqInfoList,
+								  AttrNumber attnum)
 {
-	Assert(*attnumList == NIL && *dependentSequenceList == NIL);
+	Assert(*seqInfoList == NIL);
 
 	List *attrdefResult = NIL;
 	List *attrdefAttnumResult = NIL;
@@ -1620,8 +1639,25 @@ GetDependentSequencesWithRelation(Oid relationId, List **attnumList,
 			deprec->refobjsubid != 0 &&
 			deprec->deptype == DEPENDENCY_AUTO)
 		{
+			/*
+			 * We are going to generate corresponding SequenceInfo
+			 * in the following loop.
+			 */
 			attrdefResult = lappend_oid(attrdefResult, deprec->objid);
 			attrdefAttnumResult = lappend_int(attrdefAttnumResult, deprec->refobjsubid);
+		}
+		else if (deprec->deptype == DEPENDENCY_AUTO &&
+				 deprec->refobjsubid != 0 &&
+				 deprec->classid == RelationRelationId &&
+				 get_rel_relkind(deprec->objid) == RELKIND_SEQUENCE)
+		{
+			SequenceInfo *seqInfo = (SequenceInfo *) palloc(sizeof(SequenceInfo));
+
+			seqInfo->sequenceOid = deprec->objid;
+			seqInfo->attributeNumber = deprec->refobjsubid;
+			seqInfo->isNextValDefault = false;
+
+			*seqInfoList = lappend(*seqInfoList, seqInfo);
 		}
 	}
 
@@ -1646,9 +1682,13 @@ GetDependentSequencesWithRelation(Oid relationId, List **attnumList,
 
 		if (list_length(sequencesFromAttrDef) == 1)
 		{
-			*dependentSequenceList = list_concat(*dependentSequenceList,
-												 sequencesFromAttrDef);
-			*attnumList = lappend_int(*attnumList, attrdefAttnum);
+			SequenceInfo *seqInfo = (SequenceInfo *) palloc(sizeof(SequenceInfo));
+
+			seqInfo->sequenceOid = linitial_oid(sequencesFromAttrDef);
+			seqInfo->attributeNumber = attrdefAttnum;
+			seqInfo->isNextValDefault = true;
+
+			*seqInfoList = lappend(*seqInfoList, seqInfo);
 		}
 	}
 }
@@ -2070,6 +2110,7 @@ GetObjectsForGrantStmt(ObjectType objectType, Oid objectId)
 
 		/* enterprise supported object types */
 		case OBJECT_FUNCTION:
+		case OBJECT_AGGREGATE:
 		case OBJECT_PROCEDURE:
 		{
 			ObjectWithArgs *owa = ObjectWithArgsFromOid(objectId);
@@ -2252,11 +2293,15 @@ GenerateGrantOnFunctionQueriesFromAclItem(Oid functionOid, AclItem *aclItem)
 		{
 			objectType = OBJECT_PROCEDURE;
 		}
+		else if (prokind == PROKIND_AGGREGATE)
+		{
+			objectType = OBJECT_AGGREGATE;
+		}
 		else
 		{
 			ereport(ERROR, (errmsg("unsupported prokind"),
 							errdetail("GRANT commands on procedures are propagated only "
-									  "for procedures and functions.")));
+									  "for procedures, functions, and aggregates.")));
 		}
 
 		char *query = DeparseTreeNode((Node *) GenerateGrantStmtForRights(
@@ -3170,6 +3215,35 @@ EnsurePartitionMetadataIsSane(Oid relationId, char distributionMethod, int coloc
 							   "as the replication model.",
 							   REPLICATION_MODEL_STREAMING, REPLICATION_MODEL_2PC)));
 	}
+}
+
+
+/*
+ * citus_internal_delete_partition_metadata is an internal UDF to
+ * delete a row in pg_dist_partition.
+ */
+Datum
+citus_internal_delete_partition_metadata(PG_FUNCTION_ARGS)
+{
+	CheckCitusVersion(ERROR);
+
+	PG_ENSURE_ARGNOTNULL(0, "relation");
+	Oid relationId = PG_GETARG_OID(0);
+
+	/* only owner of the table (or superuser) is allowed to add the Citus metadata */
+	EnsureTableOwner(relationId);
+
+	/* we want to serialize all the metadata changes to this table */
+	LockRelationOid(relationId, ShareUpdateExclusiveLock);
+
+	if (!ShouldSkipMetadataChecks())
+	{
+		EnsureCoordinatorInitiatedOperation();
+	}
+
+	DeletePartitionRow(relationId);
+
+	PG_RETURN_VOID();
 }
 
 

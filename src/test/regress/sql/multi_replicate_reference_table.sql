@@ -233,6 +233,30 @@ WHERE colocationid IN
 
 DROP TABLE replicate_reference_table_commit;
 
+-- exercise reference table replication in create_distributed_table_concurrently
+SELECT citus_remove_node('localhost', :worker_2_port);
+CREATE TABLE replicate_reference_table_cdtc(column1 int);
+SELECT create_reference_table('replicate_reference_table_cdtc');
+SELECT citus_add_node('localhost', :worker_2_port);
+
+-- required for create_distributed_table_concurrently
+SELECT 1 FROM citus_set_coordinator_host('localhost', :master_port);
+SET citus.shard_replication_factor TO 1;
+
+CREATE TABLE distributed_table_cdtc(column1 int primary key);
+SELECT create_distributed_table_concurrently('distributed_table_cdtc', 'column1');
+
+RESET citus.shard_replication_factor;
+SELECT citus_remove_node('localhost', :master_port);
+
+SELECT
+    shardid, shardstate, shardlength, nodename, nodeport
+FROM
+    pg_dist_shard_placement_view
+WHERE
+    nodeport = :worker_2_port
+ORDER BY shardid, nodeport;
+DROP TABLE replicate_reference_table_cdtc, distributed_table_cdtc;
 
 -- test adding new node + upgrading another hash distributed table to reference table + creating new reference table in TRANSACTION
 SELECT master_remove_node('localhost', :worker_2_port);
@@ -505,11 +529,36 @@ ORDER BY 1,4,5;
 
 SELECT 1 FROM master_remove_node('localhost', :worker_2_port);
 
-CREATE TABLE ref_table(a int);
+CREATE TABLE ref_table(id bigserial PRIMARY KEY, a int);
+CREATE INDEX ON ref_table (a);
 SELECT create_reference_table('ref_table');
-INSERT INTO ref_table SELECT * FROM generate_series(1, 10);
+INSERT INTO ref_table(a) SELECT * FROM generate_series(1, 10);
 
-SELECT 1 FROM master_add_node('localhost', :worker_2_port);
+-- verify direct call to citus_copy_shard_placement errors if target node is not yet added
+SELECT citus_copy_shard_placement(
+           (SELECT shardid FROM pg_dist_shard WHERE logicalrelid='ref_table'::regclass::oid),
+           'localhost', :worker_1_port,
+           'localhost', :worker_2_port,
+           transfer_mode := 'block_writes');
+
+-- verify direct call to citus_copy_shard_placement errors if target node is secondary
+SELECT citus_add_secondary_node('localhost', :worker_2_port, 'localhost', :worker_1_port);
+SELECT citus_copy_shard_placement(
+           (SELECT shardid FROM pg_dist_shard WHERE logicalrelid='ref_table'::regclass::oid),
+           'localhost', :worker_1_port,
+           'localhost', :worker_2_port,
+           transfer_mode := 'block_writes');
+SELECT citus_remove_node('localhost', :worker_2_port);
+
+-- verify direct call to citus_copy_shard_placement errors if target node is inactive
+SELECT 1 FROM master_add_inactive_node('localhost', :worker_2_port);
+SELECT citus_copy_shard_placement(
+           (SELECT shardid FROM pg_dist_shard WHERE logicalrelid='ref_table'::regclass::oid),
+           'localhost', :worker_1_port,
+           'localhost', :worker_2_port,
+           transfer_mode := 'block_writes');
+
+SELECT 1 FROM master_activate_node('localhost', :worker_2_port);
 
 -- verify we cannot replicate reference tables in a transaction modifying pg_dist_node
 BEGIN;
@@ -540,8 +589,8 @@ ROLLBACK;
 --
 BEGIN;
 SELECT count(*) FROM ref_table;
-SELECT replicate_reference_tables();
-INSERT INTO ref_table VALUES (11);
+SELECT replicate_reference_tables('block_writes');
+INSERT INTO ref_table(a) VALUES (11);
 SELECT count(*), sum(a) FROM ref_table;
 UPDATE ref_table SET a = a + 1;
 SELECT sum(a) FROM ref_table;
@@ -592,7 +641,7 @@ SELECT count(*) - :ref_table_placements FROM pg_dist_shard_placement WHERE shard
 
 SELECT min(result) = max(result) AS consistent FROM run_command_on_placements('ref_table', 'SELECT sum(a) FROM %s');
 
--- test that metadata is synced when master_copy_shard_placement replicates
+-- test that metadata is synced when citus_copy_shard_placement replicates
 -- reference table shards
 SET citus.replicate_reference_tables_on_activate TO off;
 SELECT 1 FROM master_remove_node('localhost', :worker_2_port);
@@ -600,22 +649,30 @@ SELECT 1 FROM master_add_node('localhost', :worker_2_port);
 
 SET citus.shard_replication_factor TO 1;
 
-SELECT master_copy_shard_placement(
+SELECT citus_copy_shard_placement(
            :ref_table_shard,
            'localhost', :worker_1_port,
            'localhost', :worker_2_port,
-           do_repair := false,
            transfer_mode := 'block_writes');
 
 SELECT result::int - :ref_table_placements
 FROM run_command_on_workers('SELECT count(*) FROM pg_dist_placement a, pg_dist_shard b, pg_class c WHERE a.shardid=b.shardid AND b.logicalrelid=c.oid AND c.relname=''ref_table''')
 WHERE nodeport=:worker_1_port;
 
+-- test that we can use non-blocking rebalance
+SELECT 1 FROM master_remove_node('localhost', :worker_2_port);
+SELECT 1 FROM master_add_node('localhost', :worker_2_port);
+
+SELECT rebalance_table_shards(shard_transfer_mode := 'force_logical');
+
 -- test that metadata is synced on replicate_reference_tables
 SELECT 1 FROM master_remove_node('localhost', :worker_2_port);
 SELECT 1 FROM master_add_node('localhost', :worker_2_port);
 
+-- detects correctly that referecence table doesn't have replica identity
 SELECT replicate_reference_tables();
+-- allows force_logical
+SELECT replicate_reference_tables('force_logical');
 
 SELECT result::int - :ref_table_placements
 FROM run_command_on_workers('SELECT count(*) FROM pg_dist_placement a, pg_dist_shard b, pg_class c WHERE a.shardid=b.shardid AND b.logicalrelid=c.oid AND c.relname=''ref_table''')
@@ -630,7 +687,7 @@ SELECT create_distributed_table('dist_table', 'a');
 INSERT INTO dist_table SELECT i, i * i FROM generate_series(1, 20) i;
 
 TRUNCATE ref_table;
-INSERT INTO ref_table SELECT 2 * i FROM generate_series(1, 5) i;
+INSERT INTO ref_table(a) SELECT 2 * i FROM generate_series(1, 5) i;
 
 \c - - - :worker_1_port
 
@@ -662,6 +719,21 @@ DROP TABLE test;
 CREATE TABLE test (x int, y int references ref(a));
 SELECT create_distributed_table('test','x');
 END;
+
+-- verify the split fails if we still need to replicate reference tables
+SELECT citus_remove_node('localhost', :worker_2_port);
+SELECT create_distributed_table('test','x');
+SELECT citus_add_node('localhost', :worker_2_port);
+SELECT
+  citus_split_shard_by_split_points(shardid,
+                                    ARRAY[(shardminvalue::int + (shardmaxvalue::int - shardminvalue::int)/2)::text],
+                                    ARRAY[nodeid, nodeid],
+                                    'force_logical')
+FROM
+  pg_dist_shard, pg_dist_node
+WHERE
+  logicalrelid = 'replicate_reference_table.test'::regclass AND nodename = 'localhost' AND nodeport = :worker_2_port
+ORDER BY shardid LIMIT 1;
 
 -- test adding an invalid node while we have reference tables to replicate
 -- set client message level to ERROR and verbosity to terse to supporess

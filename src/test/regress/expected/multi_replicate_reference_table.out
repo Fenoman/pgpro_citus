@@ -356,6 +356,63 @@ WHERE colocationid IN
 (1 row)
 
 DROP TABLE replicate_reference_table_commit;
+-- exercise reference table replication in create_distributed_table_concurrently
+SELECT citus_remove_node('localhost', :worker_2_port);
+ citus_remove_node
+---------------------------------------------------------------------
+
+(1 row)
+
+CREATE TABLE replicate_reference_table_cdtc(column1 int);
+SELECT create_reference_table('replicate_reference_table_cdtc');
+ create_reference_table
+---------------------------------------------------------------------
+
+(1 row)
+
+SELECT citus_add_node('localhost', :worker_2_port);
+ citus_add_node
+---------------------------------------------------------------------
+        1370004
+(1 row)
+
+-- required for create_distributed_table_concurrently
+SELECT 1 FROM citus_set_coordinator_host('localhost', :master_port);
+ ?column?
+---------------------------------------------------------------------
+        1
+(1 row)
+
+SET citus.shard_replication_factor TO 1;
+CREATE TABLE distributed_table_cdtc(column1 int primary key);
+SELECT create_distributed_table_concurrently('distributed_table_cdtc', 'column1');
+ create_distributed_table_concurrently
+---------------------------------------------------------------------
+
+(1 row)
+
+RESET citus.shard_replication_factor;
+SELECT citus_remove_node('localhost', :master_port);
+ citus_remove_node
+---------------------------------------------------------------------
+
+(1 row)
+
+SELECT
+    shardid, shardstate, shardlength, nodename, nodeport
+FROM
+    pg_dist_shard_placement_view
+WHERE
+    nodeport = :worker_2_port
+ORDER BY shardid, nodeport;
+ shardid | shardstate | shardlength | nodename  | nodeport
+---------------------------------------------------------------------
+ 1370004 |          1 |           0 | localhost |    57638
+ 1370005 |          1 |           0 | localhost |    57638
+ 1370007 |          1 |           0 | localhost |    57638
+(3 rows)
+
+DROP TABLE replicate_reference_table_cdtc, distributed_table_cdtc;
 -- test adding new node + upgrading another hash distributed table to reference table + creating new reference table in TRANSACTION
 SELECT master_remove_node('localhost', :worker_2_port);
  master_remove_node
@@ -431,8 +488,8 @@ WHERE
 ORDER BY shardid, nodeport;
  shardid | shardstate | shardlength | nodename  | nodeport
 ---------------------------------------------------------------------
- 1370004 |          1 |           0 | localhost |    57638
- 1370005 |          1 |           0 | localhost |    57638
+ 1370009 |          1 |           0 | localhost |    57638
+ 1370010 |          1 |           0 | localhost |    57638
 (2 rows)
 
 SELECT shardcount, replicationfactor, distributioncolumntype, distributioncolumncollation FROM pg_dist_colocation
@@ -739,7 +796,7 @@ WHERE
 ORDER BY 1,4,5;
  shardid | shardstate | shardlength | nodename  | nodeport
 ---------------------------------------------------------------------
- 1370014 |          1 |           0 | localhost |    57637
+ 1370019 |          1 |           0 | localhost |    57637
 (1 row)
 
 -- we should see the two shard placements after activation
@@ -764,7 +821,7 @@ WHERE
 ORDER BY 1,4,5;
  shardid | shardstate | shardlength | nodename  | nodeport
 ---------------------------------------------------------------------
- 1370014 |          1 |           0 | localhost |    57637
+ 1370019 |          1 |           0 | localhost |    57637
 (1 row)
 
 SELECT 1 FROM master_remove_node('localhost', :worker_2_port);
@@ -773,15 +830,57 @@ SELECT 1 FROM master_remove_node('localhost', :worker_2_port);
         1
 (1 row)
 
-CREATE TABLE ref_table(a int);
+CREATE TABLE ref_table(id bigserial PRIMARY KEY, a int);
+CREATE INDEX ON ref_table (a);
 SELECT create_reference_table('ref_table');
  create_reference_table
 ---------------------------------------------------------------------
 
 (1 row)
 
-INSERT INTO ref_table SELECT * FROM generate_series(1, 10);
-SELECT 1 FROM master_add_node('localhost', :worker_2_port);
+INSERT INTO ref_table(a) SELECT * FROM generate_series(1, 10);
+-- verify direct call to citus_copy_shard_placement errors if target node is not yet added
+SELECT citus_copy_shard_placement(
+           (SELECT shardid FROM pg_dist_shard WHERE logicalrelid='ref_table'::regclass::oid),
+           'localhost', :worker_1_port,
+           'localhost', :worker_2_port,
+           transfer_mode := 'block_writes');
+ERROR:  Copying shards to a non-existing node is not supported
+HINT:  Add the target node via SELECT citus_add_node('localhost', 57638);
+-- verify direct call to citus_copy_shard_placement errors if target node is secondary
+SELECT citus_add_secondary_node('localhost', :worker_2_port, 'localhost', :worker_1_port);
+ citus_add_secondary_node
+---------------------------------------------------------------------
+                  1370014
+(1 row)
+
+SELECT citus_copy_shard_placement(
+           (SELECT shardid FROM pg_dist_shard WHERE logicalrelid='ref_table'::regclass::oid),
+           'localhost', :worker_1_port,
+           'localhost', :worker_2_port,
+           transfer_mode := 'block_writes');
+ERROR:  Copying shards to a secondary (e.g., replica) node is not supported
+SELECT citus_remove_node('localhost', :worker_2_port);
+ citus_remove_node
+---------------------------------------------------------------------
+
+(1 row)
+
+-- verify direct call to citus_copy_shard_placement errors if target node is inactive
+SELECT 1 FROM master_add_inactive_node('localhost', :worker_2_port);
+ ?column?
+---------------------------------------------------------------------
+        1
+(1 row)
+
+SELECT citus_copy_shard_placement(
+           (SELECT shardid FROM pg_dist_shard WHERE logicalrelid='ref_table'::regclass::oid),
+           'localhost', :worker_1_port,
+           'localhost', :worker_2_port,
+           transfer_mode := 'block_writes');
+ERROR:  Copying shards to a non-active node is not supported
+HINT:  Activate the target node via SELECT citus_activate_node('localhost', 57638);
+SELECT 1 FROM master_activate_node('localhost', :worker_2_port);
  ?column?
 ---------------------------------------------------------------------
         1
@@ -826,13 +925,13 @@ SELECT count(*) FROM ref_table;
     10
 (1 row)
 
-SELECT replicate_reference_tables();
+SELECT replicate_reference_tables('block_writes');
  replicate_reference_tables
 ---------------------------------------------------------------------
 
 (1 row)
 
-INSERT INTO ref_table VALUES (11);
+INSERT INTO ref_table(a) VALUES (11);
 SELECT count(*), sum(a) FROM ref_table;
  count | sum
 ---------------------------------------------------------------------
@@ -960,7 +1059,7 @@ SELECT min(result) = max(result) AS consistent FROM run_command_on_placements('r
  t
 (1 row)
 
--- test that metadata is synced when master_copy_shard_placement replicates
+-- test that metadata is synced when citus_copy_shard_placement replicates
 -- reference table shards
 SET citus.replicate_reference_tables_on_activate TO off;
 SELECT 1 FROM master_remove_node('localhost', :worker_2_port);
@@ -976,13 +1075,12 @@ SELECT 1 FROM master_add_node('localhost', :worker_2_port);
 (1 row)
 
 SET citus.shard_replication_factor TO 1;
-SELECT master_copy_shard_placement(
+SELECT citus_copy_shard_placement(
            :ref_table_shard,
            'localhost', :worker_1_port,
            'localhost', :worker_2_port,
-           do_repair := false,
            transfer_mode := 'block_writes');
- master_copy_shard_placement
+ citus_copy_shard_placement
 ---------------------------------------------------------------------
 
 (1 row)
@@ -993,6 +1091,25 @@ WHERE nodeport=:worker_1_port;
  ?column?
 ---------------------------------------------------------------------
         0
+(1 row)
+
+-- test that we can use non-blocking rebalance
+SELECT 1 FROM master_remove_node('localhost', :worker_2_port);
+ ?column?
+---------------------------------------------------------------------
+        1
+(1 row)
+
+SELECT 1 FROM master_add_node('localhost', :worker_2_port);
+ ?column?
+---------------------------------------------------------------------
+        1
+(1 row)
+
+SELECT rebalance_table_shards(shard_transfer_mode := 'force_logical');
+ rebalance_table_shards
+---------------------------------------------------------------------
+
 (1 row)
 
 -- test that metadata is synced on replicate_reference_tables
@@ -1008,7 +1125,14 @@ SELECT 1 FROM master_add_node('localhost', :worker_2_port);
         1
 (1 row)
 
+-- detects correctly that referecence table doesn't have replica identity
 SELECT replicate_reference_tables();
+ERROR:  cannot use logical replication to transfer shards of the relation initially_not_replicated_reference_table since it doesn't have a REPLICA IDENTITY or PRIMARY KEY
+DETAIL:  UPDATE and DELETE commands on the shard will error out during logical replication unless there is a REPLICA IDENTITY or PRIMARY KEY.
+HINT:  If you wish to continue without a replica identity set the shard_transfer_mode to 'force_logical' or 'block_writes'.
+CONTEXT:  while executing command on localhost:xxxxx
+-- allows force_logical
+SELECT replicate_reference_tables('force_logical');
  replicate_reference_tables
 ---------------------------------------------------------------------
 
@@ -1034,7 +1158,7 @@ SELECT create_distributed_table('dist_table', 'a');
 
 INSERT INTO dist_table SELECT i, i * i FROM generate_series(1, 20) i;
 TRUNCATE ref_table;
-INSERT INTO ref_table SELECT 2 * i FROM generate_series(1, 5) i;
+INSERT INTO ref_table(a) SELECT 2 * i FROM generate_series(1, 5) i;
 \c - - - :worker_1_port
 SET search_path TO replicate_reference_table;
 SELECT array_agg(dist_table.b ORDER BY ref_table.a)
@@ -1079,6 +1203,38 @@ CREATE TABLE test (x int, y int references ref(a));
 SELECT create_distributed_table('test','x');
 ERROR:  canceling the transaction since it was involved in a distributed deadlock
 END;
+-- verify the split fails if we still need to replicate reference tables
+SELECT citus_remove_node('localhost', :worker_2_port);
+ citus_remove_node
+---------------------------------------------------------------------
+
+(1 row)
+
+SELECT create_distributed_table('test','x');
+ create_distributed_table
+---------------------------------------------------------------------
+
+(1 row)
+
+SELECT citus_add_node('localhost', :worker_2_port);
+ citus_add_node
+---------------------------------------------------------------------
+        1370024
+(1 row)
+
+SELECT
+  citus_split_shard_by_split_points(shardid,
+                                    ARRAY[(shardminvalue::int + (shardmaxvalue::int - shardminvalue::int)/2)::text],
+                                    ARRAY[nodeid, nodeid],
+                                    'force_logical')
+FROM
+  pg_dist_shard, pg_dist_node
+WHERE
+  logicalrelid = 'replicate_reference_table.test'::regclass AND nodename = 'localhost' AND nodeport = :worker_2_port
+ORDER BY shardid LIMIT 1;
+ERROR:  reference tables have not been replicated to node localhost:xxxxx yet
+DETAIL:  Reference tables are lazily replicated after adding a node, but must exist before shards can be created on that node.
+HINT:  Run SELECT replicate_reference_tables(); to ensure reference tables exist on all nodes.
 -- test adding an invalid node while we have reference tables to replicate
 -- set client message level to ERROR and verbosity to terse to supporess
 -- OS-dependent host name resolution warnings

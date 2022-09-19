@@ -54,6 +54,12 @@
 /* controlled via GUC, should be accessed via GetEnableLocalReferenceForeignKeys() */
 bool EnableLocalReferenceForeignKeys = true;
 
+/*
+ * GUC that controls whether to allow unique/exclude constraints without
+ * distribution column.
+ */
+bool AllowUnsafeConstraints = false;
+
 /* Local functions forward declarations for unsupported command checks */
 static void PostprocessCreateTableStmtForeignKeys(CreateStmt *createStatement);
 static void PostprocessCreateTableStmtPartitionOf(CreateStmt *createStatement,
@@ -153,11 +159,14 @@ PreprocessDropTableStmt(Node *node, const char *queryString,
 			continue;
 		}
 
-		if (IsCitusTableType(relationId, REFERENCE_TABLE))
+		/*
+		 * While changing the tables that are part of a colocation group we need to
+		 * prevent concurrent mutations to the placements of the shard groups.
+		 */
+		CitusTableCacheEntry *cacheEntry = GetCitusTableCacheEntry(relationId);
+		if (cacheEntry->colocationId != INVALID_COLOCATION_ID)
 		{
-			/* prevent concurrent EnsureReferenceTablesExistOnAllNodes */
-			int colocationId = CreateReferenceTableColocationId();
-			LockColocationId(colocationId, ExclusiveLock);
+			LockColocationId(cacheEntry->colocationId, ShareLock);
 		}
 
 		/* invalidate foreign key cache if the table involved in any foreign key */
@@ -439,9 +448,18 @@ PreprocessAlterTableStmtAttachPartition(AlterTableStmt *alterTableStatement,
 			Oid parentRelationId = AlterTableLookupRelation(alterTableStatement,
 															lockmode);
 			PartitionCmd *partitionCommand = (PartitionCmd *) alterTableCommand->def;
-			bool partitionMissingOk = false;
+			bool partitionMissingOk = true;
 			Oid partitionRelationId = RangeVarGetRelid(partitionCommand->name, lockmode,
 													   partitionMissingOk);
+			if (!OidIsValid(partitionRelationId))
+			{
+				/*
+				 * We can stop propagation here instead of logging error. Pg will complain
+				 * in standard_utility, so we are safe to stop here. We pass missing_ok
+				 * as true to not diverge from pg output.
+				 */
+				return NIL;
+			}
 
 			if (!IsCitusTable(parentRelationId))
 			{
@@ -649,7 +667,7 @@ PostprocessAlterTableSchemaStmt(Node *node, const char *queryString)
 	/*
 	 * We will let Postgres deal with missing_ok
 	 */
-	List *tableAddresses = GetObjectAddressListFromParseTree((Node *) stmt, true);
+	List *tableAddresses = GetObjectAddressListFromParseTree((Node *) stmt, true, true);
 
 	/*  the code-path only supports a single object */
 	Assert(list_length(tableAddresses) == 1);
@@ -715,20 +733,40 @@ PreprocessAlterTableStmt(Node *node, const char *alterTableCommand,
 
 	/*
 	 * check whether we are dealing with a sequence or view here
-	 * if yes, it must be ALTER TABLE .. OWNER TO .. command
-	 * since this is the only ALTER command of a sequence or view that
-	 * passes through an AlterTableStmt
 	 */
 	char relKind = get_rel_relkind(leftRelationId);
 	if (relKind == RELKIND_SEQUENCE)
 	{
 		AlterTableStmt *stmtCopy = copyObject(alterTableStatement);
 		AlterTableStmtObjType_compat(stmtCopy) = OBJECT_SEQUENCE;
+#if (PG_VERSION_NUM >= PG_VERSION_15)
+
+		/*
+		 * it must be ALTER TABLE .. OWNER TO ..
+		 * or ALTER TABLE .. SET LOGGED/UNLOGGED command
+		 * since these are the only ALTER commands of a sequence that
+		 * pass through an AlterTableStmt
+		 */
+		return PreprocessSequenceAlterTableStmt((Node *) stmtCopy, alterTableCommand,
+												processUtilityContext);
+#else
+
+		/*
+		 * it must be ALTER TABLE .. OWNER TO .. command
+		 * since this is the only ALTER command of a sequence that
+		 * passes through an AlterTableStmt
+		 */
 		return PreprocessAlterSequenceOwnerStmt((Node *) stmtCopy, alterTableCommand,
 												processUtilityContext);
+#endif
 	}
 	else if (relKind == RELKIND_VIEW)
 	{
+		/*
+		 * it must be ALTER TABLE .. OWNER TO .. command
+		 * since this is the only ALTER command of a view that
+		 * passes through an AlterTableStmt
+		 */
 		AlterTableStmt *stmtCopy = copyObject(alterTableStatement);
 		AlterTableStmtObjType_compat(stmtCopy) = OBJECT_VIEW;
 		return PreprocessAlterViewStmt((Node *) stmtCopy, alterTableCommand,
@@ -1786,7 +1824,7 @@ PreprocessAlterTableSchemaStmt(Node *node, const char *queryString,
 	}
 
 	List *addresses = GetObjectAddressListFromParseTree((Node *) stmt,
-														stmt->missing_ok);
+														stmt->missing_ok, false);
 
 	/*  the code-path only supports a single object */
 	Assert(list_length(addresses) == 1);
@@ -1836,52 +1874,44 @@ PreprocessAlterTableSchemaStmt(Node *node, const char *queryString,
  * statement to be worked on the distributed table. Currently, it only processes
  * ALTER TABLE ... ADD FOREIGN KEY command to skip the validation step.
  */
-Node *
-SkipForeignKeyValidationIfConstraintIsFkey(AlterTableStmt *alterTableStatement,
-										   bool processLocalRelation)
+void
+SkipForeignKeyValidationIfConstraintIsFkey(AlterTableStmt *alterTableStatement)
 {
 	/* first check whether a distributed relation is affected */
 	if (alterTableStatement->relation == NULL)
 	{
-		return (Node *) alterTableStatement;
+		return;
 	}
 
 	LOCKMODE lockmode = AlterTableGetLockLevel(alterTableStatement->cmds);
 	Oid leftRelationId = AlterTableLookupRelation(alterTableStatement, lockmode);
 	if (!OidIsValid(leftRelationId))
 	{
-		return (Node *) alterTableStatement;
+		return;
 	}
 
-	if (!IsCitusTable(leftRelationId) && !processLocalRelation)
+	if (!IsCitusTable(leftRelationId))
 	{
-		return (Node *) alterTableStatement;
+		return;
 	}
 
-	/*
-	 * We check if there is a ADD FOREIGN CONSTRAINT command in sub commands list.
-	 * If there is we assign referenced releation id to rightRelationId and we also
-	 * set skip_validation to true to prevent PostgreSQL to verify validity of the
-	 * foreign constraint in master. Validity will be checked in workers anyway.
-	 */
-	List *commandList = alterTableStatement->cmds;
 	AlterTableCmd *command = NULL;
-	foreach_ptr(command, commandList)
+	foreach_ptr(command, alterTableStatement->cmds)
 	{
 		AlterTableType alterTableType = command->subtype;
 
 		if (alterTableType == AT_AddConstraint)
 		{
+			/* skip only if the constraint is a foreign key */
 			Constraint *constraint = (Constraint *) command->def;
 			if (constraint->contype == CONSTR_FOREIGN)
 			{
-				/* foreign constraint validations will be done in shards. */
-				constraint->skip_validation = true;
+				/* set the GUC skip_constraint_validation to on */
+				EnableSkippingConstraintValidation();
+				return;
 			}
 		}
 	}
-
-	return (Node *) alterTableStatement;
 }
 
 
@@ -2561,6 +2591,16 @@ ErrorIfUnsupportedConstraint(Relation relation, char distributionMethod,
 							  errhint("Consider using hash partitioning.")));
 		}
 
+		if (AllowUnsafeConstraints)
+		{
+			/*
+			 * The user explicitly wants to allow the constraint without
+			 * distribution column.
+			 */
+			index_close(indexDesc, NoLock);
+			continue;
+		}
+
 		int attributeCount = indexInfo->ii_NumIndexAttrs;
 		AttrNumber *attributeNumberArray = indexInfo->ii_IndexAttrNumbers;
 
@@ -2804,11 +2844,9 @@ ErrorIfUnsupportedAlterTableStmt(AlterTableStmt *alterTableStatement)
 				 * changing the type of the column should not be allowed for now
 				 */
 				AttrNumber attnum = get_attnum(relationId, command->name);
-				List *attnumList = NIL;
-				List *dependentSequenceList = NIL;
-				GetDependentSequencesWithRelation(relationId, &attnumList,
-												  &dependentSequenceList, attnum);
-				if (dependentSequenceList != NIL)
+				List *seqInfoList = NIL;
+				GetDependentSequencesWithRelation(relationId, &seqInfoList, attnum);
+				if (seqInfoList != NIL)
 				{
 					ereport(ERROR, (errmsg("cannot execute ALTER COLUMN TYPE .. command "
 										   "because the column involves a default coming "
@@ -3369,7 +3407,7 @@ ErrorIfUnsupportedAlterAddConstraintStmt(AlterTableStmt *alterTableStatement)
  * be found in either of the schemas.
  */
 List *
-AlterTableSchemaStmtObjectAddress(Node *node, bool missing_ok)
+AlterTableSchemaStmtObjectAddress(Node *node, bool missing_ok, bool isPostprocess)
 {
 	AlterObjectSchemaStmt *stmt = castNode(AlterObjectSchemaStmt, node);
 	Assert(stmt->objectType == OBJECT_TABLE || stmt->objectType == OBJECT_FOREIGN_TABLE);

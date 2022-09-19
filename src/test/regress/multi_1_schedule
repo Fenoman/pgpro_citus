@@ -62,7 +62,7 @@ test: multi_remove_node_reference_table
 # ----------
 test: multi_create_table
 test: multi_create_table_superuser
-test: multi_create_table_constraints multi_master_protocol multi_load_data multi_load_data_superuser multi_behavioral_analytics_create_table
+test: multi_master_protocol multi_load_data multi_load_data_superuser multi_behavioral_analytics_create_table
 test: multi_behavioral_analytics_basics multi_behavioral_analytics_single_shard_queries multi_insert_select_non_pushable_queries multi_insert_select multi_behavioral_analytics_create_table_superuser
 test: multi_shard_update_delete recursive_dml_with_different_planners_executors
 test: insert_select_repartition window_functions dml_recursive multi_insert_select_window
@@ -180,7 +180,7 @@ test: multi_modifications
 test: multi_distribution_metadata
 test: multi_prune_shard_list
 test: multi_upsert multi_simple_queries multi_data_types
-test: master_copy_shard_placement
+test: citus_copy_shard_placement
 # multi_utilities cannot be run in parallel with other tests because it checks
 # global locks
 test: multi_utilities
@@ -188,7 +188,7 @@ test: foreign_key_to_reference_table validate_constraint
 test: multi_repartition_udt multi_repartitioned_subquery_udf multi_subtransactions
 
 test: multi_modifying_xacts
-test: multi_generate_ddl_commands multi_repair_shards
+test: multi_generate_ddl_commands
 test: multi_create_shards
 test: multi_transaction_recovery
 
@@ -253,10 +253,8 @@ test: multi_truncate
 
 # ----------
 # multi_colocation_utils tests utility functions written for co-location feature & internal API
-# multi_colocated_shard_transfer tests master_copy_shard_placement with colocated tables.
 # ----------
 test: multi_colocation_utils
-test: multi_colocated_shard_transfer
 
 # ----------
 # node_conninfo_reload tests that node_conninfo changes take effect
@@ -277,7 +275,7 @@ test: add_coordinator
 test: replicate_reference_tables_to_coordinator
 test: citus_local_tables
 test: mixed_relkind_tests
-test: multi_row_router_insert
+test: multi_row_router_insert create_distributed_table_concurrently
 test: multi_reference_table citus_local_tables_queries
 test: citus_local_table_triggers
 test: coordinator_shouldhaveshards
@@ -290,6 +288,7 @@ test: auto_undist_citus_local
 test: mx_regular_user
 test: citus_locks
 test: global_cancel
+test: sequencenes_owned_by
 test: remove_coordinator
 
 # ----------

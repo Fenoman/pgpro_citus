@@ -23,11 +23,10 @@
 #include "distributed/connection_management.h"
 #include "distributed/remote_commands.h"
 #include "distributed/shard_split.h"
+#include "distributed/utils/distribution_column_map.h"
 
 /* declarations for dynamic loading */
 PG_FUNCTION_INFO_V1(citus_split_shard_by_split_points);
-
-static SplitMode LookupSplitMode(Oid shardTransferModeOid);
 
 /*
  * citus_split_shard_by_split_points(shard_id bigint, split_points text[], node_ids integer[], shard_transfer_mode citus.shard_transfer_mode)
@@ -54,12 +53,17 @@ citus_split_shard_by_split_points(PG_FUNCTION_ARGS)
 	Oid shardTransferModeOid = PG_GETARG_OID(3);
 	SplitMode shardSplitMode = LookupSplitMode(shardTransferModeOid);
 
+	DistributionColumnMap *distributionColumnOverrides = NULL;
+	List *sourceColocatedShardIntervalList = NIL;
 	SplitShard(
 		shardSplitMode,
 		SHARD_SPLIT_API,
 		shardIdToSplit,
 		shardSplitPointsList,
-		nodeIdsForPlacementList);
+		nodeIdsForPlacementList,
+		distributionColumnOverrides,
+		sourceColocatedShardIntervalList,
+		INVALID_COLOCATION_ID);
 
 	PG_RETURN_VOID();
 }
@@ -81,18 +85,19 @@ LookupSplitMode(Oid shardTransferModeOid)
 	{
 		shardSplitMode = BLOCKING_SPLIT;
 	}
-	else if (strncmp(enumLabel, "auto", NAMEDATALEN) == 0 ||
-			 strncmp(enumLabel, "force_logical", NAMEDATALEN) == 0)
+	else if (strncmp(enumLabel, "force_logical", NAMEDATALEN) == 0)
 	{
-		ereport(ERROR, (errmsg(
-							"Shard Tranfer mode: '%s' is not supported. Please use 'block_writes' instead.",
-							enumLabel)));
+		shardSplitMode = NON_BLOCKING_SPLIT;
+	}
+	else if (strncmp(enumLabel, "auto", NAMEDATALEN) == 0)
+	{
+		shardSplitMode = AUTO_SPLIT;
 	}
 	else
 	{
 		/* We will not get here as postgres will validate the enum value. */
 		ereport(ERROR, (errmsg(
-							"Invalid shard tranfer mode: '%s'. Expected split mode is 'block_writes'.",
+							"Invalid shard tranfer mode: '%s'. Expected split mode is 'block_writes/auto/force_logical'.",
 							enumLabel)));
 	}
 

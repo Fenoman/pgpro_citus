@@ -143,6 +143,7 @@ extern List * AllCitusTableIds(void);
 extern bool IsCitusTableType(Oid relationId, CitusTableType tableType);
 extern bool IsCitusTableTypeCacheEntry(CitusTableCacheEntry *tableEtnry,
 									   CitusTableType tableType);
+extern char * GetTableTypeName(Oid tableId);
 
 extern void SetCreateCitusTransactionLevel(int val);
 extern int GetCitusCreationLevel(void);
@@ -152,9 +153,11 @@ extern char PgDistPartitionViaCatalog(Oid relationId);
 extern List * LookupDistShardTuples(Oid relationId);
 extern char PartitionMethodViaCatalog(Oid relationId);
 extern Var * PartitionColumnViaCatalog(Oid relationId);
+extern uint32 ColocationIdViaCatalog(Oid relationId);
 extern bool IsCitusLocalTableByDistParams(char partitionMethod, char replicationModel);
 extern List * CitusTableList(void);
 extern ShardInterval * LoadShardInterval(uint64 shardId);
+extern bool ShardExists(uint64 shardId);
 extern Oid RelationIdForShard(uint64 shardId);
 extern bool ReferenceTableShardId(uint64 shardId);
 extern bool DistributedTableShardId(uint64 shardId);
@@ -172,7 +175,6 @@ extern int32 GetLocalNodeId(void);
 extern void CitusTableCacheFlushInvalidatedEntries(void);
 extern Oid LookupShardRelationFromCatalog(int64 shardId, bool missing_ok);
 extern List * ShardPlacementListIncludingOrphanedPlacements(uint64 shardId);
-extern bool ShardExists(int64 shardId);
 extern void CitusInvalidateRelcacheByRelid(Oid relationId);
 extern void CitusInvalidateRelcacheByShardId(int64 shardId);
 extern void InvalidateForeignKeyGraph(void);
@@ -180,7 +182,6 @@ extern void FlushDistTableCache(void);
 extern void InvalidateMetadataSystemCache(void);
 extern List * CitusTableTypeIdList(CitusTableType citusTableType);
 extern Datum DistNodeMetadata(void);
-extern bool ClusterHasReferenceTable(void);
 extern bool HasUniformHashDistribution(ShardInterval **shardIntervalArray,
 									   int shardIntervalArrayLength);
 extern bool HasUninitializedShardInterval(ShardInterval **sortedShardIntervalArray,
@@ -222,12 +223,15 @@ extern WorkerNode * LookupNodeForGroup(int32 groupId);
 extern Oid CitusCatalogNamespaceId(void);
 
 /* relation oids */
+extern Oid DistCleanupRelationId(void);
 extern Oid DistColocationRelationId(void);
 extern Oid DistColocationConfigurationIndexId(void);
 extern Oid DistPartitionRelationId(void);
 extern Oid DistShardRelationId(void);
 extern Oid DistPlacementRelationId(void);
 extern Oid DistNodeRelationId(void);
+extern Oid DistBackgroundJobRelationId(void);
+extern Oid DistBackgroundTaskRelationId(void);
 extern Oid DistRebalanceStrategyRelationId(void);
 extern Oid DistLocalGroupIdRelationId(void);
 extern Oid DistObjectRelationId(void);
@@ -237,6 +241,13 @@ extern Oid DistEnabledCustomAggregatesId(void);
 extern Oid DistNodeNodeIdIndexId(void);
 extern Oid DistPartitionLogicalRelidIndexId(void);
 extern Oid DistPartitionColocationidIndexId(void);
+extern Oid DistBackgroundJobPKeyIndexId(void);
+extern Oid DistBackgroundTaskPKeyIndexId(void);
+extern Oid DistBackgroundTaskJobIdTaskIdIndexId(void);
+extern Oid DistBackgroundTaskStatusTaskIdIndexId(void);
+extern Oid DistBackgroundTaskDependRelationId(void);
+extern Oid DistBackgroundTaskDependTaskIdIndexId(void);
+extern Oid DistBackgroundTaskDependDependsOnIndexId(void);
 extern Oid DistShardLogicalRelidIndexId(void);
 extern Oid DistShardShardidIndexId(void);
 extern Oid DistPlacementShardidIndexId(void);
@@ -246,6 +257,11 @@ extern Oid DistTransactionRelationId(void);
 extern Oid DistTransactionGroupIndexId(void);
 extern Oid DistPlacementGroupidIndexId(void);
 extern Oid DistObjectPrimaryKeyIndexId(void);
+extern Oid DistCleanupPrimaryKeyIndexId(void);
+
+/* sequence oids */
+extern Oid DistBackgroundJobJobIdSequenceId(void);
+extern Oid DistBackgroundTaskTaskIdSequenceId(void);
 
 /* type oids */
 extern Oid LookupTypeOid(char *schemaNameSting, char *typeNameString);
@@ -258,8 +274,6 @@ extern Oid CitusExtraDataContainerFuncId(void);
 extern Oid CitusAnyValueFunctionId(void);
 extern Oid CitusTextSendAsJsonbFunctionId(void);
 extern Oid TextOutFunctionId(void);
-extern Oid PgTableVisibleFuncId(void);
-extern Oid CitusTableVisibleFuncId(void);
 extern Oid RelationIsAKnownShardFuncId(void);
 extern Oid JsonbExtractPathFuncId(void);
 extern Oid JsonbExtractPathTextFuncId(void);
@@ -271,6 +285,21 @@ extern Oid SecondaryNodeRoleId(void);
 extern Oid CitusCopyFormatTypeId(void);
 extern Oid TextCopyFormatId(void);
 extern Oid BinaryCopyFormatId(void);
+extern Oid CitusJobStatusScheduledId(void);
+extern Oid CitusJobStatusRunningId(void);
+extern Oid CitusJobStatusCancellingId(void);
+extern Oid CitusJobStatusFinishedId(void);
+extern Oid CitusJobStatusCancelledId(void);
+extern Oid CitusJobStatusFailedId(void);
+extern Oid CitusJobStatusFailingId(void);
+extern Oid CitusTaskStatusBlockedId(void);
+extern Oid CitusTaskStatusRunnableId(void);
+extern Oid CitusTaskStatusRunningId(void);
+extern Oid CitusTaskStatusDoneId(void);
+extern Oid CitusTaskStatusErrorId(void);
+extern Oid CitusTaskStatusUnscheduledId(void);
+extern Oid CitusTaskStatusCancelledId(void);
+extern Oid CitusTaskStatusCancellingId(void);
 
 /* user related functions */
 extern Oid CitusExtensionOwner(void);

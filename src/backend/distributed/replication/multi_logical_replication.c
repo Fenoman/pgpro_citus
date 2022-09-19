@@ -24,14 +24,16 @@
 #include "access/htup_details.h"
 #include "access/sysattr.h"
 #include "access/xact.h"
-#include "catalog/pg_subscription_rel.h"
 #include "commands/dbcommands.h"
+#include "common/hashfn.h"
+#include "catalog/pg_subscription_rel.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_constraint.h"
 #include "distributed/adaptive_executor.h"
 #include "distributed/citus_safe_lib.h"
 #include "distributed/colocation_utils.h"
 #include "distributed/connection_management.h"
+#include "distributed/hash_helpers.h"
 #include "distributed/listutils.h"
 #include "distributed/coordinator_protocol.h"
 #include "distributed/metadata_cache.h"
@@ -39,10 +41,12 @@
 #include "distributed/multi_join_order.h"
 #include "distributed/multi_logical_replication.h"
 #include "distributed/multi_partitioning_utils.h"
+#include "distributed/priority.h"
 #include "distributed/distributed_planner.h"
 #include "distributed/remote_commands.h"
 #include "distributed/resource_lock.h"
 #include "distributed/shard_rebalancer.h"
+#include "distributed/shard_transfer.h"
 #include "distributed/version_compat.h"
 #include "nodes/bitmapset.h"
 #include "parser/scansup.h"
@@ -61,6 +65,8 @@
 #include "utils/ruleutils.h"
 #include "utils/syscache.h"
 
+#define STR_ERRCODE_UNDEFINED_OBJECT "42704"
+
 
 #define REPLICATION_SLOT_CATALOG_TABLE_NAME "pg_replication_slots"
 #define CURRENT_LOG_POSITION_COMMAND "SELECT pg_current_wal_lsn()"
@@ -71,6 +77,31 @@
 /* decimal representation of Adler-16 hash value of citus_shard_move_subscription */
 #define SHARD_MOVE_ADVISORY_LOCK_SECOND_KEY 55152
 
+static const char *publicationPrefix[] = {
+	[SHARD_MOVE] = "citus_shard_move_publication_",
+	[SHARD_SPLIT] = "citus_shard_split_publication_",
+};
+
+static const char *replicationSlotPrefix[] = {
+	[SHARD_MOVE] = "citus_shard_move_slot_",
+	[SHARD_SPLIT] = "citus_shard_split_slot_",
+};
+
+/*
+ * IMPORTANT: All the subscription names should start with "citus_". Otherwise
+ * our utility hook does not defend against non-superusers altering or dropping
+ * them, which is important for security purposes.
+ */
+static const char *subscriptionPrefix[] = {
+	[SHARD_MOVE] = "citus_shard_move_subscription_",
+	[SHARD_SPLIT] = "citus_shard_split_subscription_",
+};
+
+static const char *subscriptionRolePrefix[] = {
+	[SHARD_MOVE] = "citus_shard_move_subscription_role_",
+	[SHARD_SPLIT] = "citus_shard_split_subscription_role_",
+};
+
 
 /* GUC variable, defaults to 2 hours */
 int LogicalReplicationTimeout = 2 * 60 * 60 * 1000;
@@ -79,84 +110,52 @@ int LogicalReplicationTimeout = 2 * 60 * 60 * 1000;
 /* see the comment in master_move_shard_placement */
 bool PlacementMovedUsingLogicalReplicationInTX = false;
 
-
 /* report in every 10 seconds */
 static int logicalReplicationProgressReportTimeout = 10 * 1000;
 
 
-static void CreateForeignConstraintsToReferenceTable(List *shardList,
-													 MultiConnection *targetConnection);
 static List * PrepareReplicationSubscriptionList(List *shardList);
-static Bitmapset * TableOwnerIds(List *shardList);
-static void CreateReplicaIdentity(List *shardList, char *nodeName, int32
-								  nodePort);
 static List * GetReplicaIdentityCommandListForShard(Oid relationId, uint64 shardId);
 static List * GetIndexCommandListForShardBackingReplicaIdentity(Oid relationId,
 																uint64 shardId);
-static void CreatePostLogicalReplicationDataLoadObjects(List *shardList,
-														char *targetNodeName,
-														int32 targetNodePort);
-static void ExecuteCreateIndexCommands(List *shardList, char *targetNodeName,
-									   int targetNodePort);
-static void ExecuteCreateConstraintsBackedByIndexCommands(List *shardList,
-														  char *targetNodeName,
-														  int targetNodePort);
+static void CreatePostLogicalReplicationDataLoadObjects(List *logicalRepTargetList,
+														LogicalRepType type);
+static void ExecuteCreateIndexCommands(List *logicalRepTargetList);
+static void ExecuteCreateConstraintsBackedByIndexCommands(List *logicalRepTargetList);
 static List * ConvertNonExistingPlacementDDLCommandsToTasks(List *shardCommandList,
-															uint64 shardId,
 															char *targetNodeName,
 															int targetNodePort);
-static void ExecuteClusterOnCommands(List *shardList, char *targetNodeName,
-									 int targetNodePort);
-static void ExecuteCreateIndexStatisticsCommands(List *shardList, char *targetNodeName,
-												 int targetNodePort);
-static void ExecuteRemainingPostLoadTableCommands(List *shardList, char *targetNodeName,
-												  int targetNodePort);
-static void CreatePartitioningHierarchy(List *shardList, char *targetNodeName,
-										int targetNodePort);
-static void CreateColocatedForeignKeys(List *shardList, char *targetNodeName,
-									   int targetNodePort);
-static void ConflictOnlyWithIsolationTesting(void);
-static void DropShardMovePublications(MultiConnection *connection,
-									  Bitmapset *tableOwnerIds);
-static void DropShardMoveSubscriptions(MultiConnection *connection,
-									   Bitmapset *tableOwnerIds);
-static void CreateShardMovePublications(MultiConnection *connection, List *shardList,
-										Bitmapset *tableOwnerIds);
-static void CreateShardMoveSubscriptions(MultiConnection *connection,
-										 char *sourceNodeName,
-										 int sourceNodePort, char *userName,
-										 char *databaseName,
-										 Bitmapset *tableOwnerIds);
+static void ExecuteClusterOnCommands(List *logicalRepTargetList);
+static void ExecuteCreateIndexStatisticsCommands(List *logicalRepTargetList);
+static void ExecuteRemainingPostLoadTableCommands(List *logicalRepTargetList);
 static char * escape_param_str(const char *str);
-static XLogRecPtr GetRemoteLogPosition(MultiConnection *connection);
 static XLogRecPtr GetRemoteLSN(MultiConnection *connection, char *command);
-static void WaitForRelationSubscriptionsBecomeReady(MultiConnection *targetConnection,
-													Bitmapset *tableOwnerIds);
-static uint64 TotalRelationSizeForSubscription(MultiConnection *connection,
-											   char *command);
-static bool RelationSubscriptionsAreReady(MultiConnection *targetConnection,
-										  Bitmapset *tableOwnerIds);
-static void WaitForShardMoveSubscription(MultiConnection *targetConnection,
-										 XLogRecPtr sourcePosition,
-										 Bitmapset *tableOwnerIds);
+static bool RelationSubscriptionsAreReady(
+	GroupedLogicalRepTargets *groupedLogicalRepTargets);
 static void WaitForMiliseconds(long timeout);
-static XLogRecPtr GetSubscriptionPosition(MultiConnection *connection,
-										  Bitmapset *tableOwnerIds);
-static char * ShardMovePublicationName(Oid ownerId);
-static char * ShardMoveSubscriptionName(Oid ownerId);
+static XLogRecPtr GetSubscriptionPosition(
+	GroupedLogicalRepTargets *groupedLogicalRepTargets);
 static void AcquireLogicalReplicationLock(void);
-static void DropAllShardMoveLeftovers(void);
-static void DropAllShardMoveSubscriptions(MultiConnection *connection);
-static void DropAllShardMoveReplicationSlots(MultiConnection *connection);
-static void DropAllShardMovePublications(MultiConnection *connection);
-static void DropAllShardMoveUsers(MultiConnection *connection);
-static char * ShardMoveSubscriptionNamesValueList(Bitmapset *tableOwnerIds);
-static void DropShardMoveSubscription(MultiConnection *connection,
-									  char *subscriptionName);
-static void DropShardMoveReplicationSlot(MultiConnection *connection,
-										 char *publicationName);
-static void DropShardMovePublication(MultiConnection *connection, char *publicationName);
-static void DropShardMoveUser(MultiConnection *connection, char *username);
+static void DropSubscription(MultiConnection *connection,
+							 char *subscriptionName);
+static void DropPublication(MultiConnection *connection, char *publicationName);
+
+static void DropUser(MultiConnection *connection, char *username);
+static void DropReplicationSlot(MultiConnection *connection,
+								char *publicationName);
+static void DropAllSubscriptions(MultiConnection *connection, LogicalRepType type);
+static void DropAllReplicationSlots(MultiConnection *connection, LogicalRepType type);
+static void DropAllPublications(MultiConnection *connection, LogicalRepType type);
+static void DropAllUsers(MultiConnection *connection, LogicalRepType type);
+static HTAB * CreateShardMovePublicationInfoHash(WorkerNode *targetNode,
+												 List *shardIntervals);
+static List * CreateShardMoveLogicalRepTargetList(HTAB *publicationInfoHash,
+												  List *shardList);
+static void WaitForGroupedLogicalRepTargetsToBecomeReady(
+	GroupedLogicalRepTargets *groupedLogicalRepTargets);
+static void WaitForGroupedLogicalRepTargetsToCatchUp(XLogRecPtr sourcePosition,
+													 GroupedLogicalRepTargets *
+													 groupedLogicalRepTargets);
 
 /*
  * LogicallyReplicateShards replicates a list of shards from one node to another
@@ -184,97 +183,75 @@ LogicallyReplicateShards(List *shardList, char *sourceNodeName, int sourceNodePo
 		return;
 	}
 
-	Bitmapset *tableOwnerIds = TableOwnerIds(replicationSubscriptionList);
-
-	DropAllShardMoveLeftovers();
+	DropAllLogicalReplicationLeftovers(SHARD_MOVE);
 
 	MultiConnection *sourceConnection =
 		GetNodeUserDatabaseConnection(connectionFlags, sourceNodeName, sourceNodePort,
 									  superUser, databaseName);
-	MultiConnection *targetConnection =
-		GetNodeUserDatabaseConnection(connectionFlags, targetNodeName, targetNodePort,
-									  superUser, databaseName);
 
 	/*
-	 * Operations on publications and subscriptions cannot run in a transaction
-	 * block. Claim the connections exclusively to ensure they do not get used
-	 * for metadata syncing, which does open a transaction block.
+	 * Operations on publications and replication slots cannot run in a
+	 * transaction block. We claim the connections exclusively to ensure they
+	 * do not get used for metadata syncing, which does open a transaction
+	 * block.
 	 */
 	ClaimConnectionExclusively(sourceConnection);
-	ClaimConnectionExclusively(targetConnection);
+
+	WorkerNode *sourceNode = FindWorkerNode(sourceNodeName, sourceNodePort);
+	WorkerNode *targetNode = FindWorkerNode(targetNodeName, targetNodePort);
+
+	HTAB *publicationInfoHash = CreateShardMovePublicationInfoHash(
+		targetNode, replicationSubscriptionList);
+
+	List *logicalRepTargetList = CreateShardMoveLogicalRepTargetList(publicationInfoHash,
+																	 shardList);
+
+	HTAB *groupedLogicalRepTargetsHash = CreateGroupedLogicalRepTargetsHash(
+		logicalRepTargetList);
+
+	CreateGroupedLogicalRepTargetsConnections(groupedLogicalRepTargetsHash, superUser,
+											  databaseName);
 
 	PG_TRY();
 	{
-		/*
-		 * We have to create the primary key (or any other replica identity)
-		 * before the initial COPY is done. This is necessary because as soon
-		 * as the COPY command finishes, the update/delete operations that
-		 * are queued will be replicated. And, if the replica identity does not
-		 * exist on the target, the replication would fail.
-		 */
-		CreateReplicaIdentity(shardList, targetNodeName, targetNodePort);
+		MultiConnection *sourceReplicationConnection =
+			GetReplicationConnection(sourceConnection->hostname, sourceConnection->port);
 
 		/* set up the publication on the source and subscription on the target */
-		CreateShardMovePublications(sourceConnection, replicationSubscriptionList,
-									tableOwnerIds);
-		CreateShardMoveSubscriptions(targetConnection, sourceNodeName, sourceNodePort,
-									 superUser, databaseName, tableOwnerIds);
+		CreatePublications(sourceConnection, publicationInfoHash);
+		char *snapshot = CreateReplicationSlots(
+			sourceConnection,
+			sourceReplicationConnection,
+			logicalRepTargetList,
+			"pgoutput");
+
+		CreateSubscriptions(
+			sourceConnection,
+			sourceConnection->database,
+			logicalRepTargetList);
 
 		/* only useful for isolation testing, see the function comment for the details */
 		ConflictOnlyWithIsolationTesting();
 
-		/*
-		 * Logical replication starts with copying the existing data for each table in
-		 * the publication. During the copy operation the state of the associated relation
-		 * subscription is not ready. There is no point of locking the shards before the
-		 * subscriptions for each relation becomes ready, so wait for it.
-		 */
-		WaitForRelationSubscriptionsBecomeReady(targetConnection, tableOwnerIds);
+		CopyShardsToNode(sourceNode, targetNode, shardList, snapshot);
 
 		/*
-		 * Wait until the subscription is caught up to changes that has happened
-		 * after the initial COPY on the shards.
+		 * We can close this connection now, because we're done copying the
+		 * data and thus don't need access to the snapshot anymore. The
+		 * replication slot will still be at the same LSN, because the
+		 * subscriptions have not been enabled yet.
 		 */
-		XLogRecPtr sourcePosition = GetRemoteLogPosition(sourceConnection);
-		WaitForShardMoveSubscription(targetConnection, sourcePosition, tableOwnerIds);
+		CloseConnection(sourceReplicationConnection);
 
 		/*
-		 * Now lets create the post-load objects, such as the indexes, constraints
-		 * and partitioning hierarchy. Once they are done, wait until the replication
-		 * catches up again. So we don't block writes too long.
+		 * Start the replication and copy all data
 		 */
-		CreatePostLogicalReplicationDataLoadObjects(shardList, targetNodeName,
-													targetNodePort);
-		sourcePosition = GetRemoteLogPosition(sourceConnection);
-		WaitForShardMoveSubscription(targetConnection, sourcePosition, tableOwnerIds);
-
-		/*
-		 * We're almost done, we'll block the writes to the shards that we're
-		 * replicating and expect the subscription to catch up quickly afterwards.
-		 *
-		 * Notice that although shards in partitioned relation are excluded from
-		 * logical replication, they are still locked against modification, and
-		 * foreign constraints are created on them too.
-		 */
-		BlockWritesToShardList(shardList);
-
-		sourcePosition = GetRemoteLogPosition(sourceConnection);
-		WaitForShardMoveSubscription(targetConnection, sourcePosition, tableOwnerIds);
-
-		/*
-		 * We're creating the foreign constraints to reference tables after the
-		 * data is already replicated and all the necessary locks are acquired.
-		 *
-		 * We prefer to do it here because the placements of reference tables
-		 * are always valid, and any modification during the shard move would
-		 * cascade to the hash distributed tables' shards if we had created
-		 * the constraints earlier.
-		 */
-		CreateForeignConstraintsToReferenceTable(shardList, targetConnection);
-
-		/* we're done, cleanup the publication and subscription */
-		DropShardMoveSubscriptions(targetConnection, tableOwnerIds);
-		DropShardMovePublications(sourceConnection, tableOwnerIds);
+		CompleteNonBlockingShardTransfer(shardList,
+										 sourceConnection,
+										 publicationInfoHash,
+										 logicalRepTargetList,
+										 groupedLogicalRepTargetsHash,
+										 SHARD_MOVE);
 
 		/*
 		 * We use these connections exclusively for subscription management,
@@ -282,7 +259,7 @@ LogicallyReplicateShards(List *shardList, char *sourceNodeName, int sourceNodePo
 		 * these connections instead of the connections that were used to
 		 * grab locks in BlockWritesToShardList.
 		 */
-		CloseConnection(targetConnection);
+		CloseGroupedLogicalRepTargetsConnections(groupedLogicalRepTargetsHash);
 		CloseConnection(sourceConnection);
 	}
 	PG_CATCH();
@@ -296,15 +273,10 @@ LogicallyReplicateShards(List *shardList, char *sourceNodeName, int sourceNodePo
 		 */
 
 		/* reconnect if the connection failed or is waiting for a command */
-		if (PQstatus(targetConnection->pgConn) != CONNECTION_OK ||
-			PQisBusy(targetConnection->pgConn))
-		{
-			targetConnection = GetNodeUserDatabaseConnection(connectionFlags,
-															 targetNodeName,
-															 targetNodePort,
-															 superUser, databaseName);
-		}
-		DropShardMoveSubscriptions(targetConnection, tableOwnerIds);
+		RecreateGroupedLogicalRepTargetsConnections(groupedLogicalRepTargetsHash,
+													superUser, databaseName);
+
+		DropSubscriptions(logicalRepTargetList);
 
 		/* reconnect if the connection failed or is waiting for a command */
 		if (PQstatus(sourceConnection->pgConn) != CONNECTION_OK ||
@@ -315,13 +287,238 @@ LogicallyReplicateShards(List *shardList, char *sourceNodeName, int sourceNodePo
 															 sourceNodePort, superUser,
 															 databaseName);
 		}
-		DropShardMovePublications(sourceConnection, tableOwnerIds);
+		DropReplicationSlots(sourceConnection, logicalRepTargetList);
+		DropPublications(sourceConnection, publicationInfoHash);
 
 		/* We don't need to UnclaimConnections since we're already erroring out */
 
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
+}
+
+
+/*
+ * CreateGroupedLogicalRepTargetsHash creates a hashmap that groups the subscriptions
+ * logicalRepTargetList by node. This is useful for cases where we want to
+ * iterate the subscriptions by node, so we can batch certain operations, such
+ * as checking subscription readiness.
+ */
+HTAB *
+CreateGroupedLogicalRepTargetsHash(List *logicalRepTargetList)
+{
+	HTAB *logicalRepTargetsHash = CreateSimpleHash(uint32, GroupedLogicalRepTargets);
+	LogicalRepTarget *target = NULL;
+	foreach_ptr(target, logicalRepTargetList)
+	{
+		bool found = false;
+		GroupedLogicalRepTargets *groupedLogicalRepTargets =
+			(GroupedLogicalRepTargets *) hash_search(
+				logicalRepTargetsHash,
+				&target->replicationSlot->targetNodeId,
+				HASH_ENTER,
+				&found);
+		if (!found)
+		{
+			groupedLogicalRepTargets->logicalRepTargetList = NIL;
+			groupedLogicalRepTargets->superuserConnection = NULL;
+		}
+		groupedLogicalRepTargets->logicalRepTargetList =
+			lappend(groupedLogicalRepTargets->logicalRepTargetList, target);
+	}
+	return logicalRepTargetsHash;
+}
+
+
+/*
+ * CompleteNonBlockingShardTransfer uses logical replication to apply the changes
+ * made on the source to the target. It also runs all DDL on the target shards
+ * that need to be run after the data copy.
+ *
+ * For shard splits it skips the partition hierarchy and foreign key creation
+ * though, since those need to happen after the metadata is updated.
+ */
+void
+CompleteNonBlockingShardTransfer(List *shardList,
+								 MultiConnection *sourceConnection,
+								 HTAB *publicationInfoHash,
+								 List *logicalRepTargetList,
+								 HTAB *groupedLogicalRepTargetsHash,
+								 LogicalRepType type)
+{
+	/*
+	 * We have to create the primary key (or any other replica identity)
+	 * before the update/delete operations that are queued will be
+	 * replicated. Because if the replica identity does not exist on the
+	 * target, the replication would fail.
+	 *
+	 * So we it right after the initial data COPY, but before enabling the
+	 * susbcriptions. We do it at this latest possible moment, because its
+	 * much cheaper to build an index at once than to create it
+	 * incrementally. So this way we create the primary key index in one go
+	 * for all data from the initial COPY.
+	 */
+	CreateReplicaIdentities(logicalRepTargetList);
+
+	/* Start applying the changes from the replication slots to catch up. */
+	EnableSubscriptions(logicalRepTargetList);
+
+	/*
+	 * The following check is a leftover from when used subscriptions with
+	 * copy_data=true. It's probably not really necessary anymore, but it
+	 * seemed like a nice check to keep. At least for debugging issues it
+	 * seems nice to report differences between the subscription never
+	 * becoming ready and the subscriber not applying WAL. It's also not
+	 * entirely clear if the catchup check handles the case correctly where
+	 * the subscription is not in the ready state yet, because so far it
+	 * never had to.
+	 */
+	WaitForAllSubscriptionsToBecomeReady(groupedLogicalRepTargetsHash);
+
+	/*
+	 * Wait until all the subscriptions are caught up to changes that
+	 * happened after the initial COPY on the shards.
+	 */
+	WaitForAllSubscriptionsToCatchUp(sourceConnection, groupedLogicalRepTargetsHash);
+
+	/*
+	 * Now lets create the post-load objects, such as the indexes, constraints
+	 * and partitioning hierarchy. Once they are done, wait until the replication
+	 * catches up again. So we don't block writes too long.
+	 */
+	CreatePostLogicalReplicationDataLoadObjects(logicalRepTargetList, type);
+	WaitForAllSubscriptionsToCatchUp(sourceConnection, groupedLogicalRepTargetsHash);
+
+
+	/* only useful for isolation testing, see the function comment for the details */
+	ConflictOnlyWithIsolationTesting();
+
+	/*
+	 * We're almost done, we'll block the writes to the shards that we're
+	 * replicating and expect all the subscription to catch up quickly
+	 * afterwards.
+	 *
+	 * Notice that although shards in partitioned relation are excluded from
+	 * logical replication, they are still locked against modification, and
+	 * foreign constraints are created on them too.
+	 */
+	BlockWritesToShardList(shardList);
+
+	WaitForAllSubscriptionsToCatchUp(sourceConnection, groupedLogicalRepTargetsHash);
+
+	if (type != SHARD_SPLIT)
+	{
+		/*
+		 * We're creating the foreign constraints to reference tables after the
+		 * data is already replicated and all the necessary locks are acquired.
+		 *
+		 * We prefer to do it here because the placements of reference tables
+		 * are always valid, and any modification during the shard move would
+		 * cascade to the hash distributed tables' shards if we had created
+		 * the constraints earlier. The same is true for foreign keys between
+		 * tables owned by different users.
+		 */
+		CreateUncheckedForeignKeyConstraints(logicalRepTargetList);
+	}
+
+	/* we're done, cleanup the publication and subscription */
+	DropSubscriptions(logicalRepTargetList);
+	DropReplicationSlots(sourceConnection, logicalRepTargetList);
+	DropPublications(sourceConnection, publicationInfoHash);
+}
+
+
+/*
+ * CreateShardMovePublicationInfoHash creates hashmap of PublicationInfos for a
+ * shard move. Even though we only support moving a shard to a single target
+ * node, the resulting hashmap can have multiple PublicationInfos in it.
+ * The reason for that is that we need a separate publication for each
+ * distributed table owning user in the shard group.
+ */
+static HTAB *
+CreateShardMovePublicationInfoHash(WorkerNode *targetNode, List *shardIntervals)
+{
+	HTAB *publicationInfoHash = CreateSimpleHash(NodeAndOwner, PublicationInfo);
+	ShardInterval *shardInterval = NULL;
+	foreach_ptr(shardInterval, shardIntervals)
+	{
+		NodeAndOwner key;
+		key.nodeId = targetNode->nodeId;
+		key.tableOwnerId = TableOwnerOid(shardInterval->relationId);
+		bool found = false;
+		PublicationInfo *publicationInfo =
+			(PublicationInfo *) hash_search(publicationInfoHash, &key,
+											HASH_ENTER,
+											&found);
+		if (!found)
+		{
+			publicationInfo->name = PublicationName(SHARD_MOVE, key.nodeId,
+													key.tableOwnerId);
+			publicationInfo->shardIntervals = NIL;
+		}
+		publicationInfo->shardIntervals =
+			lappend(publicationInfo->shardIntervals, shardInterval);
+	}
+	return publicationInfoHash;
+}
+
+
+/*
+ * CreateShardMoveLogicalRepTargetList creates the list containing all the
+ * subscriptions that should be connected to the publications in the given
+ * publicationHash.
+ */
+static List *
+CreateShardMoveLogicalRepTargetList(HTAB *publicationInfoHash, List *shardList)
+{
+	List *logicalRepTargetList = NIL;
+
+	HASH_SEQ_STATUS status;
+	hash_seq_init(&status, publicationInfoHash);
+	Oid nodeId = InvalidOid;
+
+	PublicationInfo *publication = NULL;
+	while ((publication = (PublicationInfo *) hash_seq_search(&status)) != NULL)
+	{
+		Oid ownerId = publication->key.tableOwnerId;
+		nodeId = publication->key.nodeId;
+		LogicalRepTarget *target = palloc0(sizeof(LogicalRepTarget));
+		target->subscriptionName = SubscriptionName(SHARD_MOVE, ownerId);
+		target->tableOwnerId = ownerId;
+		target->publication = publication;
+		publication->target = target;
+		target->newShards = NIL;
+		target->subscriptionOwnerName = SubscriptionRoleName(SHARD_MOVE, ownerId);
+		target->replicationSlot = palloc0(sizeof(ReplicationSlotInfo));
+		target->replicationSlot->name = ReplicationSlotName(SHARD_MOVE,
+															nodeId,
+															ownerId);
+		target->replicationSlot->targetNodeId = nodeId;
+		target->replicationSlot->tableOwnerId = ownerId;
+		logicalRepTargetList = lappend(logicalRepTargetList, target);
+	}
+
+	ShardInterval *shardInterval = NULL;
+	foreach_ptr(shardInterval, shardList)
+	{
+		NodeAndOwner key;
+		key.nodeId = nodeId;
+		key.tableOwnerId = TableOwnerOid(shardInterval->relationId);
+
+		bool found = false;
+		publication = (PublicationInfo *) hash_search(
+			publicationInfoHash,
+			&key,
+			HASH_FIND,
+			&found);
+		if (!found)
+		{
+			ereport(ERROR, errmsg("Could not find publication matching a split"));
+		}
+		publication->target->newShards = lappend(
+			publication->target->newShards, shardInterval);
+	}
+	return logicalRepTargetList;
 }
 
 
@@ -345,26 +542,27 @@ AcquireLogicalReplicationLock(void)
 
 
 /*
- * DropAllShardMoveLeftovers drops shard move subscriptions, publications, roles
- * and replication slots on all nodes. These might have been left there after
- * the coordinator crashed during a shard move. It's important to delete them
- * for two reasons:
+ * DropAllLogicalReplicationLeftovers drops all subscriptions, publications,
+ * roles and replication slots on all nodes that were related to this
+ * LogicalRepType. These might have been left there after the coordinator
+ * crashed during a shard move/split. It's important to delete them for two
+ * reasons:
  * 1. Starting new shard moves will fail when they exist, because it cannot
  *    create them.
  * 2. Leftover replication slots that are not consumed from anymore make it
  *    impossible for WAL to be dropped. This can cause out-of-disk issues.
  */
-static void
-DropAllShardMoveLeftovers(void)
+void
+DropAllLogicalReplicationLeftovers(LogicalRepType type)
 {
 	char *superUser = CitusExtensionOwnerName();
 	char *databaseName = get_database_name(MyDatabaseId);
 
 	/*
 	 * We open new connections to all nodes. The reason for this is that
-	 * operations on subscriptions and publications cannot be run in a
-	 * transaction. By forcing a new connection we make sure no transaction is
-	 * active on the connection.
+	 * operations on subscriptions, publications and replication slotscannot be
+	 * run in a transaction. By forcing a new connection we make sure no
+	 * transaction is active on the connection.
 	 */
 	int connectionFlags = FORCE_NEW_CONNECTION;
 
@@ -385,8 +583,8 @@ DropAllShardMoveLeftovers(void)
 			superUser, databaseName);
 		cleanupConnectionList = lappend(cleanupConnectionList, cleanupConnection);
 
-		DropAllShardMoveSubscriptions(cleanupConnection);
-		DropAllShardMoveUsers(cleanupConnection);
+		DropAllSubscriptions(cleanupConnection, type);
+		DropAllUsers(cleanupConnection, type);
 	}
 
 	MultiConnection *cleanupConnection = NULL;
@@ -396,13 +594,13 @@ DropAllShardMoveLeftovers(void)
 		 * If replication slot could not be dropped while dropping the
 		 * subscriber, drop it here.
 		 */
-		DropAllShardMoveReplicationSlots(cleanupConnection);
-		DropAllShardMovePublications(cleanupConnection);
+		DropAllReplicationSlots(cleanupConnection, type);
+		DropAllPublications(cleanupConnection, type);
 
 		/*
 		 * We close all connections that we opened for the dropping here. That
 		 * way we don't keep these connections open unnecessarily during the
-		 * shard move (which can take a long time).
+		 * 'LogicalRepType' operation (which can take a long time).
 		 */
 		CloseConnection(cleanupConnection);
 	}
@@ -438,34 +636,33 @@ PrepareReplicationSubscriptionList(List *shardList)
 
 
 /*
- * TableOwnerIds returns a bitmapset containing all the owners of the tables
- * that the given shards belong to.
+ * CreateReplicaIdentities creates replica identities for all the shards that
+ * are part of the given subscriptions.
  */
-static Bitmapset *
-TableOwnerIds(List *shardList)
+void
+CreateReplicaIdentities(List *logicalRepTargetList)
 {
-	ShardInterval *shardInterval = NULL;
-	Bitmapset *tableOwnerIds = NULL;
-
-	foreach_ptr(shardInterval, shardList)
+	LogicalRepTarget *target = NULL;
+	foreach_ptr(target, logicalRepTargetList)
 	{
-		tableOwnerIds = bms_add_member(tableOwnerIds, TableOwnerOid(
-										   shardInterval->relationId));
+		MultiConnection *superuserConnection = target->superuserConnection;
+		CreateReplicaIdentitiesOnNode(
+			target->newShards,
+			superuserConnection->hostname,
+			superuserConnection->port);
 	}
-
-	return tableOwnerIds;
 }
 
 
 /*
- * CreateReplicaIdentity gets a shardList and creates all the replica identities
- * on the shards in the given node.
+ * CreateReplicaIdentitiesOnNode gets a shardList and creates all the replica
+ * identities on the shards in the given node.
  */
-static void
-CreateReplicaIdentity(List *shardList, char *nodeName, int32 nodePort)
+void
+CreateReplicaIdentitiesOnNode(List *shardList, char *nodeName, int32 nodePort)
 {
 	MemoryContext localContext = AllocSetContextCreate(CurrentMemoryContext,
-													   "CreateReplicaIdentity",
+													   "CreateReplicaIdentitiesOnNode",
 													   ALLOCSET_DEFAULT_SIZES);
 	MemoryContext oldContext = MemoryContextSwitchTo(localContext);
 
@@ -568,8 +765,8 @@ GetReplicaIdentityCommandListForShard(Oid relationId, uint64 shardId)
  * the objects that can be created after the data is moved with logical replication.
  */
 static void
-CreatePostLogicalReplicationDataLoadObjects(List *shardList, char *targetNodeName,
-											int32 targetNodePort)
+CreatePostLogicalReplicationDataLoadObjects(List *logicalRepTargetList,
+											LogicalRepType type)
 {
 	/*
 	 * We create indexes in 4 steps.
@@ -585,23 +782,25 @@ CreatePostLogicalReplicationDataLoadObjects(List *shardList, char *targetNodeNam
 	 *  table and setting the statistics of indexes, depends on the indexes being
 	 *  created. That's why the execution is divided into four distinct stages.
 	 */
-	ExecuteCreateIndexCommands(shardList, targetNodeName, targetNodePort);
-	ExecuteCreateConstraintsBackedByIndexCommands(shardList, targetNodeName,
-												  targetNodePort);
-	ExecuteClusterOnCommands(shardList, targetNodeName, targetNodePort);
-	ExecuteCreateIndexStatisticsCommands(shardList, targetNodeName, targetNodePort);
+	ExecuteCreateIndexCommands(logicalRepTargetList);
+	ExecuteCreateConstraintsBackedByIndexCommands(logicalRepTargetList);
+	ExecuteClusterOnCommands(logicalRepTargetList);
+	ExecuteCreateIndexStatisticsCommands(logicalRepTargetList);
 
 	/*
 	 * Once the indexes are created, there are few more objects like triggers and table
 	 * statistics that should be created after the data move.
 	 */
-	ExecuteRemainingPostLoadTableCommands(shardList, targetNodeName, targetNodePort);
+	ExecuteRemainingPostLoadTableCommands(logicalRepTargetList);
 
-	/* create partitioning hierarchy, if any */
-	CreatePartitioningHierarchy(shardList, targetNodeName, targetNodePort);
-
-	/* create colocated foreign keys, if any */
-	CreateColocatedForeignKeys(shardList, targetNodeName, targetNodePort);
+	/*
+	 * Creating the partitioning hierarchy errors out in shard splits when
+	 */
+	if (type != SHARD_SPLIT)
+	{
+		/* create partitioning hierarchy, if any */
+		CreatePartitioningHierarchy(logicalRepTargetList);
+	}
 }
 
 
@@ -613,27 +812,31 @@ CreatePostLogicalReplicationDataLoadObjects(List *shardList, char *targetNodeNam
  * commands fail.
  */
 static void
-ExecuteCreateIndexCommands(List *shardList, char *targetNodeName, int targetNodePort)
+ExecuteCreateIndexCommands(List *logicalRepTargetList)
 {
 	List *taskList = NIL;
-	ListCell *shardCell = NULL;
-	foreach(shardCell, shardList)
+	LogicalRepTarget *target = NULL;
+	foreach_ptr(target, logicalRepTargetList)
 	{
-		ShardInterval *shardInterval = (ShardInterval *) lfirst(shardCell);
-		Oid relationId = shardInterval->relationId;
+		ShardInterval *shardInterval = NULL;
+		foreach_ptr(shardInterval, target->newShards)
+		{
+			Oid relationId = shardInterval->relationId;
 
-		List *tableCreateIndexCommandList =
-			GetTableIndexAndConstraintCommandsExcludingReplicaIdentity(relationId,
-																	   INCLUDE_CREATE_INDEX_STATEMENTS);
+			List *tableCreateIndexCommandList =
+				GetTableIndexAndConstraintCommandsExcludingReplicaIdentity(relationId,
+																		   INCLUDE_CREATE_INDEX_STATEMENTS);
 
-		List *shardCreateIndexCommandList =
-			WorkerApplyShardDDLCommandList(tableCreateIndexCommandList,
-										   shardInterval->shardId);
-		List *taskListForShard =
-			ConvertNonExistingPlacementDDLCommandsToTasks(shardCreateIndexCommandList,
-														  shardInterval->shardId,
-														  targetNodeName, targetNodePort);
-		taskList = list_concat(taskList, taskListForShard);
+			List *shardCreateIndexCommandList =
+				WorkerApplyShardDDLCommandList(tableCreateIndexCommandList,
+											   shardInterval->shardId);
+			List *taskListForShard =
+				ConvertNonExistingPlacementDDLCommandsToTasks(
+					shardCreateIndexCommandList,
+					target->superuserConnection->hostname,
+					target->superuserConnection->port);
+			taskList = list_concat(taskList, taskListForShard);
+		}
 	}
 
 	/*
@@ -648,8 +851,7 @@ ExecuteCreateIndexCommands(List *shardList, char *targetNodeName, int targetNode
 	 */
 
 	ereport(DEBUG1, (errmsg("Creating post logical replication objects "
-							"(indexes) on node %s:%d", targetNodeName,
-							targetNodePort)));
+							"(indexes)")));
 
 	ExecuteTaskListOutsideTransaction(ROW_MODIFY_NONE, taskList,
 									  MaxAdaptiveExecutorPoolSize,
@@ -665,45 +867,47 @@ ExecuteCreateIndexCommands(List *shardList, char *targetNodeName, int targetNode
  * commands fail.
  */
 static void
-ExecuteCreateConstraintsBackedByIndexCommands(List *shardList, char *targetNodeName,
-											  int targetNodePort)
+ExecuteCreateConstraintsBackedByIndexCommands(List *logicalRepTargetList)
 {
 	ereport(DEBUG1, (errmsg("Creating post logical replication objects "
-							"(constraints backed by indexes) on node %s:%d",
-							targetNodeName,
-							targetNodePort)));
+							"(constraints backed by indexes)")));
 
 	MemoryContext localContext = AllocSetContextCreate(CurrentMemoryContext,
 													   "CreateConstraintsBackedByIndexContext",
 													   ALLOCSET_DEFAULT_SIZES);
 	MemoryContext oldContext = MemoryContextSwitchTo(localContext);
 
-	ListCell *shardCell = NULL;
-	foreach(shardCell, shardList)
+	LogicalRepTarget *target = NULL;
+	foreach_ptr(target, logicalRepTargetList)
 	{
-		ShardInterval *shardInterval = (ShardInterval *) lfirst(shardCell);
-		Oid relationId = shardInterval->relationId;
-
-		List *tableCreateConstraintCommandList =
-			GetTableIndexAndConstraintCommandsExcludingReplicaIdentity(relationId,
-																	   INCLUDE_CREATE_CONSTRAINT_STATEMENTS);
-
-		if (tableCreateConstraintCommandList == NIL)
+		ShardInterval *shardInterval = NULL;
+		foreach_ptr(shardInterval, target->newShards)
 		{
-			/* no constraints backed by indexes, skip */
+			Oid relationId = shardInterval->relationId;
+
+			List *tableCreateConstraintCommandList =
+				GetTableIndexAndConstraintCommandsExcludingReplicaIdentity(relationId,
+																		   INCLUDE_CREATE_CONSTRAINT_STATEMENTS);
+
+			if (tableCreateConstraintCommandList == NIL)
+			{
+				/* no constraints backed by indexes, skip */
+				MemoryContextReset(localContext);
+				continue;
+			}
+
+			List *shardCreateConstraintCommandList =
+				WorkerApplyShardDDLCommandList(tableCreateConstraintCommandList,
+											   shardInterval->shardId);
+
+			char *tableOwner = TableOwner(shardInterval->relationId);
+			SendCommandListToWorkerOutsideTransaction(
+				target->superuserConnection->hostname,
+				target->superuserConnection->port,
+				tableOwner,
+				shardCreateConstraintCommandList);
 			MemoryContextReset(localContext);
-			continue;
 		}
-
-		List *shardCreateConstraintCommandList =
-			WorkerApplyShardDDLCommandList(tableCreateConstraintCommandList,
-										   shardInterval->shardId);
-
-		char *tableOwner = TableOwner(shardInterval->relationId);
-		SendCommandListToWorkerOutsideTransaction(targetNodeName, targetNodePort,
-												  tableOwner,
-												  shardCreateConstraintCommandList);
-		MemoryContextReset(localContext);
 	}
 
 	MemoryContextSwitchTo(oldContext);
@@ -719,7 +923,6 @@ ExecuteCreateConstraintsBackedByIndexCommands(List *shardList, char *targetNodeN
  */
 static List *
 ConvertNonExistingPlacementDDLCommandsToTasks(List *shardCommandList,
-											  uint64 shardId,
 											  char *targetNodeName,
 											  int targetNodePort)
 {
@@ -740,7 +943,6 @@ ConvertNonExistingPlacementDDLCommandsToTasks(List *shardCommandList,
 		SetPlacementNodeMetadata(taskPlacement, workerNode);
 
 		task->taskPlacementList = list_make1(taskPlacement);
-		task->anchorShardId = shardId;
 
 		taskList = lappend(taskList, task);
 		taskId++;
@@ -758,34 +960,36 @@ ConvertNonExistingPlacementDDLCommandsToTasks(List *shardCommandList,
  * is aborted.
  */
 static void
-ExecuteClusterOnCommands(List *shardList, char *targetNodeName, int targetNodePort)
+ExecuteClusterOnCommands(List *logicalRepTargetList)
 {
 	List *taskList = NIL;
-	ListCell *shardCell;
-	foreach(shardCell, shardList)
+	LogicalRepTarget *target = NULL;
+	foreach_ptr(target, logicalRepTargetList)
 	{
-		ShardInterval *shardInterval = (ShardInterval *) lfirst(shardCell);
-		Oid relationId = shardInterval->relationId;
+		ShardInterval *shardInterval = NULL;
+		foreach_ptr(shardInterval, target->newShards)
+		{
+			Oid relationId = shardInterval->relationId;
 
-		List *tableAlterTableClusterOnCommandList =
-			GetTableIndexAndConstraintCommandsExcludingReplicaIdentity(relationId,
-																	   INCLUDE_INDEX_CLUSTERED_STATEMENTS);
+			List *tableAlterTableClusterOnCommandList =
+				GetTableIndexAndConstraintCommandsExcludingReplicaIdentity(relationId,
+																		   INCLUDE_INDEX_CLUSTERED_STATEMENTS);
 
-		List *shardAlterTableClusterOnCommandList =
-			WorkerApplyShardDDLCommandList(tableAlterTableClusterOnCommandList,
-										   shardInterval->shardId);
+			List *shardAlterTableClusterOnCommandList =
+				WorkerApplyShardDDLCommandList(tableAlterTableClusterOnCommandList,
+											   shardInterval->shardId);
 
-		List *taskListForShard =
-			ConvertNonExistingPlacementDDLCommandsToTasks(
-				shardAlterTableClusterOnCommandList,
-				shardInterval->shardId,
-				targetNodeName, targetNodePort);
-		taskList = list_concat(taskList, taskListForShard);
+			List *taskListForShard =
+				ConvertNonExistingPlacementDDLCommandsToTasks(
+					shardAlterTableClusterOnCommandList,
+					target->superuserConnection->hostname,
+					target->superuserConnection->port);
+			taskList = list_concat(taskList, taskListForShard);
+		}
 	}
 
 	ereport(DEBUG1, (errmsg("Creating post logical replication objects "
-							"(CLUSTER ON) on node %s:%d", targetNodeName,
-							targetNodePort)));
+							"(CLUSTER ON)")));
 
 	ExecuteTaskListOutsideTransaction(ROW_MODIFY_NONE, taskList,
 									  MaxAdaptiveExecutorPoolSize,
@@ -801,48 +1005,51 @@ ExecuteClusterOnCommands(List *shardList, char *targetNodeName, int targetNodePo
  * is aborted.
  */
 static void
-ExecuteCreateIndexStatisticsCommands(List *shardList, char *targetNodeName, int
-									 targetNodePort)
+ExecuteCreateIndexStatisticsCommands(List *logicalRepTargetList)
 {
 	ereport(DEBUG1, (errmsg("Creating post logical replication objects "
-							"(index statistics) on node %s:%d", targetNodeName,
-							targetNodePort)));
+							"(index statistics)")));
 
 	MemoryContext localContext = AllocSetContextCreate(CurrentMemoryContext,
 													   "CreateIndexStatisticsContext",
 													   ALLOCSET_DEFAULT_SIZES);
 	MemoryContext oldContext = MemoryContextSwitchTo(localContext);
 
-	ListCell *shardCell;
-	foreach(shardCell, shardList)
+	LogicalRepTarget *target = NULL;
+	foreach_ptr(target, logicalRepTargetList)
 	{
-		ShardInterval *shardInterval = (ShardInterval *) lfirst(shardCell);
-		Oid relationId = shardInterval->relationId;
-
-		List *tableAlterIndexSetStatisticsCommandList =
-			GetTableIndexAndConstraintCommandsExcludingReplicaIdentity(relationId,
-																	   INCLUDE_INDEX_STATISTICS_STATEMENTTS);
-		List *shardAlterIndexSetStatisticsCommandList =
-			WorkerApplyShardDDLCommandList(tableAlterIndexSetStatisticsCommandList,
-										   shardInterval->shardId);
-
-		if (shardAlterIndexSetStatisticsCommandList == NIL)
+		ShardInterval *shardInterval = NULL;
+		foreach_ptr(shardInterval, target->newShards)
 		{
-			/* no index statistics exists, skip */
+			Oid relationId = shardInterval->relationId;
+
+			List *tableAlterIndexSetStatisticsCommandList =
+				GetTableIndexAndConstraintCommandsExcludingReplicaIdentity(relationId,
+																		   INCLUDE_INDEX_STATISTICS_STATEMENTTS);
+			List *shardAlterIndexSetStatisticsCommandList =
+				WorkerApplyShardDDLCommandList(tableAlterIndexSetStatisticsCommandList,
+											   shardInterval->shardId);
+
+			if (shardAlterIndexSetStatisticsCommandList == NIL)
+			{
+				/* no index statistics exists, skip */
+				MemoryContextReset(localContext);
+				continue;
+			}
+
+			/*
+			 * These remaining operations do not require significant resources, so no
+			 * need to create them in parallel.
+			 */
+			char *tableOwner = TableOwner(shardInterval->relationId);
+			SendCommandListToWorkerOutsideTransaction(
+				target->superuserConnection->hostname,
+				target->superuserConnection->port,
+				tableOwner,
+				shardAlterIndexSetStatisticsCommandList);
+
 			MemoryContextReset(localContext);
-			continue;
 		}
-
-		/*
-		 * These remaining operations do not require significant resources, so no
-		 * need to create them in parallel.
-		 */
-		char *tableOwner = TableOwner(shardInterval->relationId);
-		SendCommandListToWorkerOutsideTransaction(targetNodeName, targetNodePort,
-												  tableOwner,
-												  shardAlterIndexSetStatisticsCommandList);
-
-		MemoryContextReset(localContext);
 	}
 
 	MemoryContextSwitchTo(oldContext);
@@ -855,52 +1062,55 @@ ExecuteCreateIndexStatisticsCommands(List *shardList, char *targetNodeName, int
  * in the given target node.
  */
 static void
-ExecuteRemainingPostLoadTableCommands(List *shardList, char *targetNodeName, int
-									  targetNodePort)
+ExecuteRemainingPostLoadTableCommands(List *logicalRepTargetList)
 {
 	ereport(DEBUG1, (errmsg("Creating post logical replication objects "
-							"(triggers and table statistics) on node %s:%d",
-							targetNodeName,
-							targetNodePort)));
+							"(triggers and table statistics)"
+							)));
 
 	MemoryContext localContext = AllocSetContextCreate(CurrentMemoryContext,
 													   "CreateTableStatisticsContext",
 													   ALLOCSET_DEFAULT_SIZES);
 	MemoryContext oldContext = MemoryContextSwitchTo(localContext);
 
-	ListCell *shardCell = NULL;
-	foreach(shardCell, shardList)
+	LogicalRepTarget *target = NULL;
+	foreach_ptr(target, logicalRepTargetList)
 	{
-		ShardInterval *shardInterval = (ShardInterval *) lfirst(shardCell);
-		Oid relationId = shardInterval->relationId;
-
-		bool includeIndexes = false;
-		bool includeReplicaIdentity = false;
-
-		List *tablePostLoadTableCommandList =
-			GetPostLoadTableCreationCommands(relationId, includeIndexes,
-											 includeReplicaIdentity);
-
-		List *shardPostLoadTableCommandList =
-			WorkerApplyShardDDLCommandList(tablePostLoadTableCommandList,
-										   shardInterval->shardId);
-
-		if (shardPostLoadTableCommandList == NIL)
+		ShardInterval *shardInterval = NULL;
+		foreach_ptr(shardInterval, target->newShards)
 		{
-			/* no index statistics exists, skip */
-			continue;
+			Oid relationId = shardInterval->relationId;
+
+			bool includeIndexes = false;
+			bool includeReplicaIdentity = false;
+
+			List *tablePostLoadTableCommandList =
+				GetPostLoadTableCreationCommands(relationId, includeIndexes,
+												 includeReplicaIdentity);
+
+			List *shardPostLoadTableCommandList =
+				WorkerApplyShardDDLCommandList(tablePostLoadTableCommandList,
+											   shardInterval->shardId);
+
+			if (shardPostLoadTableCommandList == NIL)
+			{
+				/* no index statistics exists, skip */
+				continue;
+			}
+
+			/*
+			 * These remaining operations do not require significant resources, so no
+			 * need to create them in parallel.
+			 */
+			char *tableOwner = TableOwner(shardInterval->relationId);
+			SendCommandListToWorkerOutsideTransaction(
+				target->superuserConnection->hostname,
+				target->superuserConnection->port,
+				tableOwner,
+				shardPostLoadTableCommandList);
+
+			MemoryContextReset(localContext);
 		}
-
-		/*
-		 * These remaining operations do not require significant resources, so no
-		 * need to create them in parallel.
-		 */
-		char *tableOwner = TableOwner(shardInterval->relationId);
-		SendCommandListToWorkerOutsideTransaction(targetNodeName, targetNodePort,
-												  tableOwner,
-												  shardPostLoadTableCommandList);
-
-		MemoryContextReset(localContext);
 	}
 
 	MemoryContextSwitchTo(oldContext);
@@ -911,40 +1121,42 @@ ExecuteRemainingPostLoadTableCommands(List *shardList, char *targetNodeName, int
  * CreatePartitioningHierarchy gets a shardList and creates the partitioning
  * hierarchy between the shardList, if any,
  */
-static void
-CreatePartitioningHierarchy(List *shardList, char *targetNodeName, int targetNodePort)
+void
+CreatePartitioningHierarchy(List *logicalRepTargetList)
 {
 	ereport(DEBUG1, (errmsg("Creating post logical replication objects "
-							"(partitioning hierarchy) on node %s:%d", targetNodeName,
-							targetNodePort)));
+							"(partitioning hierarchy)")));
 
 	MemoryContext localContext = AllocSetContextCreate(CurrentMemoryContext,
 													   "CreatePartitioningHierarchy",
 													   ALLOCSET_DEFAULT_SIZES);
 	MemoryContext oldContext = MemoryContextSwitchTo(localContext);
 
-	ListCell *shardCell = NULL;
-	foreach(shardCell, shardList)
+	LogicalRepTarget *target = NULL;
+	foreach_ptr(target, logicalRepTargetList)
 	{
-		ShardInterval *shardInterval = (ShardInterval *) lfirst(shardCell);
-
-		if (PartitionTable(shardInterval->relationId))
+		ShardInterval *shardInterval = NULL;
+		foreach_ptr(shardInterval, target->newShards)
 		{
-			char *attachPartitionCommand =
-				GenerateAttachShardPartitionCommand(shardInterval);
+			if (PartitionTable(shardInterval->relationId))
+			{
+				char *attachPartitionCommand =
+					GenerateAttachShardPartitionCommand(shardInterval);
 
-			char *tableOwner = TableOwner(shardInterval->relationId);
+				char *tableOwner = TableOwner(shardInterval->relationId);
 
-			/*
-			 * Attaching partition may acquire conflicting locks when created in
-			 * parallel, so create them sequentially. Also attaching partition
-			 * is a quick operation, so it is fine to execute sequentially.
-			 */
-			SendCommandListToWorkerOutsideTransaction(targetNodeName, targetNodePort,
-													  tableOwner,
-													  list_make1(
-														  attachPartitionCommand));
-			MemoryContextReset(localContext);
+				/*
+				 * Attaching partition may acquire conflicting locks when created in
+				 * parallel, so create them sequentially. Also attaching partition
+				 * is a quick operation, so it is fine to execute sequentially.
+				 */
+				SendCommandListToWorkerOutsideTransaction(
+					target->superuserConnection->hostname,
+					target->superuserConnection->port,
+					tableOwner,
+					list_make1(attachPartitionCommand));
+				MemoryContextReset(localContext);
+			}
 		}
 	}
 
@@ -953,89 +1165,52 @@ CreatePartitioningHierarchy(List *shardList, char *targetNodeName, int targetNod
 
 
 /*
- * CreateColocatedForeignKeys gets a shardList and creates the colocated foreign
- * keys between the shardList, if any,
+ * CreateUncheckedForeignKeyConstraints is used to create the foreign
+ * constraints on the logical replication target without checking that they are
+ * actually valid.
+ *
+ * We skip the validation phase of foreign keys to after a shard
+ * move/copy/split because the validation is pretty costly and given that the
+ * source placements are already valid, the validation in the target nodes is
+ * useless.
  */
-static void
-CreateColocatedForeignKeys(List *shardList, char *targetNodeName, int targetNodePort)
+void
+CreateUncheckedForeignKeyConstraints(List *logicalRepTargetList)
 {
-	ereport(DEBUG1, (errmsg("Creating post logical replication objects "
-							"(co-located foreign keys) on node %s:%d", targetNodeName,
-							targetNodePort)));
-
-	MemoryContext localContext = AllocSetContextCreate(CurrentMemoryContext,
-													   "CreateColocatedForeignKeys",
-													   ALLOCSET_DEFAULT_SIZES);
-	MemoryContext oldContext = MemoryContextSwitchTo(localContext);
-
-	ListCell *shardCell = NULL;
-	foreach(shardCell, shardList)
-	{
-		ShardInterval *shardInterval = (ShardInterval *) lfirst(shardCell);
-
-		List *shardForeignConstraintCommandList = NIL;
-		List *referenceTableForeignConstraintList = NIL;
-		CopyShardForeignConstraintCommandListGrouped(shardInterval,
-													 &shardForeignConstraintCommandList,
-													 &referenceTableForeignConstraintList);
-
-		if (shardForeignConstraintCommandList == NIL)
-		{
-			/* no colocated foreign keys, skip */
-			continue;
-		}
-
-		/*
-		 * Creating foreign keys may acquire conflicting locks when done in
-		 * parallel. Hence we create foreign keys one at a time.
-		 *
-		 */
-		char *tableOwner = TableOwner(shardInterval->relationId);
-		SendCommandListToWorkerOutsideTransaction(targetNodeName, targetNodePort,
-												  tableOwner,
-												  shardForeignConstraintCommandList);
-		MemoryContextReset(localContext);
-	}
-
-	MemoryContextSwitchTo(oldContext);
-}
-
-
-/*
- * CreateForeignConstraintsToReferenceTable is used to create the foreign constraints
- * from distributed to reference tables in the newly created shard replicas.
- */
-static void
-CreateForeignConstraintsToReferenceTable(List *shardList,
-										 MultiConnection *targetConnection)
-{
-	ereport(DEBUG1, (errmsg("Creating post logical replication objects "
-							"(foreign keys to reference tables) on node "
-							"%s:%d", targetConnection->hostname,
-							targetConnection->port)));
-
 	MemoryContext localContext =
 		AllocSetContextCreate(CurrentMemoryContext,
-							  "CreateForeignConstraintsToReferenceTable",
+							  "CreateKeyForeignConstraints",
 							  ALLOCSET_DEFAULT_SIZES);
 	MemoryContext oldContext = MemoryContextSwitchTo(localContext);
 
 
-	ListCell *shardCell = NULL;
-	foreach(shardCell, shardList)
+	/*
+	 * Iterate over all the shards in the shard group.
+	 */
+	LogicalRepTarget *target = NULL;
+	foreach_ptr(target, logicalRepTargetList)
 	{
-		ListCell *commandCell = NULL;
-		ShardInterval *shardInterval = (ShardInterval *) lfirst(shardCell);
-		List *commandList = GetForeignConstraintCommandsToReferenceTable(shardInterval);
+		ShardInterval *shardInterval = NULL;
 
-		/* iterate over the commands and execute them in the same connection */
-		foreach(commandCell, commandList)
+		/*
+		 * Iterate on split shards list for a given shard and create constraints.
+		 */
+		foreach_ptr(shardInterval, target->newShards)
 		{
-			char *commandString = lfirst(commandCell);
+			List *commandList = CopyShardForeignConstraintCommandList(
+				shardInterval);
+			commandList = list_concat(
+				list_make1("SET LOCAL citus.skip_constraint_validation TO ON;"),
+				commandList);
 
-			ExecuteCriticalRemoteCommand(targetConnection, commandString);
+			SendCommandListToWorkerOutsideTransaction(
+				target->superuserConnection->hostname,
+				target->superuserConnection->port,
+				target->superuserConnection->user,
+				commandList);
+
+			MemoryContextReset(localContext);
 		}
-		MemoryContextReset(localContext);
 	}
 
 	MemoryContextSwitchTo(oldContext);
@@ -1053,7 +1228,7 @@ CreateForeignConstraintsToReferenceTable(List *shardList,
  * Note that since the cost of calling this function is pretty low, we prefer
  * to use it in non-assert builds as well not to diverge in the behaviour.
  */
-static void
+extern void
 ConflictOnlyWithIsolationTesting()
 {
 	LOCKTAG tag;
@@ -1072,33 +1247,44 @@ ConflictOnlyWithIsolationTesting()
 
 
 /*
- * DropShardMovePublication drops the publication used for shard moves over the given
- * connection, if it exists. It also drops the replication slot if that slot was not
- * dropped while dropping the subscription.
+ * DropReplicationSlots drops the replication slots used for shard moves/splits
+ * over the given connection (if they exist).
  */
-static void
-DropShardMovePublications(MultiConnection *connection, Bitmapset *tableOwnerIds)
+void
+DropReplicationSlots(MultiConnection *sourceConnection, List *logicalRepTargetList)
 {
-	int ownerId = -1;
-
-	while ((ownerId = bms_next_member(tableOwnerIds, ownerId)) >= 0)
+	LogicalRepTarget *target = NULL;
+	foreach_ptr(target, logicalRepTargetList)
 	{
-		/*
-		 * If replication slot can not be dropped while dropping the subscriber, drop
-		 * it here.
-		 */
-		DropShardMoveReplicationSlot(connection, ShardMoveSubscriptionName(ownerId));
-		DropShardMovePublication(connection, ShardMovePublicationName(ownerId));
+		DropReplicationSlot(sourceConnection, target->replicationSlot->name);
 	}
 }
 
 
 /*
- * DropShardMoveReplicationSlot drops the replication slot with the given name
+ * DropPublications drops the publications used for shard moves/splits over the
+ * given connection (if they exist).
+ */
+void
+DropPublications(MultiConnection *sourceConnection, HTAB *publicationInfoHash)
+{
+	HASH_SEQ_STATUS status;
+	hash_seq_init(&status, publicationInfoHash);
+
+	PublicationInfo *entry = NULL;
+	while ((entry = (PublicationInfo *) hash_seq_search(&status)) != NULL)
+	{
+		DropPublication(sourceConnection, entry->name);
+	}
+}
+
+
+/*
+ * DropReplicationSlot drops the replication slot with the given name
  * if it exists.
  */
 static void
-DropShardMoveReplicationSlot(MultiConnection *connection, char *replicationSlotName)
+DropReplicationSlot(MultiConnection *connection, char *replicationSlotName)
 {
 	ExecuteCriticalRemoteCommand(
 		connection,
@@ -1111,11 +1297,11 @@ DropShardMoveReplicationSlot(MultiConnection *connection, char *replicationSlotN
 
 
 /*
- * DropShardMovePublication drops the publication with the given name if it
+ * DropPublication drops the publication with the given name if it
  * exists.
  */
 static void
-DropShardMovePublication(MultiConnection *connection, char *publicationName)
+DropPublication(MultiConnection *connection, char *publicationName)
 {
 	ExecuteCriticalRemoteCommand(connection, psprintf(
 									 "DROP PUBLICATION IF EXISTS %s",
@@ -1124,49 +1310,56 @@ DropShardMovePublication(MultiConnection *connection, char *publicationName)
 
 
 /*
- * ShardMovePublicationName returns the name of the publication for the given
+ * PublicationName returns the name of the publication for the given node and
  * table owner.
  */
-static char *
-ShardMovePublicationName(Oid ownerId)
+char *
+PublicationName(LogicalRepType type, uint32_t nodeId, Oid ownerId)
 {
-	return psprintf("%s%i", SHARD_MOVE_PUBLICATION_PREFIX, ownerId);
+	return psprintf("%s%u_%u", publicationPrefix[type], nodeId, ownerId);
 }
 
 
 /*
- * ShardMoveSubscriptionName returns the name of the subscription for the given
- * owner. If we're running the isolation tester the function also appends the
- * process id normal subscription name.
- *
- * When it contains the PID of the current process it is used for block detection
- * by the isolation test runner, since the replication process on the publishing
- * node uses the name of the subscription as the application_name of the SQL session.
- * This PID is then extracted from the application_name to find out which PID on the
- * coordinator is blocked by the blocked replication process.
+ * ReplicationSlotName returns the name of the replication slot for the given
+ * node and table owner.
  */
-static char *
-ShardMoveSubscriptionName(Oid ownerId)
+char *
+ReplicationSlotName(LogicalRepType type, uint32_t nodeId, Oid ownerId)
 {
-	if (RunningUnderIsolationTest)
+	StringInfo slotName = makeStringInfo();
+	appendStringInfo(slotName, "%s%u_%u", replicationSlotPrefix[type], nodeId,
+					 ownerId);
+
+	if (slotName->len > NAMEDATALEN)
 	{
-		return psprintf("%s%i_%i", SHARD_MOVE_SUBSCRIPTION_PREFIX, ownerId, MyProcPid);
+		ereport(ERROR,
+				(errmsg(
+					 "Replication Slot name:%s having length:%d is greater than maximum allowed length:%d",
+					 slotName->data, slotName->len, NAMEDATALEN)));
 	}
-	else
-	{
-		return psprintf("%s%i", SHARD_MOVE_SUBSCRIPTION_PREFIX, ownerId);
-	}
+	return slotName->data;
 }
 
 
 /*
- * ShardMoveSubscriptionRole returns the name of the role used by the
+ * SubscriptionName returns the name of the subscription for the given owner.
+ */
+char *
+SubscriptionName(LogicalRepType type, Oid ownerId)
+{
+	return psprintf("%s%i", subscriptionPrefix[type], ownerId);
+}
+
+
+/*
+ * SubscriptionRoleName returns the name of the role used by the
  * subscription that subscribes to the tables of the given owner.
  */
-static char *
-ShardMoveSubscriptionRole(Oid ownerId)
+char *
+SubscriptionRoleName(LogicalRepType type, Oid ownerId)
 {
-	return psprintf("%s%i", SHARD_MOVE_SUBSCRIPTION_ROLE_PREFIX, ownerId);
+	return psprintf("%s%i", subscriptionRolePrefix[type], ownerId);
 }
 
 
@@ -1175,7 +1368,7 @@ ShardMoveSubscriptionRole(Oid ownerId)
  * strings. This query is executed on the connection and the function then
  * returns the results of the query in a List.
  */
-static List *
+List *
 GetQueryResultStringList(MultiConnection *connection, char *query)
 {
 	bool raiseInterrupts = true;
@@ -1221,175 +1414,172 @@ GetQueryResultStringList(MultiConnection *connection, char *query)
 
 
 /*
- * DropAllShardMoveSubscriptions drops all the existing subscriptions that
+ * DropAllSubscriptions drops all the existing subscriptions that
  * match our shard move naming scheme on the node that the connection points
  * to.
  */
 static void
-DropAllShardMoveSubscriptions(MultiConnection *connection)
+DropAllSubscriptions(MultiConnection *connection, LogicalRepType type)
 {
 	char *query = psprintf(
 		"SELECT subname FROM pg_subscription "
 		"WHERE subname LIKE %s || '%%'",
-		quote_literal_cstr(SHARD_MOVE_SUBSCRIPTION_PREFIX));
+		quote_literal_cstr(subscriptionPrefix[type]));
 	List *subscriptionNameList = GetQueryResultStringList(connection, query);
 	char *subscriptionName;
 	foreach_ptr(subscriptionName, subscriptionNameList)
 	{
-		DropShardMoveSubscription(connection, subscriptionName);
+		DropSubscription(connection, subscriptionName);
 	}
 }
 
 
 /*
- * DropAllShardMoveUsers drops all the users that match our shard move naming
+ * DropAllUsers drops all the users that match our shard move naming
  * scheme for temporary shard move users on the node that the connection points
  * to.
  */
 static void
-DropAllShardMoveUsers(MultiConnection *connection)
+DropAllUsers(MultiConnection *connection, LogicalRepType type)
 {
 	char *query = psprintf(
 		"SELECT rolname FROM pg_roles "
 		"WHERE rolname LIKE %s || '%%'",
-		quote_literal_cstr(SHARD_MOVE_SUBSCRIPTION_ROLE_PREFIX));
+		quote_literal_cstr(subscriptionRolePrefix[type]));
 	List *usernameList = GetQueryResultStringList(connection, query);
 	char *username;
 	foreach_ptr(username, usernameList)
 	{
-		DropShardMoveUser(connection, username);
+		DropUser(connection, username);
 	}
 }
 
 
 /*
- * DropAllShardMoveReplicationSlots drops all the existing replication slots
+ * DropAllReplicationSlots drops all the existing replication slots
  * that match our shard move naming scheme on the node that the connection
  * points to.
  */
 static void
-DropAllShardMoveReplicationSlots(MultiConnection *connection)
+DropAllReplicationSlots(MultiConnection *connection, LogicalRepType type)
 {
 	char *query = psprintf(
 		"SELECT slot_name FROM pg_replication_slots "
 		"WHERE slot_name LIKE %s || '%%'",
-		quote_literal_cstr(SHARD_MOVE_SUBSCRIPTION_PREFIX));
+		quote_literal_cstr(replicationSlotPrefix[type]));
 	List *slotNameList = GetQueryResultStringList(connection, query);
 	char *slotName;
 	foreach_ptr(slotName, slotNameList)
 	{
-		DropShardMoveReplicationSlot(connection, slotName);
+		DropReplicationSlot(connection, slotName);
 	}
 }
 
 
 /*
- * DropAllShardMovePublications drops all the existing publications that
+ * DropAllPublications drops all the existing publications that
  * match our shard move naming scheme on the node that the connection points
  * to.
  */
 static void
-DropAllShardMovePublications(MultiConnection *connection)
+DropAllPublications(MultiConnection *connection, LogicalRepType type)
 {
 	char *query = psprintf(
 		"SELECT pubname FROM pg_publication "
 		"WHERE pubname LIKE %s || '%%'",
-		quote_literal_cstr(SHARD_MOVE_PUBLICATION_PREFIX));
+		quote_literal_cstr(publicationPrefix[type]));
 	List *publicationNameList = GetQueryResultStringList(connection, query);
 	char *publicationName;
 	foreach_ptr(publicationName, publicationNameList)
 	{
-		DropShardMovePublication(connection, publicationName);
+		DropPublication(connection, publicationName);
 	}
 }
 
 
 /*
- * DropShardMoveSubscriptions drops subscriptions from the subscriber node that
- * are used to move shards for the given table owners. Note that, it drops the
- * replication slots on the publisher node if it can drop the slots as well
- * with the DROP SUBSCRIPTION command. Otherwise, only the subscriptions will
- * be deleted with DROP SUBSCRIPTION via the connection. In the latter case,
- * replication slots will be dropped while cleaning the publisher node when
- * calling DropShardMovePublications.
+ * DropSubscriptions drops all the subscriptions in the logicalRepTargetList
+ * from the subscriber node. It also drops the temporary users that are used as
+ * owners for of the subscription. This doesn't drop the replication slots on
+ * the publisher, these should be dropped using DropReplicationSlots.
  */
-static void
-DropShardMoveSubscriptions(MultiConnection *connection, Bitmapset *tableOwnerIds)
+void
+DropSubscriptions(List *logicalRepTargetList)
 {
-	int ownerId = -1;
-	while ((ownerId = bms_next_member(tableOwnerIds, ownerId)) >= 0)
+	LogicalRepTarget *target = NULL;
+	foreach_ptr(target, logicalRepTargetList)
 	{
-		DropShardMoveSubscription(connection, ShardMoveSubscriptionName(ownerId));
-		DropShardMoveUser(connection, ShardMoveSubscriptionRole(ownerId));
+		DropSubscription(target->superuserConnection,
+						 target->subscriptionName);
+		DropUser(target->superuserConnection, target->subscriptionOwnerName);
 	}
 }
 
 
 /*
- * DropShardMoveSubscription drops subscription with the given name on the
- * subscriber node. Note that, it also drops the replication slot on the
- * publisher node if it can drop the slot as well with the DROP SUBSCRIPTION
- * command. Otherwise, only the subscription will be deleted with DROP
- * SUBSCRIPTION via the connection.
+ * DropSubscription drops subscription with the given name on the subscriber
+ * node if it exists. Note that this doesn't drop the replication slot on the
+ * publisher node. The reason is that sometimes this is not possible. To known
+ * cases where this is not possible are:
+ * 1. Due to the node with the replication slot being down.
+ * 2. Due to a deadlock when the replication is on the same node as the
+ *    subscription, which is the case for shard splits to the local node.
+ *
+ * So instead of directly dropping the subscription, including the attached
+ * replication slot, the subscription is first disconnected from the
+ * replication slot before dropping it. The replication slot itself should be
+ * dropped using DropReplicationSlot on the source connection.
  */
 static void
-DropShardMoveSubscription(MultiConnection *connection, char *subscriptionName)
+DropSubscription(MultiConnection *connection, char *subscriptionName)
 {
-	PGresult *result = NULL;
-
-	/*
-	 * Instead of ExecuteCriticalRemoteCommand, we use the
-	 * ExecuteOptionalRemoteCommand to fall back into the logic inside the
-	 * if block below in case of any error while sending the command.
-	 */
-	int dropCommandResult = ExecuteOptionalRemoteCommand(
+	int querySent = SendRemoteCommand(
 		connection,
-		psprintf(
-			"DROP SUBSCRIPTION IF EXISTS %s",
-			quote_identifier(subscriptionName)),
-		&result);
-
-	if (PQstatus(connection->pgConn) != CONNECTION_OK)
+		psprintf("ALTER SUBSCRIPTION %s DISABLE", quote_identifier(subscriptionName)));
+	if (querySent == 0)
 	{
 		ReportConnectionError(connection, ERROR);
+	}
+
+	bool raiseInterrupts = true;
+	PGresult *result = GetRemoteCommandResult(connection, raiseInterrupts);
+	if (!IsResponseOK(result))
+	{
+		char *errorcode = PQresultErrorField(result, PG_DIAG_SQLSTATE);
+		if (errorcode != NULL && strcmp(errorcode, STR_ERRCODE_UNDEFINED_OBJECT) == 0)
+		{
+			/*
+			 * The subscription doesn't exist, so we can return right away.
+			 * This DropSubscription call is effectively a no-op.
+			 */
+			return;
+		}
+		else
+		{
+			ReportResultError(connection, result, ERROR);
+			PQclear(result);
+			ForgetResults(connection);
+		}
 	}
 
 	PQclear(result);
 	ForgetResults(connection);
 
-	/*
-	 * If we can not drop the replication slot using the DROP SUBSCRIPTION command
-	 * then we need to alter the subscription to drop the subscriber only and drop
-	 * the replication slot separately.
-	 */
-	if (dropCommandResult != 0)
-	{
-		StringInfo alterSubscriptionSlotCommand = makeStringInfo();
-		StringInfo alterSubscriptionDisableCommand = makeStringInfo();
+	ExecuteCriticalRemoteCommand(connection, psprintf(
+									 "ALTER SUBSCRIPTION %s SET (slot_name = NONE)",
+									 quote_identifier(subscriptionName)));
 
-		appendStringInfo(alterSubscriptionDisableCommand,
-						 "ALTER SUBSCRIPTION %s DISABLE",
-						 quote_identifier(subscriptionName));
-		ExecuteCriticalRemoteCommand(connection,
-									 alterSubscriptionDisableCommand->data);
-
-		appendStringInfo(alterSubscriptionSlotCommand,
-						 "ALTER SUBSCRIPTION %s SET (slot_name = NONE)",
-						 quote_identifier(subscriptionName));
-		ExecuteCriticalRemoteCommand(connection, alterSubscriptionSlotCommand->data);
-
-		ExecuteCriticalRemoteCommand(connection, psprintf(
-										 "DROP SUBSCRIPTION %s",
-										 quote_identifier(subscriptionName)));
-	}
+	ExecuteCriticalRemoteCommand(connection, psprintf(
+									 "DROP SUBSCRIPTION %s",
+									 quote_identifier(subscriptionName)));
 }
 
 
 /*
- * DropShardMoveUser drops the user with the given name if it exists.
+ * DropUser drops the user with the given name if it exists.
  */
 static void
-DropShardMoveUser(MultiConnection *connection, char *username)
+DropUser(MultiConnection *connection, char *username)
 {
 	/*
 	 * The DROP USER command should not propagate, so we temporarily disable
@@ -1405,33 +1595,27 @@ DropShardMoveUser(MultiConnection *connection, char *username)
 
 
 /*
- * CreateShardMovePublications creates a set of publications for moving a list
- * of shards over the given connection. One publication is created for each of
- * the table owners in tableOwnerIds. Each of those publications only contains
- * shards that the respective table owner owns.
+ * CreatePublications creates a the publications defined in the
+ * publicationInfoHash over the given connection.
  */
-static void
-CreateShardMovePublications(MultiConnection *connection, List *shardList,
-							Bitmapset *tableOwnerIds)
+void
+CreatePublications(MultiConnection *connection,
+				   HTAB *publicationInfoHash)
 {
-	int ownerId = -1;
-
-	while ((ownerId = bms_next_member(tableOwnerIds, ownerId)) >= 0)
+	HASH_SEQ_STATUS status;
+	hash_seq_init(&status, publicationInfoHash);
+	PublicationInfo *entry = NULL;
+	while ((entry = (PublicationInfo *) hash_seq_search(&status)) != NULL)
 	{
 		StringInfo createPublicationCommand = makeStringInfo();
 		bool prefixWithComma = false;
 
 		appendStringInfo(createPublicationCommand, "CREATE PUBLICATION %s FOR TABLE ",
-						 ShardMovePublicationName(ownerId));
+						 entry->name);
 
 		ShardInterval *shard = NULL;
-		foreach_ptr(shard, shardList)
+		foreach_ptr(shard, entry->shardIntervals)
 		{
-			if (TableOwnerOid(shard->relationId) != ownerId)
-			{
-				continue;
-			}
-
 			char *shardName = ConstructQualifiedShardName(shard);
 
 			if (prefixWithComma)
@@ -1451,59 +1635,197 @@ CreateShardMovePublications(MultiConnection *connection, List *shardList,
 
 
 /*
- * CreateShardMoveSubscriptions creates the subscriptions used for shard moves
- * over the given connection. One subscription is created for each of the table
- * owners in tableOwnerIds. The remote node needs to have appropriate
- * pg_dist_authinfo rows for the user such that the apply process can connect.
- * Because the generated CREATE SUBSCRIPTION statements uses the host and port
- * names directly (rather than looking up any relevant pg_dist_poolinfo rows),
- * all such connections remain direct and will not route through any configured
- * poolers.
+ * GetReplicationConnection opens a new replication connection to this node.
+ * This connection can be used to send replication commands, such as
+ * CREATE_REPLICATION_SLOT.
  */
-static void
-CreateShardMoveSubscriptions(MultiConnection *connection, char *sourceNodeName,
-							 int sourceNodePort, char *userName, char *databaseName,
-							 Bitmapset *tableOwnerIds)
+MultiConnection *
+GetReplicationConnection(char *nodeName, int nodePort)
 {
-	int ownerId = -1;
-	while ((ownerId = bms_next_member(tableOwnerIds, ownerId)) >= 0)
+	int connectionFlags = FORCE_NEW_CONNECTION;
+	connectionFlags |= REQUIRE_REPLICATION_CONNECTION_PARAM;
+
+	MultiConnection *connection = GetNodeUserDatabaseConnection(
+		connectionFlags,
+		nodeName,
+		nodePort,
+		CitusExtensionOwnerName(),
+		get_database_name(MyDatabaseId));
+
+	/*
+	 * Replication connections are special and don't support all of SQL, so we
+	 * don't want it to be used for other purposes what we create it for.
+	 */
+	ClaimConnectionExclusively(connection);
+	return connection;
+}
+
+
+/*
+ * CreateReplicationSlot creates a replication slot with the given slot name
+ * over the given connection. The given connection should be a replication
+ * connection. This function returns the name of the snapshot that is used for
+ * this replication slot. When using this snapshot name for other transactions
+ * you need to keep the given replication connection open until you have used
+ * the snapshot name.
+ */
+static char *
+CreateReplicationSlot(MultiConnection *connection, char *slotname, char *outputPlugin)
+{
+	StringInfo createReplicationSlotCommand = makeStringInfo();
+	appendStringInfo(createReplicationSlotCommand,
+					 "CREATE_REPLICATION_SLOT %s LOGICAL %s EXPORT_SNAPSHOT;",
+					 quote_identifier(slotname), quote_identifier(outputPlugin));
+
+	PGresult *result = NULL;
+	int response = ExecuteOptionalRemoteCommand(connection,
+												createReplicationSlotCommand->data,
+												&result);
+
+	if (response != RESPONSE_OKAY || !IsResponseOK(result) || PQntuples(result) != 1)
 	{
-		StringInfo createSubscriptionCommand = makeStringInfo();
-		StringInfo conninfo = makeStringInfo();
+		ReportResultError(connection, result, ERROR);
+	}
+
+	/*'snapshot_name' is second column where index starts from zero.
+	 * We're using the pstrdup to copy the data into the current memory context */
+	char *snapShotName = pstrdup(PQgetvalue(result, 0, 2 /* columIndex */));
+	PQclear(result);
+	ForgetResults(connection);
+	return snapShotName;
+}
+
+
+/*
+ * CreateReplicationSlots creates the replication slots that the subscriptions
+ * in the logicalRepTargetList can use.
+ *
+ * This function returns the snapshot name of the replication slots that are
+ * used by the subscription. When using this snapshot name for other
+ * transactions you need to keep the given replication connection open until
+ * you are finished using the snapshot.
+ */
+char *
+CreateReplicationSlots(MultiConnection *sourceConnection,
+					   MultiConnection *sourceReplicationConnection,
+					   List *logicalRepTargetList,
+					   char *outputPlugin)
+{
+	ReplicationSlotInfo *firstReplicationSlot = NULL;
+	char *snapshot = NULL;
+	LogicalRepTarget *target = NULL;
+	foreach_ptr(target, logicalRepTargetList)
+	{
+		ReplicationSlotInfo *replicationSlot = target->replicationSlot;
+
+		if (!firstReplicationSlot)
+		{
+			firstReplicationSlot = replicationSlot;
+			snapshot = CreateReplicationSlot(
+				sourceReplicationConnection,
+				replicationSlot->name,
+				outputPlugin
+				);
+		}
+		else
+		{
+			ExecuteCriticalRemoteCommand(
+				sourceConnection,
+				psprintf("SELECT pg_catalog.pg_copy_logical_replication_slot(%s, %s)",
+						 quote_literal_cstr(firstReplicationSlot->name),
+						 quote_literal_cstr(replicationSlot->name)));
+		}
+	}
+	return snapshot;
+}
+
+
+/*
+ * CreateSubscriptions creates the subscriptions according to their definition
+ * in the logicalRepTargetList. The remote node(s) needs to have appropriate
+ * pg_dist_authinfo rows for the superuser such that the apply process can
+ * connect. Because the generated CREATE SUBSCRIPTION statements use the host
+ * and port names directly (rather than looking up any relevant
+ * pg_dist_poolinfo rows), all such connections remain direct and will not
+ * route through any configured poolers.
+ *
+ * The subscriptions created by this function are created in the disabled
+ * state. This is done so a data copy can be done manually afterwards. To
+ * enable the subscriptions you can use EnableSubscriptions().
+ */
+void
+CreateSubscriptions(MultiConnection *sourceConnection,
+					char *databaseName,
+					List *logicalRepTargetList)
+{
+	LogicalRepTarget *target = NULL;
+	foreach_ptr(target, logicalRepTargetList)
+	{
+		int ownerId = target->tableOwnerId;
 
 		/*
 		 * The CREATE USER command should not propagate, so we temporarily
 		 * disable DDL propagation.
+		 *
+		 * Subscription workers have SUPERUSER permissions. Hence we temporarily
+		 * create a user with SUPERUSER permissions and then alter it to NOSUPERUSER.
+		 * This prevents permission escalations.
 		 */
 		SendCommandListToWorkerOutsideTransaction(
-			connection->hostname, connection->port, connection->user,
+			target->superuserConnection->hostname,
+			target->superuserConnection->port,
+			target->superuserConnection->user,
 			list_make2(
 				"SET LOCAL citus.enable_ddl_propagation TO OFF;",
 				psprintf(
 					"CREATE USER %s SUPERUSER IN ROLE %s",
-					ShardMoveSubscriptionRole(ownerId),
+					target->subscriptionOwnerName,
 					GetUserNameFromId(ownerId, false)
 					)));
 
+		StringInfo conninfo = makeStringInfo();
 		appendStringInfo(conninfo, "host='%s' port=%d user='%s' dbname='%s' "
 								   "connect_timeout=20",
-						 escape_param_str(sourceNodeName), sourceNodePort,
-						 escape_param_str(userName), escape_param_str(databaseName));
+						 escape_param_str(sourceConnection->hostname),
+						 sourceConnection->port,
+						 escape_param_str(sourceConnection->user), escape_param_str(
+							 databaseName));
+		if (CpuPriorityLogicalRepSender != CPU_PRIORITY_INHERIT &&
+			list_length(logicalRepTargetList) <= MaxHighPriorityBackgroundProcesess)
+		{
+			appendStringInfo(conninfo,
+							 " options='-c citus.cpu_priority=%d'",
+							 CpuPriorityLogicalRepSender);
+		}
 
+		StringInfo createSubscriptionCommand = makeStringInfo();
 		appendStringInfo(createSubscriptionCommand,
 						 "CREATE SUBSCRIPTION %s CONNECTION %s PUBLICATION %s "
-						 "WITH (citus_use_authinfo=true, enabled=false)",
-						 quote_identifier(ShardMoveSubscriptionName(ownerId)),
+						 "WITH (citus_use_authinfo=true, create_slot=false, "
+						 "copy_data=false, enabled=false, slot_name=%s",
+						 quote_identifier(target->subscriptionName),
 						 quote_literal_cstr(conninfo->data),
-						 quote_identifier(ShardMovePublicationName(ownerId)));
+						 quote_identifier(target->publication->name),
+						 quote_identifier(target->replicationSlot->name));
 
-		ExecuteCriticalRemoteCommand(connection, createSubscriptionCommand->data);
+		if (EnableBinaryProtocol && PG_VERSION_NUM >= PG_VERSION_14)
+		{
+			appendStringInfoString(createSubscriptionCommand, ", binary=true)");
+		}
+		else
+		{
+			appendStringInfoString(createSubscriptionCommand, ")");
+		}
+
+
+		ExecuteCriticalRemoteCommand(target->superuserConnection,
+									 createSubscriptionCommand->data);
 		pfree(createSubscriptionCommand->data);
 		pfree(createSubscriptionCommand);
-		ExecuteCriticalRemoteCommand(connection, psprintf(
+		ExecuteCriticalRemoteCommand(target->superuserConnection, psprintf(
 										 "ALTER SUBSCRIPTION %s OWNER TO %s",
-										 ShardMoveSubscriptionName(ownerId),
-										 ShardMoveSubscriptionRole(ownerId)
+										 target->subscriptionName,
+										 target->subscriptionOwnerName
 										 ));
 
 		/*
@@ -1511,17 +1833,33 @@ CreateShardMoveSubscriptions(MultiConnection *connection, char *sourceNodeName,
 		 * disable DDL propagation.
 		 */
 		SendCommandListToWorkerOutsideTransaction(
-			connection->hostname, connection->port, connection->user,
+			target->superuserConnection->hostname,
+			target->superuserConnection->port,
+			target->superuserConnection->user,
 			list_make2(
 				"SET LOCAL citus.enable_ddl_propagation TO OFF;",
 				psprintf(
 					"ALTER ROLE %s NOSUPERUSER",
-					ShardMoveSubscriptionRole(ownerId)
+					target->subscriptionOwnerName
 					)));
+	}
+}
 
-		ExecuteCriticalRemoteCommand(connection, psprintf(
+
+/*
+ * EnableSubscriptions enables all the the subscriptions in the
+ * logicalRepTargetList. This means the replication slot will start to be read
+ * and the catchup phase begins.
+ */
+void
+EnableSubscriptions(List *logicalRepTargetList)
+{
+	LogicalRepTarget *target = NULL;
+	foreach_ptr(target, logicalRepTargetList)
+	{
+		ExecuteCriticalRemoteCommand(target->superuserConnection, psprintf(
 										 "ALTER SUBSCRIPTION %s ENABLE",
-										 ShardMoveSubscriptionName(ownerId)
+										 target->subscriptionName
 										 ));
 	}
 }
@@ -1558,7 +1896,7 @@ escape_param_str(const char *str)
 /*
  * GetRemoteLogPosition gets the current WAL log position over the given connection.
  */
-static XLogRecPtr
+XLogRecPtr
 GetRemoteLogPosition(MultiConnection *connection)
 {
 	return GetRemoteLSN(connection, CURRENT_LOG_POSITION_COMMAND);
@@ -1619,26 +1957,154 @@ GetRemoteLSN(MultiConnection *connection, char *command)
 
 
 /*
- * WaitForRelationSubscriptionsBecomeReady waits until the states of the subsriptions
- * for each shard becomes ready. This indicates that the initial COPY is finished
- * on the shards.
+ * CreateGroupedLogicalRepTargetsConnections creates connections for all of the nodes
+ * in the groupedLogicalRepTargetsHash.
+ */
+void
+CreateGroupedLogicalRepTargetsConnections(HTAB *groupedLogicalRepTargetsHash,
+										  char *user,
+										  char *databaseName)
+{
+	int connectionFlags = FORCE_NEW_CONNECTION;
+	HASH_SEQ_STATUS status;
+	GroupedLogicalRepTargets *groupedLogicalRepTargets = NULL;
+	foreach_htab(groupedLogicalRepTargets, &status, groupedLogicalRepTargetsHash)
+	{
+		WorkerNode *targetWorkerNode = FindNodeWithNodeId(
+			groupedLogicalRepTargets->nodeId,
+			false);
+		MultiConnection *superuserConnection =
+			GetNodeUserDatabaseConnection(connectionFlags, targetWorkerNode->workerName,
+										  targetWorkerNode->workerPort,
+										  user,
+										  databaseName);
+
+		/*
+		 * Operations on subscriptions cannot run in a transaction block. We
+		 * claim the connections exclusively to ensure they do not get used for
+		 * metadata syncing, which does open a transaction block.
+		 */
+		ClaimConnectionExclusively(superuserConnection);
+
+		groupedLogicalRepTargets->superuserConnection = superuserConnection;
+
+		LogicalRepTarget *target = NULL;
+		foreach_ptr(target, groupedLogicalRepTargets->logicalRepTargetList)
+		{
+			target->superuserConnection = superuserConnection;
+		}
+	}
+}
+
+
+/*
+ * RecreateGroupedLogicalRepTargetsConnections recreates connections for all of the
+ * nodes in the groupedLogicalRepTargetsHash where the old connection is broken or
+ * currently running a query.
+ */
+void
+RecreateGroupedLogicalRepTargetsConnections(HTAB *groupedLogicalRepTargetsHash,
+											char *user,
+											char *databaseName)
+{
+	int connectionFlags = FORCE_NEW_CONNECTION;
+	HASH_SEQ_STATUS status;
+	GroupedLogicalRepTargets *groupedLogicalRepTargets = NULL;
+	foreach_htab(groupedLogicalRepTargets, &status, groupedLogicalRepTargetsHash)
+	{
+		if (groupedLogicalRepTargets->superuserConnection &&
+			PQstatus(groupedLogicalRepTargets->superuserConnection->pgConn) ==
+			CONNECTION_OK &&
+			!PQisBusy(groupedLogicalRepTargets->superuserConnection->pgConn)
+			)
+		{
+			continue;
+		}
+		WorkerNode *targetWorkerNode = FindNodeWithNodeId(
+			groupedLogicalRepTargets->nodeId,
+			false);
+		MultiConnection *superuserConnection =
+			GetNodeUserDatabaseConnection(connectionFlags,
+										  targetWorkerNode->workerName,
+										  targetWorkerNode->workerPort,
+										  user,
+										  databaseName);
+
+		/*
+		 * Operations on subscriptions cannot run in a transaction block. We
+		 * claim the connections exclusively to ensure they do not get used for
+		 * metadata syncing, which does open a transaction block.
+		 */
+		ClaimConnectionExclusively(superuserConnection);
+
+		groupedLogicalRepTargets->superuserConnection = superuserConnection;
+
+		LogicalRepTarget *target = NULL;
+		foreach_ptr(target, groupedLogicalRepTargets->logicalRepTargetList)
+		{
+			target->superuserConnection = superuserConnection;
+		}
+	}
+}
+
+
+/*
+ * CreateGroupedLogicalRepTargetsConnections closes the  connections for all of the
+ * nodes in the groupedLogicalRepTargetsHash.
+ */
+void
+CloseGroupedLogicalRepTargetsConnections(HTAB *groupedLogicalRepTargetsHash)
+{
+	HASH_SEQ_STATUS status;
+	GroupedLogicalRepTargets *groupedLogicalRepTargets = NULL;
+	foreach_htab(groupedLogicalRepTargets, &status, groupedLogicalRepTargetsHash)
+	{
+		CloseConnection(groupedLogicalRepTargets->superuserConnection);
+	}
+}
+
+
+/*
+ * WaitForRelationSubscriptionsBecomeReady waits until the states of the
+ * subsriptions in the groupedLogicalRepTargetsHash becomes ready. This should happen
+ * very quickly, because we don't use the COPY logic from the subscriptions. So
+ * all that's needed is to start reading from the replication slot.
  *
- * The function errors if the total size of the relations that belong to the subscription
- * on the target node doesn't change within LogicalReplicationErrorTimeout. The
- * function also reports its progress in every logicalReplicationProgressReportTimeout.
+ * The function errors if the subscriptions on one of the nodes don't become
+ * ready within LogicalReplicationErrorTimeout. The function also reports its
+ * progress every logicalReplicationProgressReportTimeout.
+ */
+void
+WaitForAllSubscriptionsToBecomeReady(HTAB *groupedLogicalRepTargetsHash)
+{
+	HASH_SEQ_STATUS status;
+	GroupedLogicalRepTargets *groupedLogicalRepTargets = NULL;
+	foreach_htab(groupedLogicalRepTargets, &status, groupedLogicalRepTargetsHash)
+	{
+		WaitForGroupedLogicalRepTargetsToBecomeReady(groupedLogicalRepTargets);
+	}
+	elog(LOG, "The states of all subscriptions have become READY");
+}
+
+
+/*
+ * WaitForRelationSubscriptionsBecomeReady waits until the states of the
+ * subsriptions for each shard becomes ready. This should happen very quickly,
+ * because we don't use the COPY logic from the subscriptions. So all that's
+ * needed is to start reading from the replication slot.
+ *
+ * The function errors if the subscriptions don't become ready within
+ * LogicalReplicationErrorTimeout. The function also reports its progress in
+ * every logicalReplicationProgressReportTimeout.
  */
 static void
-WaitForRelationSubscriptionsBecomeReady(MultiConnection *targetConnection,
-										Bitmapset *tableOwnerIds)
+WaitForGroupedLogicalRepTargetsToBecomeReady(
+	GroupedLogicalRepTargets *groupedLogicalRepTargets)
 {
-	uint64 previousTotalRelationSizeForSubscription = 0;
 	TimestampTz previousSizeChangeTime = GetCurrentTimestamp();
+	TimestampTz previousReportTime = GetCurrentTimestamp();
 
-	/* report in the first iteration as well */
-	TimestampTz previousReportTime = 0;
-
-	uint64 previousReportedTotalSize = 0;
-
+	MultiConnection *superuserConnection = groupedLogicalRepTargets->superuserConnection;
 
 	/*
 	 * We might be in the loop for a while. Since we don't need to preserve
@@ -1653,110 +2119,54 @@ WaitForRelationSubscriptionsBecomeReady(MultiConnection *targetConnection,
 															  ALLOCSET_DEFAULT_MAXSIZE);
 
 	MemoryContext oldContext = MemoryContextSwitchTo(loopContext);
-
 	while (true)
 	{
 		/* we're done, all relations are ready */
-		if (RelationSubscriptionsAreReady(targetConnection, tableOwnerIds))
+		if (RelationSubscriptionsAreReady(groupedLogicalRepTargets))
 		{
 			ereport(LOG, (errmsg("The states of the relations belonging to the "
 								 "subscriptions became READY on the "
 								 "target node %s:%d",
-								 targetConnection->hostname,
-								 targetConnection->port)));
+								 superuserConnection->hostname,
+								 superuserConnection->port)));
 
 			break;
 		}
-		char *subscriptionValueList = ShardMoveSubscriptionNamesValueList(tableOwnerIds);
 
-		/* Get the current total size of tables belonging to the subscriber */
-		uint64 currentTotalRelationSize =
-			TotalRelationSizeForSubscription(targetConnection, psprintf(
-												 "SELECT sum(pg_total_relation_size(srrelid)) "
-												 "FROM pg_subscription_rel, pg_stat_subscription "
-												 "WHERE srsubid = subid AND subname IN %s",
-												 subscriptionValueList
-												 )
-											 );
-
-		/*
-		 * The size has not been changed within the last iteration. If necessary
-		 * log a messages. If size does not change over a given replication timeout
-		 * error out.
-		 */
-		if (currentTotalRelationSize == previousTotalRelationSizeForSubscription)
+		/* log the progress if necessary */
+		if (TimestampDifferenceExceeds(previousReportTime,
+									   GetCurrentTimestamp(),
+									   logicalReplicationProgressReportTimeout))
 		{
-			/* log the progress if necessary */
-			if (TimestampDifferenceExceeds(previousReportTime,
-										   GetCurrentTimestamp(),
-										   logicalReplicationProgressReportTimeout))
-			{
-				ereport(LOG, (errmsg("Subscription size has been staying same for the "
-									 "last %d msec",
-									 logicalReplicationProgressReportTimeout)));
+			ereport(LOG, (errmsg("Not all subscriptions on target node %s:%d "
+								 "are READY yet",
+								 superuserConnection->hostname,
+								 superuserConnection->port)));
 
-				previousReportTime = GetCurrentTimestamp();
-			}
-
-			/* Error out if the size does not change within the given time threshold */
-			if (TimestampDifferenceExceeds(previousSizeChangeTime,
-										   GetCurrentTimestamp(),
-										   LogicalReplicationTimeout))
-			{
-				ereport(ERROR, (errmsg("The logical replication waiting timeout "
-									   "%d msec exceeded",
-									   LogicalReplicationTimeout),
-								errdetail("The subscribed relations haven't become "
-										  "ready on the target node %s:%d",
-										  targetConnection->hostname,
-										  targetConnection->port),
-								errhint(
-									"There might have occurred problems on the target "
-									"node. If not, consider using higher values for "
-									"citus.logical_replication_timeout")));
-			}
-		}
-		else
-		{
-			/* first, record that there is some change in the size */
-			previousSizeChangeTime = GetCurrentTimestamp();
-
-			/*
-			 * Subscription size may decrease or increase.
-			 *
-			 * Subscription size may decrease in case of VACUUM operation, which
-			 * may get fired with autovacuum, on it.
-			 *
-			 * Increase of the relation's size belonging to subscriber means a successful
-			 * copy from publisher to subscriber.
-			 */
-			bool sizeIncreased = currentTotalRelationSize >
-								 previousTotalRelationSizeForSubscription;
-
-			if (TimestampDifferenceExceeds(previousReportTime,
-										   GetCurrentTimestamp(),
-										   logicalReplicationProgressReportTimeout))
-			{
-				ereport(LOG, ((errmsg("The total size of the relations belonging to "
-									  "subscriptions %s from %ld to %ld at %s "
-									  "on the target node %s:%d",
-									  sizeIncreased ? "increased" : "decreased",
-									  previousReportedTotalSize,
-									  currentTotalRelationSize,
-									  timestamptz_to_str(previousSizeChangeTime),
-									  targetConnection->hostname,
-									  targetConnection->port))));
-
-				previousReportedTotalSize = currentTotalRelationSize;
-				previousReportTime = GetCurrentTimestamp();
-			}
+			previousReportTime = GetCurrentTimestamp();
 		}
 
-		previousTotalRelationSizeForSubscription = currentTotalRelationSize;
+		/* Error out if the size does not change within the given time threshold */
+		if (TimestampDifferenceExceeds(previousSizeChangeTime,
+									   GetCurrentTimestamp(),
+									   LogicalReplicationTimeout))
+		{
+			ereport(ERROR, (errmsg("The logical replication waiting timeout "
+								   "of %d msec is exceeded",
+								   LogicalReplicationTimeout),
+							errdetail("The subscribed relations haven't become "
+									  "ready on the target node %s:%d",
+									  superuserConnection->hostname,
+									  superuserConnection->port),
+							errhint(
+								"Logical replication has failed to initialize "
+								"on the target node. If not, consider using "
+								"higher values for "
+								"citus.logical_replication_timeout")));
+		}
 
 		/* wait for 1 second (1000 miliseconds) and try again */
 		WaitForMiliseconds(1000);
-
 		MemoryContextReset(loopContext);
 	}
 
@@ -1765,75 +2175,19 @@ WaitForRelationSubscriptionsBecomeReady(MultiConnection *targetConnection,
 
 
 /*
- * TotalRelationSizeForSubscription is a helper function which returns the total
- * size of the shards that are replicated via the subscription. Note that the
- * function returns the total size including indexes.
- */
-static uint64
-TotalRelationSizeForSubscription(MultiConnection *connection, char *command)
-{
-	bool raiseInterrupts = false;
-	uint64 remoteTotalSize = 0;
-
-	int querySent = SendRemoteCommand(connection, command);
-	if (querySent == 0)
-	{
-		ReportConnectionError(connection, ERROR);
-	}
-
-	PGresult *result = GetRemoteCommandResult(connection, raiseInterrupts);
-	if (!IsResponseOK(result))
-	{
-		ReportResultError(connection, result, ERROR);
-	}
-
-	int rowCount = PQntuples(result);
-	if (rowCount != 1)
-	{
-		ereport(ERROR, (errmsg("unexpected number of rows returned by: %s",
-							   command)));
-	}
-
-	int colCount = PQnfields(result);
-	if (colCount != 1)
-	{
-		ereport(ERROR, (errmsg("unexpected number of columns returned by: %s",
-							   command)));
-	}
-
-	if (!PQgetisnull(result, 0, 0))
-	{
-		char *resultString = PQgetvalue(result, 0, 0);
-
-		remoteTotalSize = SafeStringToUint64(resultString);
-	}
-	else
-	{
-		ereport(ERROR, (errmsg("unexpected value returned by: %s",
-							   command)));
-	}
-
-	PQclear(result);
-	ForgetResults(connection);
-
-	return remoteTotalSize;
-}
-
-
-/*
- * ShardMoveSubscriptionNamesValueList returns a SQL value list containing the
- * subscription names for all of the given table owner ids. This value list can
+ * SubscriptionNamesValueList returns a SQL value list containing the
+ * subscription names from the logicalRepTargetList. This value list can
  * be used in a query by using the IN operator.
  */
 static char *
-ShardMoveSubscriptionNamesValueList(Bitmapset *tableOwnerIds)
+SubscriptionNamesValueList(List *logicalRepTargetList)
 {
 	StringInfo subscriptionValueList = makeStringInfo();
 	appendStringInfoString(subscriptionValueList, "(");
-	int ownerId = -1;
 	bool first = true;
 
-	while ((ownerId = bms_next_member(tableOwnerIds, ownerId)) >= 0)
+	LogicalRepTarget *target = NULL;
+	foreach_ptr(target, logicalRepTargetList)
 	{
 		if (!first)
 		{
@@ -1843,8 +2197,8 @@ ShardMoveSubscriptionNamesValueList(Bitmapset *tableOwnerIds)
 		{
 			first = false;
 		}
-		appendStringInfoString(subscriptionValueList,
-							   quote_literal_cstr(ShardMoveSubscriptionName(ownerId)));
+		appendStringInfoString(subscriptionValueList, quote_literal_cstr(
+								   target->subscriptionName));
 	}
 	appendStringInfoString(subscriptionValueList, ")");
 	return subscriptionValueList->data;
@@ -1853,29 +2207,31 @@ ShardMoveSubscriptionNamesValueList(Bitmapset *tableOwnerIds)
 
 /*
  * RelationSubscriptionsAreReady gets the subscription status for each
- * shard and returns false if at least one of them is not ready.
+ * subscriptions and returns false if at least one of them is not ready.
  */
 static bool
-RelationSubscriptionsAreReady(MultiConnection *targetConnection,
-							  Bitmapset *tableOwnerIds)
+RelationSubscriptionsAreReady(GroupedLogicalRepTargets *groupedLogicalRepTargets)
 {
 	bool raiseInterrupts = false;
 
-	char *subscriptionValueList = ShardMoveSubscriptionNamesValueList(tableOwnerIds);
+	List *logicalRepTargetList = groupedLogicalRepTargets->logicalRepTargetList;
+	MultiConnection *superuserConnection = groupedLogicalRepTargets->superuserConnection;
+
+	char *subscriptionValueList = SubscriptionNamesValueList(logicalRepTargetList);
 	char *query = psprintf(
 		"SELECT count(*) FROM pg_subscription_rel, pg_stat_subscription "
 		"WHERE srsubid = subid AND srsubstate != 'r' AND subname IN %s",
 		subscriptionValueList);
-	int querySent = SendRemoteCommand(targetConnection, query);
+	int querySent = SendRemoteCommand(superuserConnection, query);
 	if (querySent == 0)
 	{
-		ReportConnectionError(targetConnection, ERROR);
+		ReportConnectionError(superuserConnection, ERROR);
 	}
 
-	PGresult *result = GetRemoteCommandResult(targetConnection, raiseInterrupts);
+	PGresult *result = GetRemoteCommandResult(superuserConnection, raiseInterrupts);
 	if (!IsResponseOK(result))
 	{
-		ReportResultError(targetConnection, result, ERROR);
+		ReportResultError(superuserConnection, result, ERROR);
 	}
 
 	int rowCount = PQntuples(result);
@@ -1897,7 +2253,7 @@ RelationSubscriptionsAreReady(MultiConnection *targetConnection,
 	char *resultString = pstrdup(PQgetvalue(result, rowIndex, columnIndex));
 
 	PQclear(result);
-	ForgetResults(targetConnection);
+	ForgetResults(superuserConnection);
 
 	int64 resultInt = SafeStringToInt64(resultString);
 
@@ -1906,20 +2262,47 @@ RelationSubscriptionsAreReady(MultiConnection *targetConnection,
 
 
 /*
- * WaitForShardMoveSubscription waits until the last LSN reported by the subscription.
+ * WaitForAllSubscriptionToCatchUp waits until the last LSN reported by the
+ * subscription.
  *
- * The function errors if the target LSN doesn't increase within LogicalReplicationErrorTimeout.
- * The function also reports its progress in every logicalReplicationProgressReportTimeout.
+ * The function errors if the target LSN doesn't increase within
+ * LogicalReplicationErrorTimeout. The function also reports its progress in
+ * every logicalReplicationProgressReportTimeout.
+ */
+void
+WaitForAllSubscriptionsToCatchUp(MultiConnection *sourceConnection,
+								 HTAB *groupedLogicalRepTargetsHash)
+{
+	XLogRecPtr sourcePosition = GetRemoteLogPosition(sourceConnection);
+	HASH_SEQ_STATUS status;
+	GroupedLogicalRepTargets *groupedLogicalRepTargets = NULL;
+	foreach_htab(groupedLogicalRepTargets, &status, groupedLogicalRepTargetsHash)
+	{
+		WaitForGroupedLogicalRepTargetsToCatchUp(sourcePosition,
+												 groupedLogicalRepTargets);
+	}
+}
+
+
+/*
+ * WaitForNodeSubscriptionToCatchUp waits until the last LSN reported by the
+ * subscription.
+ *
+ * The function errors if the target LSN doesn't increase within
+ * LogicalReplicationErrorTimeout. The function also reports its progress in
+ * every logicalReplicationProgressReportTimeout.
  */
 static void
-WaitForShardMoveSubscription(MultiConnection *targetConnection, XLogRecPtr sourcePosition,
-							 Bitmapset *tableOwnerIds)
+WaitForGroupedLogicalRepTargetsToCatchUp(XLogRecPtr sourcePosition,
+										 GroupedLogicalRepTargets *
+										 groupedLogicalRepTargets)
 {
 	XLogRecPtr previousTargetPosition = 0;
 	TimestampTz previousLSNIncrementTime = GetCurrentTimestamp();
 
 	/* report in the first iteration as well */
 	TimestampTz previousReportTime = 0;
+	MultiConnection *superuserConnection = groupedLogicalRepTargets->superuserConnection;
 
 
 	/*
@@ -1929,7 +2312,7 @@ WaitForShardMoveSubscription(MultiConnection *targetConnection, XLogRecPtr sourc
 	 * a lot of memory.
 	 */
 	MemoryContext loopContext = AllocSetContextCreateInternal(CurrentMemoryContext,
-															  "WaitForShardMoveSubscription",
+															  "WaitForShardSubscriptionToCatchUp",
 															  ALLOCSET_DEFAULT_MINSIZE,
 															  ALLOCSET_DEFAULT_INITSIZE,
 															  ALLOCSET_DEFAULT_MAXSIZE);
@@ -1938,15 +2321,14 @@ WaitForShardMoveSubscription(MultiConnection *targetConnection, XLogRecPtr sourc
 
 	while (true)
 	{
-		XLogRecPtr targetPosition = GetSubscriptionPosition(targetConnection,
-															tableOwnerIds);
+		XLogRecPtr targetPosition = GetSubscriptionPosition(groupedLogicalRepTargets);
 		if (targetPosition >= sourcePosition)
 		{
 			ereport(LOG, (errmsg(
 							  "The LSN of the target subscriptions on node %s:%d have "
 							  "caught up with the source LSN ",
-							  targetConnection->hostname,
-							  targetConnection->port)));
+							  superuserConnection->hostname,
+							  superuserConnection->port)));
 
 			break;
 		}
@@ -1972,8 +2354,8 @@ WaitForShardMoveSubscription(MultiConnection *targetConnection, XLogRecPtr sourc
 				ereport(LOG, (errmsg(
 								  "The LSN of the target subscriptions on node %s:%d have "
 								  "increased from %ld to %ld at %s where the source LSN is %ld  ",
-								  targetConnection->hostname,
-								  targetConnection->port, previousTargetBeforeThisLoop,
+								  superuserConnection->hostname,
+								  superuserConnection->port, previousTargetBeforeThisLoop,
 								  targetPosition,
 								  timestamptz_to_str(previousLSNIncrementTime),
 								  sourcePosition)));
@@ -1988,12 +2370,12 @@ WaitForShardMoveSubscription(MultiConnection *targetConnection, XLogRecPtr sourc
 										   LogicalReplicationTimeout))
 			{
 				ereport(ERROR, (errmsg("The logical replication waiting timeout "
-									   "%d msec exceeded",
+									   "of %d msec is exceeded",
 									   LogicalReplicationTimeout),
 								errdetail("The LSN on the target subscription hasn't "
 										  "caught up ready on the target node %s:%d",
-										  targetConnection->hostname,
-										  targetConnection->port),
+										  superuserConnection->hostname,
+										  superuserConnection->port),
 								errhint(
 									"There might have occurred problems on the target "
 									"node. If not consider using higher values for "
@@ -2044,15 +2426,16 @@ WaitForMiliseconds(long timeout)
 
 
 /*
- * GetSubscriptionPosition gets the current WAL log position of the subscription, that
- * is the WAL log position on the source node up to which the subscription completed
- * replication.
+ * GetSubscriptionPosition gets the minimum WAL log position of the
+ * subscription given subscriptions: That is the WAL log position on the source
+ * node up to which the subscription completed replication.
  */
 static XLogRecPtr
-GetSubscriptionPosition(MultiConnection *connection, Bitmapset *tableOwnerIds)
+GetSubscriptionPosition(GroupedLogicalRepTargets *groupedLogicalRepTargets)
 {
-	char *subscriptionValueList = ShardMoveSubscriptionNamesValueList(tableOwnerIds);
-	return GetRemoteLSN(connection, psprintf(
+	char *subscriptionValueList = SubscriptionNamesValueList(
+		groupedLogicalRepTargets->logicalRepTargetList);
+	return GetRemoteLSN(groupedLogicalRepTargets->superuserConnection, psprintf(
 							"SELECT min(latest_end_lsn) FROM pg_stat_subscription "
 							"WHERE subname IN %s", subscriptionValueList));
 }

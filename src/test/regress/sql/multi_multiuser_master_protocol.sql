@@ -43,6 +43,8 @@ CREATE TABLE trivial_postgres (id int);
 SELECT master_create_distributed_table('trivial_postgres', 'id', 'append');
 GRANT ALL ON trivial_postgres TO full_access;
 
+GRANT CREATE ON SCHEMA public TO full_access;
+
 SET ROLE full_access;
 CREATE TABLE trivial_full_access (id int);
 SELECT master_create_distributed_table('trivial_full_access', 'id', 'append');
@@ -126,6 +128,7 @@ CREATE SCHEMA multiuser_schema;
 CREATE TABLE multiuser_schema.hash_table(a int, b int);
 CREATE TABLE multiuser_schema.reference_table(a int, b int);
 
+SET citus.shard_replication_factor TO 1;
 SELECT create_distributed_table('multiuser_schema.hash_table', 'a', colocate_with => 'none');
 
 
@@ -163,7 +166,7 @@ SELECT * FROM run_command_on_placements('multiuser_schema.another_table', $$ sel
 ORDER BY nodename, nodeport, shardid;
 
 -- verify isolate tenant carries grants
-SELECT isolate_tenant_to_new_shard('multiuser_schema.hash_table', 5);
+SELECT isolate_tenant_to_new_shard('multiuser_schema.hash_table', 5, shard_transfer_mode => 'block_writes');
 SELECT * FROM run_command_on_placements('multiuser_schema.hash_table', $$ select has_table_privilege('read_access', '%s', 'select') $$)
 ORDER BY nodename, nodeport, shardid;
 

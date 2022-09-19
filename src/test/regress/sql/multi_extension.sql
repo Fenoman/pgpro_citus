@@ -294,6 +294,14 @@ SELECT * FROM multi_extension.print_extension_changes();
 
 -- recreate public schema, and recreate citus_tables in the public schema by default
 CREATE SCHEMA public;
+-- In PG15, public schema is owned by pg_database_owner role
+-- Relevant PG commit: b073c3ccd06e4cb845e121387a43faa8c68a7b62
+SHOW server_version \gset
+SELECT substring(:'server_version', '\d+')::int >= 15 AS server_version_ge_15
+\gset
+\if :server_version_ge_15
+ALTER SCHEMA public OWNER TO pg_database_owner;
+\endif
 GRANT ALL ON SCHEMA public TO public;
 ALTER EXTENSION citus UPDATE TO '9.5-1';
 ALTER EXTENSION citus UPDATE TO '10.0-4';
@@ -392,6 +400,14 @@ SELECT * FROM multi_extension.print_extension_changes();
 ALTER EXTENSION citus UPDATE TO '10.2-4';
 SELECT * FROM multi_extension.print_extension_changes();
 
+-- Snapshot of state at 10.2-5
+ALTER EXTENSION citus UPDATE TO '10.2-5';
+SELECT * FROM multi_extension.print_extension_changes();
+
+-- Test downgrade to 10.2-4 from 10.2-5
+ALTER EXTENSION citus UPDATE TO '10.2-4';
+ALTER EXTENSION citus UPDATE TO '10.2-5';
+
 -- Make sure that we defined dependencies from all rel objects (tables,
 -- indexes, sequences ..) to columnar table access method ...
 SELECT pg_class.oid INTO columnar_schema_members
@@ -436,7 +452,7 @@ SELECT
 FROM
 	pg_dist_node_metadata;
 
--- Test downgrade to 10.2-4 from 11.0-1
+-- Test downgrade to 10.2-5 from 11.0-1
 ALTER EXTENSION citus UPDATE TO '11.0-1';
 
 SELECT
@@ -448,7 +464,7 @@ FROM
 DELETE FROM pg_dist_partition WHERE logicalrelid = 'e_transactions'::regclass;
 DROP TABLE e_transactions;
 
-ALTER EXTENSION citus UPDATE TO '10.2-4';
+ALTER EXTENSION citus UPDATE TO '10.2-5';
 -- Should be empty result since upgrade+downgrade should be a no-op
 SELECT * FROM multi_extension.print_extension_changes();
 
@@ -476,12 +492,25 @@ SELECT * FROM multi_extension.print_extension_changes();
 ALTER EXTENSION citus UPDATE TO '11.0-3';
 SELECT * FROM multi_extension.print_extension_changes();
 
--- Test downgrade to 11.0-3 from 11.1-1
-ALTER EXTENSION citus UPDATE TO '11.1-1';
+-- Test downgrade to 11.0-3 from 11.0-4
+ALTER EXTENSION citus UPDATE TO '11.0-4';
 ALTER EXTENSION citus UPDATE TO '11.0-3';
 -- Should be empty result since upgrade+downgrade should be a no-op
 SELECT * FROM multi_extension.print_extension_changes();
 
+-- Snapshot of state at 11.0-4
+ALTER EXTENSION citus UPDATE TO '11.0-4';
+SELECT * FROM multi_extension.print_extension_changes();
+
+-- Test downgrade to 11.0-4 from 11.1-1
+ALTER EXTENSION citus UPDATE TO '11.1-1';
+ALTER EXTENSION citus UPDATE TO '11.0-4';
+-- Should be empty result since upgrade+downgrade should be a no-op
+SELECT * FROM multi_extension.print_extension_changes();
+
+-- Test CREATE EXTENSION when Citus already exists but Citus_Columnar does not. Should skip
+CREATE EXTENSION IF NOT EXISTS citus;
+CREATE EXTENSION citus;
 -- Snapshot of state at 11.1-1
 ALTER EXTENSION citus UPDATE TO '11.1-1';
 SELECT * FROM multi_extension.print_extension_changes();
@@ -765,6 +794,40 @@ FROM test.maintenance_worker();
 
 -- confirm that there is only one maintenance daemon
 SELECT count(*) FROM pg_stat_activity WHERE application_name = 'Citus Maintenance Daemon';
+
+-- confirm that we can create a distributed table concurrently on an empty node
+DROP EXTENSION citus;
+CREATE EXTENSION citus;
+CREATE TABLE test (x int, y int);
+INSERT INTO test VALUES (1,2);
+SET citus.shard_replication_factor TO 1;
+SET citus.defer_drop_after_shard_split TO off;
+SELECT create_distributed_table_concurrently('test','x');
+DROP TABLE test;
+TRUNCATE pg_dist_node;
+
+-- confirm that we can create a distributed table on an empty node
+CREATE TABLE test (x int, y int);
+INSERT INTO test VALUES (1,2);
+SET citus.shard_replication_factor TO 1;
+SELECT create_distributed_table('test','x');
+DROP TABLE test;
+TRUNCATE pg_dist_node;
+
+-- confirm that we can create a reference table on an empty node
+CREATE TABLE test (x int, y int);
+INSERT INTO test VALUES (1,2);
+SELECT create_reference_table('test');
+DROP TABLE test;
+TRUNCATE pg_dist_node;
+
+-- confirm that we can create a local table on an empty node
+CREATE TABLE test (x int, y int);
+INSERT INTO test VALUES (1,2);
+SELECT citus_add_local_table_to_metadata('test');
+DROP TABLE test;
+DROP EXTENSION citus;
+CREATE EXTENSION citus;
 
 DROP TABLE version_mismatch_table;
 DROP SCHEMA multi_extension;

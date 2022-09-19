@@ -12,11 +12,16 @@
 #ifndef SHARDSPLIT_H_
 #define SHARDSPLIT_H_
 
+#include "distributed/utils/distribution_column_map.h"
+
 /* Split Modes supported by Shard Split API */
 typedef enum SplitMode
 {
-	BLOCKING_SPLIT = 0
+	BLOCKING_SPLIT = 0,
+	NON_BLOCKING_SPLIT = 1,
+	AUTO_SPLIT = 2
 } SplitMode;
+
 
 /*
  * User Scenario calling Split Shard API.
@@ -25,7 +30,8 @@ typedef enum SplitMode
 typedef enum SplitOperation
 {
 	SHARD_SPLIT_API = 0,
-	ISOLATE_TENANT_TO_NEW_SHARD
+	ISOLATE_TENANT_TO_NEW_SHARD,
+	CREATE_DISTRIBUTED_TABLE
 } SplitOperation;
 
 /*
@@ -36,11 +42,13 @@ extern void SplitShard(SplitMode splitMode,
 					   SplitOperation splitOperation,
 					   uint64 shardIdToSplit,
 					   List *shardSplitPointsList,
-					   List *nodeIdsForPlacementList);
+					   List *nodeIdsForPlacementList,
+					   DistributionColumnMap *distributionColumnOverrides,
+					   List *colocatedShardIntervalList,
+					   uint32 targetColocationId);
 
-/* TODO(niupre): Make all these APIs private when all consumers (Example : ISOLATE_TENANT_TO_NEW_SHARD) directly call 'SplitShard' API. */
-extern void ErrorIfCannotSplitShard(SplitOperation splitOperation,
-									ShardInterval *sourceShard);
-extern void DropShardList(List *shardIntervalList);
+extern SplitMode LookupSplitMode(Oid shardTransferModeOid);
+
+extern void ErrorIfMultipleNonblockingMoveSplitInTheSameTransaction(void);
 
 #endif /* SHARDSPLIT_H_ */

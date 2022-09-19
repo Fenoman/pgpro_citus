@@ -45,6 +45,7 @@
 #include "commands/tablecmds.h"
 #include "distributed/adaptive_executor.h"
 #include "distributed/backend_data.h"
+#include "distributed/citus_depended_object.h"
 #include "distributed/colocation_utils.h"
 #include "distributed/commands.h"
 #include "distributed/commands/multi_copy.h"
@@ -376,6 +377,8 @@ ProcessUtilityInternal(PlannedStmt *pstmt,
 {
 	Node *parsetree = pstmt->utilityStmt;
 	List *ddlJobs = NIL;
+	DistOpsValidationState distOpsValidationState = HasNoneValidObject;
+	bool oldSkipConstraintsValidationValue = SkipConstraintValidation;
 
 	if (IsA(parsetree, ExplainStmt) &&
 		IsA(((ExplainStmt *) parsetree)->query, Query))
@@ -425,16 +428,24 @@ ProcessUtilityInternal(PlannedStmt *pstmt,
 		parsetree = ProcessCreateSubscriptionStmt(createSubStmt);
 	}
 
+	/*
+	 * For security and reliability reasons we disallow altering and dropping
+	 * subscriptions created by citus by non superusers. We could probably
+	 * disallow this for all subscriptions without issues. But out of an
+	 * abundance of caution for breaking subscription logic created by users
+	 * for other purposes, we only disallow it for the subscriptions that we
+	 * create i.e. ones that start with "citus_".
+	 */
 	if (IsA(parsetree, AlterSubscriptionStmt))
 	{
 		AlterSubscriptionStmt *alterSubStmt = (AlterSubscriptionStmt *) parsetree;
 		if (!superuser() &&
-			StringStartsWith(alterSubStmt->subname,
-							 SHARD_MOVE_SUBSCRIPTION_PREFIX))
+			StringStartsWith(alterSubStmt->subname, "citus_"))
 		{
 			ereport(ERROR, (
 						errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-						errmsg("Only superusers can alter shard move subscriptions")));
+						errmsg(
+							"Only superusers can alter subscriptions that are created by citus")));
 		}
 	}
 
@@ -442,11 +453,12 @@ ProcessUtilityInternal(PlannedStmt *pstmt,
 	{
 		DropSubscriptionStmt *dropSubStmt = (DropSubscriptionStmt *) parsetree;
 		if (!superuser() &&
-			StringStartsWith(dropSubStmt->subname, SHARD_MOVE_SUBSCRIPTION_PREFIX))
+			StringStartsWith(dropSubStmt->subname, "citus_"))
 		{
 			ereport(ERROR, (
 						errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-						errmsg("Only superusers can drop shard move subscriptions")));
+						errmsg(
+							"Only superusers can drop subscriptions that are created by citus")));
 		}
 	}
 
@@ -543,6 +555,19 @@ ProcessUtilityInternal(PlannedStmt *pstmt,
 		ops = GetDistributeObjectOps(parsetree);
 
 		/*
+		 * Preprocess and qualify steps can cause pg tests to fail because of the
+		 * unwanted citus related warnings or early error logs related to invalid address.
+		 * Therefore, we first check if any address in the given statement is valid.
+		 * Then, we do not execute qualify and preprocess if none of the addresses are valid
+		 * or any address violates ownership rules to prevent before-mentioned citus related
+		 * messages. PG will complain about the invalid address or ownership violation, so we
+		 * are safe to not execute qualify and preprocess. Also note that we should not guard
+		 * any step after standardProcess_Utility with the enum state distOpsValidationState
+		 * because PG would have already failed the transaction.
+		 */
+		distOpsValidationState = DistOpsValidityState(parsetree, ops);
+
+		/*
 		 * For some statements Citus defines a Qualify function. The goal of this function
 		 * is to take any ambiguity from the statement that is contextual on either the
 		 * search_path or current settings.
@@ -550,13 +575,16 @@ ProcessUtilityInternal(PlannedStmt *pstmt,
 		 * and fill them out how postgres would resolve them. This makes subsequent
 		 * deserialize calls for the statement portable to other postgres servers, the
 		 * workers in our case.
+		 * If there are no valid objects or any object violates ownership, let's skip
+		 * the qualify and preprocess, and do not diverge from Postgres in terms of
+		 * error messages.
 		 */
-		if (ops && ops->qualify)
+		if (ops && ops->qualify && DistOpsInValidState(distOpsValidationState))
 		{
 			ops->qualify(parsetree);
 		}
 
-		if (ops && ops->preprocess)
+		if (ops && ops->preprocess && DistOpsInValidState(distOpsValidationState))
 		{
 			ddlJobs = ops->preprocess(parsetree, queryString, context);
 		}
@@ -569,9 +597,7 @@ ProcessUtilityInternal(PlannedStmt *pstmt,
 		 * Citus intervening. The only exception is partition column drop, in
 		 * which case we error out. Advanced Citus users use this to implement their
 		 * own DDL propagation. We also use it to avoid re-propagating DDL commands
-		 * when changing MX tables on workers. Below, we also make sure that DDL
-		 * commands don't run queries that might get intercepted by Citus and error
-		 * out, specifically we skip validation in foreign keys.
+		 * when changing MX tables on workers.
 		 */
 
 		if (IsA(parsetree, AlterTableStmt))
@@ -590,8 +616,7 @@ ProcessUtilityInternal(PlannedStmt *pstmt,
 				 * Note validation is done on the shard level when DDL propagation
 				 * is enabled. The following eagerly executes some tasks on workers.
 				 */
-				parsetree =
-					SkipForeignKeyValidationIfConstraintIsFkey(alterTableStmt, false);
+				SkipForeignKeyValidationIfConstraintIsFkey(alterTableStmt);
 			}
 		}
 	}
@@ -599,12 +624,15 @@ ProcessUtilityInternal(PlannedStmt *pstmt,
 	/* inform the user about potential caveats */
 	if (IsA(parsetree, CreatedbStmt))
 	{
-		ereport(NOTICE, (errmsg("Citus partially supports CREATE DATABASE for "
-								"distributed databases"),
-						 errdetail("Citus does not propagate CREATE DATABASE "
-								   "command to workers"),
-						 errhint("You can manually create a database and its "
-								 "extensions on workers.")));
+		if (EnableUnsupportedFeatureMessages)
+		{
+			ereport(NOTICE, (errmsg("Citus partially supports CREATE DATABASE for "
+									"distributed databases"),
+							 errdetail("Citus does not propagate CREATE DATABASE "
+									   "command to workers"),
+							 errhint("You can manually create a database and its "
+									 "extensions on workers.")));
+		}
 	}
 	else if (IsA(parsetree, CreateRoleStmt) && !EnableCreateRolePropagation)
 	{
@@ -857,7 +885,7 @@ ProcessUtilityInternal(PlannedStmt *pstmt,
 		 */
 		if (ops && ops->markDistributed)
 		{
-			List *addresses = GetObjectAddressListFromParseTree(parsetree, false);
+			List *addresses = GetObjectAddressListFromParseTree(parsetree, false, true);
 			ObjectAddress *address = NULL;
 			foreach_ptr(address, addresses)
 			{
@@ -874,6 +902,8 @@ ProcessUtilityInternal(PlannedStmt *pstmt,
 		 */
 		CitusHasBeenLoaded(); /* lgtm[cpp/return-value-ignored] */
 	}
+
+	SkipConstraintValidation = oldSkipConstraintsValidationValue;
 }
 
 
@@ -1383,53 +1413,6 @@ set_indexsafe_procflags(void)
 
 
 #endif
-
-
-/*
- * CreateCustomDDLTaskList creates a DDLJob which will apply a command to all placements
- * of shards of a distributed table. The command to be applied is generated by the
- * TableDDLCommand structure passed in.
- */
-DDLJob *
-CreateCustomDDLTaskList(Oid relationId, TableDDLCommand *command)
-{
-	List *taskList = NIL;
-	List *shardIntervalList = LoadShardIntervalList(relationId);
-	uint64 jobId = INVALID_JOB_ID;
-	Oid namespace = get_rel_namespace(relationId);
-	char *namespaceName = get_namespace_name(namespace);
-	int taskId = 1;
-
-	/* lock metadata before getting placement lists */
-	LockShardListMetadata(shardIntervalList, ShareLock);
-
-	ShardInterval *shardInterval = NULL;
-	foreach_ptr(shardInterval, shardIntervalList)
-	{
-		uint64 shardId = shardInterval->shardId;
-
-		char *commandStr = GetShardedTableDDLCommand(command, shardId, namespaceName);
-
-		Task *task = CitusMakeNode(Task);
-		task->jobId = jobId;
-		task->taskId = taskId++;
-		task->taskType = DDL_TASK;
-		SetTaskQueryString(task, commandStr);
-		task->replicationModel = REPLICATION_MODEL_INVALID;
-		task->dependentTaskList = NULL;
-		task->anchorShardId = shardId;
-		task->taskPlacementList = ActiveShardPlacementList(shardId);
-
-		taskList = lappend(taskList, task);
-	}
-
-	DDLJob *ddlJob = palloc0(sizeof(DDLJob));
-	ObjectAddressSet(ddlJob->targetObjectAddress, RelationRelationId, relationId);
-	ddlJob->metadataSyncCommand = GetTableDDLCommand(command);
-	ddlJob->taskList = taskList;
-
-	return ddlJob;
-}
 
 
 /*

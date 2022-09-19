@@ -1,3 +1,13 @@
+--
+-- INSERT_SELECT_REPARTITION
+--
+-- This test file has an alternative output because of the change in the
+-- display of SQL-standard function's arguments in INSERT/SELECT in PG15.
+-- The alternative output can be deleted when we drop support for PG14
+--
+SHOW server_version \gset
+SELECT substring(:'server_version', '\d+')::int >= 15 AS server_version_ge_15;
+
 -- tests behaviour of INSERT INTO ... SELECT with repartitioning
 CREATE SCHEMA insert_select_repartition;
 SET search_path TO 'insert_select_repartition';
@@ -354,7 +364,9 @@ INSERT INTO target_table
   SELECT a, max(b) FROM source_table
   WHERE a BETWEEN 1 AND 2 GROUP BY a;
 
+SELECT public.coordinator_plan($Q$
 EXPLAIN EXECUTE insert_plan;
+$Q$);
 
 SET client_min_messages TO DEBUG1;
 EXECUTE insert_plan;

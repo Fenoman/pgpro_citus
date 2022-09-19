@@ -43,6 +43,7 @@
 #include "distributed/coordinator_protocol.h"
 #include "distributed/deparser.h"
 #include "distributed/distribution_column.h"
+#include "distributed/hash_helpers.h"
 #include "distributed/listutils.h"
 #include "distributed/local_executor.h"
 #include "distributed/metadata/dependency.h"
@@ -639,6 +640,8 @@ ConvertTable(TableConversionState *con)
 		Oid partitionRelationId = InvalidOid;
 		foreach_oid(partitionRelationId, partitionList)
 		{
+			char *tableQualifiedName = generate_qualified_relation_name(
+				partitionRelationId);
 			char *detachPartitionCommand = GenerateDetachPartitionCommand(
 				partitionRelationId);
 			char *attachPartitionCommand = GenerateAlterTableAttachPartitionCommand(
@@ -683,6 +686,19 @@ ConvertTable(TableConversionState *con)
 			{
 				foreignKeyCommands = list_concat(foreignKeyCommands,
 												 partitionReturn->foreignKeyCommands);
+			}
+
+
+			/*
+			 * If we are altering a partitioned distributed table by
+			 * colocateWith:none, we override con->colocationWith parameter
+			 * with the first newly created partition table to share the
+			 * same colocation group for rest of partitions and partitioned
+			 * table.
+			 */
+			if (con->colocateWith != NULL && IsColocateWithNone(con->colocateWith))
+			{
+				con->colocateWith = tableQualifiedName;
 			}
 		}
 	}
@@ -1276,13 +1292,7 @@ CreateCitusTableLike(TableConversionState *con)
 static void
 ErrorIfUnsupportedCascadeObjects(Oid relationId)
 {
-	HASHCTL info;
-	memset(&info, 0, sizeof(info));
-	info.keysize = sizeof(Oid);
-	info.entrysize = sizeof(Oid);
-	info.hash = oid_hash;
-	uint32 hashFlags = (HASH_ELEM | HASH_FUNCTION);
-	HTAB *nodeMap = hash_create("object dependency map (oid)", 64, &info, hashFlags);
+	HTAB *nodeMap = CreateSimpleHashSetWithName(Oid, "object dependency map (oid)");
 
 	bool unsupportedObjectInDepGraph =
 		DoesCascadeDropUnsupportedObject(RelationRelationId, relationId, nodeMap);
@@ -1594,6 +1604,8 @@ ReplaceTable(Oid sourceId, Oid targetId, List *justBeforeDropCommands,
 		}
 		else if (ShouldSyncTableMetadata(sourceId))
 		{
+			char *qualifiedTableName = quote_qualified_identifier(schemaName, sourceName);
+
 			/*
 			 * We are converting a citus local table to a distributed/reference table,
 			 * so we should prevent dropping the sequence on the table. Otherwise, we'd
@@ -1602,8 +1614,8 @@ ReplaceTable(Oid sourceId, Oid targetId, List *justBeforeDropCommands,
 			StringInfo command = makeStringInfo();
 
 			appendStringInfo(command,
-							 "SELECT pg_catalog.worker_drop_sequence_dependency('%s');",
-							 quote_qualified_identifier(schemaName, sourceName));
+							 "SELECT pg_catalog.worker_drop_sequence_dependency(%s);",
+							 quote_literal_cstr(qualifiedTableName));
 
 			SendCommandToWorkersWithMetadata(command->data);
 		}
@@ -1893,11 +1905,17 @@ CreateWorkerChangeSequenceDependencyCommand(char *sequenceSchemaName, char *sequ
 											char *sourceSchemaName, char *sourceName,
 											char *targetSchemaName, char *targetName)
 {
+	char *qualifiedSchemaName = quote_qualified_identifier(sequenceSchemaName,
+														   sequenceName);
+	char *qualifiedSourceName = quote_qualified_identifier(sourceSchemaName, sourceName);
+	char *qualifiedTargetName = quote_qualified_identifier(targetSchemaName, targetName);
+
 	StringInfo query = makeStringInfo();
-	appendStringInfo(query, "SELECT worker_change_sequence_dependency('%s', '%s', '%s')",
-					 quote_qualified_identifier(sequenceSchemaName, sequenceName),
-					 quote_qualified_identifier(sourceSchemaName, sourceName),
-					 quote_qualified_identifier(targetSchemaName, targetName));
+	appendStringInfo(query, "SELECT worker_change_sequence_dependency(%s, %s, %s)",
+					 quote_literal_cstr(qualifiedSchemaName),
+					 quote_literal_cstr(qualifiedSourceName),
+					 quote_literal_cstr(qualifiedTargetName));
+
 	return query->data;
 }
 

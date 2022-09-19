@@ -1,14 +1,13 @@
--- We have two different output files for this failure test because the
--- failure behaviour of SAVEPOINT and RELEASE commands are different if
--- we use the executor. If we use it, these commands error out if any of
--- the placement commands fail. Otherwise, we might mark the placement
--- as invalid and continue with a WARNING.
+--
+-- FAILURE_SAVEPOINTS
+--
 
 SELECT citus.mitmproxy('conn.allow()');
 
 SET citus.shard_count = 2;
 SET citus.shard_replication_factor = 1; -- one shard per worker
 SET citus.next_shard_id TO 100950;
+SET client_min_messages TO ERROR;
 ALTER SEQUENCE pg_catalog.pg_dist_placement_placementid_seq RESTART 150;
 
 CREATE TABLE artists (
@@ -202,6 +201,7 @@ SELECT * FROM ref;
 END;
 
 -- clean up
+RESET client_min_messages;
 SELECT citus.mitmproxy('conn.allow()');
 DROP TABLE artists;
 DROP TABLE researchers;

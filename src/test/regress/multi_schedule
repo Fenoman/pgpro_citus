@@ -58,13 +58,14 @@ test: cte_inline recursive_view_local_table values sequences_with_different_type
 test: pg13 pg12
 # run pg14 sequentially as it syncs metadata
 test: pg14
+test: pg15
 test: drop_column_partitioned_table
 test: tableam
 
 # ----------
 # Miscellaneous tests to check our query planning behavior
 # ----------
-test: multi_deparse_shard_query multi_distributed_transaction_id intermediate_results limit_intermediate_size rollback_to_savepoint
+test: multi_deparse_shard_query multi_distributed_transaction_id intermediate_results limit_intermediate_size
 test: multi_explain hyperscale_tutorial partitioned_intermediate_results distributed_intermediate_results multi_real_time_transaction
 test: multi_basic_queries cross_join multi_complex_expressions multi_subquery multi_subquery_complex_queries multi_subquery_behavioral_analytics
 test: multi_subquery_complex_reference_clause multi_subquery_window_functions multi_view multi_sql_function multi_prepare_sql
@@ -85,7 +86,7 @@ test: multi_agg_type_conversion multi_count_type_conversion recursive_relation_p
 test: multi_partition_pruning single_hash_repartition_join unsupported_lateral_subqueries
 test: multi_join_pruning multi_hash_pruning intermediate_result_pruning
 test: multi_null_minmax_value_pruning cursors
-test: modification_correctness
+test: modification_correctness adv_lock_permission
 test: multi_query_directory_cleanup
 test: multi_task_assignment_policy multi_cross_shard
 test: multi_utility_statements
@@ -97,6 +98,7 @@ test: issue_5248 issue_5099
 test: object_propagation_debug
 test: undistribute_table
 test: run_command_on_all_nodes
+test: background_task_queue_monitor
 
 
 # ---------

@@ -84,6 +84,24 @@ SELECT * FROM partitioned_table ORDER BY 1, 2;
 SELECT * FROM partitioned_table_1_5 ORDER BY 1, 2;
 SELECT * FROM partitioned_table_6_10 ORDER BY 1, 2;
 
+-- test altering partitioned table colocate_with:none
+CREATE TABLE foo (x int, y int, t timestamptz default now()) PARTITION BY RANGE (t);
+CREATE TABLE foo_1 PARTITION of foo for VALUES FROM ('2022-01-01') TO ('2022-12-31');
+CREATE TABLE foo_2 PARTITION of foo for VALUES FROM ('2023-01-01') TO ('2023-12-31');
+
+SELECT create_distributed_table('foo','x');
+
+CREATE TABLE foo_bar (x int, y int, t timestamptz default now()) PARTITION BY RANGE (t);
+CREATE TABLE foo_bar_1 PARTITION of foo_bar for VALUES FROM ('2022-01-01') TO ('2022-12-31');
+CREATE TABLE foo_bar_2 PARTITION of foo_bar for VALUES FROM ('2023-01-01') TO ('2023-12-31');
+
+SELECT create_distributed_table('foo_bar','x');
+
+SELECT COUNT(DISTINCT colocationid) FROM pg_dist_partition WHERE logicalrelid::regclass::text in ('foo', 'foo_1', 'foo_2', 'foo_bar', 'foo_bar_1', 'foo_bar_2');
+
+SELECT alter_distributed_table('foo', colocate_with => 'none');
+
+SELECT COUNT(DISTINCT colocationid) FROM pg_dist_partition WHERE logicalrelid::regclass::text in ('foo', 'foo_1', 'foo_2', 'foo_bar', 'foo_bar_1', 'foo_bar_2');
 
 -- test references
 CREATE TABLE referenced_dist_table (a INT UNIQUE);
@@ -201,7 +219,7 @@ SET citus.shard_count TO 23;
 
 CREATE TABLE shard_split_table (a int, b int);
 SELECT create_distributed_table ('shard_split_table', 'a');
-SELECT 1 FROM isolate_tenant_to_new_shard('shard_split_table', 5);
+SELECT 1 FROM isolate_tenant_to_new_shard('shard_split_table', 5, shard_transfer_mode => 'block_writes');
 
 -- show the difference in pg_dist_colocation and citus_tables shard counts
 SELECT

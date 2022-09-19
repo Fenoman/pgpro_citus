@@ -8,6 +8,10 @@ SELECT nextval('pg_dist_placement_placementid_seq') = MAX(placementid)+1 FROM pg
 SELECT nextval('pg_dist_groupid_seq') = MAX(groupid)+1 FROM pg_dist_node;
 SELECT nextval('pg_dist_node_nodeid_seq') = MAX(nodeid)+1 FROM pg_dist_node;
 SELECT nextval('pg_dist_colocationid_seq') = MAX(colocationid)+1 FROM pg_dist_colocation;
+SELECT nextval('pg_dist_operationid_seq') = MAX(operation_id)+1 FROM pg_dist_cleanup;
+SELECT nextval('pg_dist_cleanup_recordid_seq') = MAX(record_id)+1 FROM pg_dist_cleanup;
+SELECT nextval('pg_dist_background_job_job_id_seq') > COALESCE(MAX(job_id), 0) FROM pg_dist_background_job;
+SELECT nextval('pg_dist_background_task_task_id_seq') > COALESCE(MAX(task_id), 0) FROM pg_dist_background_task;
 
 -- If this query gives output it means we've added a new sequence that should
 -- possibly be restored after upgrades.
@@ -19,7 +23,11 @@ SELECT sequence_name FROM information_schema.sequences
     'pg_dist_placement_placementid_seq',
     'pg_dist_groupid_seq',
     'pg_dist_node_nodeid_seq',
-    'pg_dist_colocationid_seq'
+    'pg_dist_colocationid_seq',
+    'pg_dist_operationid_seq',
+    'pg_dist_cleanup_recordid_seq',
+    'pg_dist_background_job_job_id_seq',
+    'pg_dist_background_task_task_id_seq'
   );
 
 SELECT logicalrelid FROM pg_dist_partition

@@ -12,6 +12,7 @@ SET SEARCH_PATH = tenant_isolation;
 SET citus.shard_count TO 2;
 SET citus.next_shard_id TO 300;
 SET citus.shard_replication_factor TO 1;
+SET citus.max_adaptive_executor_pool_size TO 1;
 SELECT pg_backend_pid() as pid \gset
 SELECT citus.mitmproxy('conn.allow()');
 
@@ -38,119 +39,124 @@ SELECT * FROM shard_sizes ORDER BY 1;
 
 -- failure on colocated table creation
 SELECT citus.mitmproxy('conn.onQuery(query="CREATE TABLE tenant_isolation.table_2").kill()');
-SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE');
+SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE', shard_transfer_mode => 'block_writes');
 
 -- cancellation on colocated table creation
-SELECT citus.mitmproxy('conn.onQuery(query="CREATE TABLE tenant_isolation.table_2").after(1).cancel(' || :pid || ')');
-SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE');
+SELECT citus.mitmproxy('conn.onQuery(query="CREATE TABLE tenant_isolation.table_2").cancel(' || :pid || ')');
+SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE', shard_transfer_mode => 'block_writes');
 
 -- failure on colocated table population
-SELECT citus.mitmproxy('conn.onQuery(query="INSERT INTO tenant_isolation.table_2").after(2).kill()');
-SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE');
+SELECT citus.mitmproxy('conn.onQuery(query="worker_split_copy\(302").kill()');
+SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE', shard_transfer_mode => 'block_writes');
 
 -- cancellation on colocated table population
-SELECT citus.mitmproxy('conn.onQuery(query="INSERT INTO tenant_isolation.table_2").cancel(' || :pid || ')');
-SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE');
+SELECT citus.mitmproxy('conn.onQuery(query="worker_split_copy\(302").cancel(' || :pid || ')');
+SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE', shard_transfer_mode => 'block_writes');
 
 -- failure on colocated table constraints
 SELECT citus.mitmproxy('conn.onQuery(query="ALTER TABLE tenant_isolation.table_2 ADD CONSTRAINT").after(1).kill()');
-SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE');
+SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE', shard_transfer_mode => 'block_writes');
 
 -- cancellation on colocated table constraints
 SELECT citus.mitmproxy('conn.onQuery(query="ALTER TABLE tenant_isolation.table_2 ADD CONSTRAINT").after(2).cancel(' || :pid || ')');
-SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE');
+SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE', shard_transfer_mode => 'block_writes');
 
 
 -- failure on table creation
 SELECT citus.mitmproxy('conn.onQuery(query="CREATE TABLE tenant_isolation.table_1").kill()');
-SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE');
+SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE', shard_transfer_mode => 'block_writes');
 
 -- cancellation on table creation
-SELECT citus.mitmproxy('conn.onQuery(query="CREATE TABLE tenant_isolation.table_1").after(1).cancel(' || :pid || ')');
-SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE');
+SELECT citus.mitmproxy('conn.onQuery(query="CREATE TABLE tenant_isolation.table_1").cancel(' || :pid || ')');
+SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE', shard_transfer_mode => 'block_writes');
 
 -- failure on table population
-SELECT citus.mitmproxy('conn.onQuery(query="INSERT INTO tenant_isolation.table_1").after(2).kill()');
-SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE');
+SELECT citus.mitmproxy('conn.onQuery(query="worker_split_copy\(300").kill()');
+SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE', shard_transfer_mode => 'block_writes');
 
 -- cancellation on table population
-SELECT citus.mitmproxy('conn.onQuery(query="INSERT INTO tenant_isolation.table_1").cancel(' || :pid || ')');
-SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE');
+SELECT citus.mitmproxy('conn.onQuery(query="worker_split_copy\(300").cancel(' || :pid || ')');
+SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE', shard_transfer_mode => 'block_writes');
 
 -- failure on table constraints
 SELECT citus.mitmproxy('conn.onQuery(query="ALTER TABLE tenant_isolation.table_1 ADD CONSTRAINT").after(1).kill()');
-SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE');
+SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE', shard_transfer_mode => 'block_writes');
 
 -- cancellation on table constraints
 SELECT citus.mitmproxy('conn.onQuery(query="ALTER TABLE tenant_isolation.table_1 ADD CONSTRAINT").after(2).cancel(' || :pid || ')');
-SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE');
+SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE', shard_transfer_mode => 'block_writes');
 
 
 -- failure on dropping old colocated shard
+-- Disable deferred drop otherwise we will skip the drop and operation will succeed instead of failing.
+SET citus.defer_drop_after_shard_split TO OFF;
+
 SELECT citus.mitmproxy('conn.onQuery(query="DROP TABLE IF EXISTS tenant_isolation.table_2").kill()');
-SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE');
+SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE', shard_transfer_mode => 'block_writes');
 
 -- cancellation on dropping old colocated shard
 SELECT citus.mitmproxy('conn.onQuery(query="DROP TABLE IF EXISTS tenant_isolation.table_2").cancel(' || :pid || ')');
-SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE');
+SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE', shard_transfer_mode => 'block_writes');
 
 -- failure on dropping old shard
 SELECT citus.mitmproxy('conn.onQuery(query="DROP TABLE IF EXISTS tenant_isolation.table_1").kill()');
-SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE');
+SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE', shard_transfer_mode => 'block_writes');
 
 -- cancellation on dropping old shard
 SELECT citus.mitmproxy('conn.onQuery(query="DROP TABLE IF EXISTS tenant_isolation.table_1").cancel(' || :pid || ')');
-SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE');
+SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE', shard_transfer_mode => 'block_writes');
 
+-- Re-enable deferred drop for rest of the tests.
+SET citus.defer_drop_after_shard_split TO ON;
 
 -- failure on foreign key creation
 SELECT citus.mitmproxy('conn.onQuery(query="ADD CONSTRAINT table_2_ref_id_fkey FOREIGN KEY").kill()');
-SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE');
+SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE', shard_transfer_mode => 'block_writes');
 
 -- failure on foreign key creation
 SELECT citus.mitmproxy('conn.onQuery(query="ADD CONSTRAINT table_2_ref_id_fkey FOREIGN KEY").after(2).cancel(' || :pid || ')');
-SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE');
+SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE', shard_transfer_mode => 'block_writes');
 
 
 -- failure on shard split transaction
 SELECT citus.mitmproxy('conn.onQuery(query="BEGIN").kill()');
-SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE');
+SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE', shard_transfer_mode => 'block_writes');
 
 -- failure on shard split transaction
 SELECT citus.mitmproxy('conn.onQuery(query="BEGIN").cancel(' || :pid || ')');
-SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE');
+SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE', shard_transfer_mode => 'block_writes');
 
 -- failure on shard split transaction commit
 SELECT citus.mitmproxy('conn.onQuery(query="COMMIT").kill()');
-SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE');
+SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE', shard_transfer_mode => 'block_writes');
 
 -- failure on shard split transaction commit
 SELECT citus.mitmproxy('conn.onQuery(query="COMMIT").cancel(' || :pid || ')');
-SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE');
+SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE', shard_transfer_mode => 'block_writes');
 
 -- failure on transaction for dropping old tables
 SELECT citus.mitmproxy('conn.after(1).onQuery(query="BEGIN").kill()');
-SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE');
+SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE', shard_transfer_mode => 'block_writes');
 
 -- failure on transaction for dropping old tables
 SELECT citus.mitmproxy('conn.after(1).onQuery(query="BEGIN").cancel(' || :pid || ')');
-SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE');
+SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE', shard_transfer_mode => 'block_writes');
 
 -- failure on transaction for foreign key creation
 SELECT citus.mitmproxy('conn.after(2).onQuery(query="BEGIN").kill()');
-SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE');
+SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE', shard_transfer_mode => 'block_writes');
 
 -- failure on transaction for foreign key creation
 SELECT citus.mitmproxy('conn.after(2).onQuery(query="BEGIN").cancel(' || :pid || ')');
-SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE');
+SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE', shard_transfer_mode => 'block_writes');
 
 -- failure on transaction commit for foreign key creation
 SELECT citus.mitmproxy('conn.after(1).onQuery(query="COMMIT").kill()');
-SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE');
+SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE', shard_transfer_mode => 'block_writes');
 
 -- failure on transaction commit for foreign key creation
 SELECT citus.mitmproxy('conn.after(1).onQuery(query="COMMIT").cancel(' || :pid || ')');
-SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE');
+SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE', shard_transfer_mode => 'block_writes');
 
 -- failure on transaction prepare for dropping old tables
 SELECT citus.mitmproxy('conn.onQuery(query="PREPARE TRANSACTION").kill()');
@@ -161,7 +167,7 @@ SELECT citus.mitmproxy('conn.onQuery(query="PREPARE TRANSACTION").kill()');
 DO LANGUAGE plpgsql
 $$
 BEGIN
-	SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE');
+	SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE', shard_transfer_mode => 'block_writes');
 	EXCEPTION WHEN OTHERS THEN
 	RAISE 'Command failed to execute';
 END;
@@ -170,15 +176,15 @@ $$;
 
 -- failure on transaction prepare for dropping old tables
 SELECT citus.mitmproxy('conn.onQuery(query="PREPARE TRANSACTION").cancel(' || :pid || ')');
-SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE');
+SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE', shard_transfer_mode => 'block_writes');
 
 -- failure on transaction commit for dropping old tables
 SELECT citus.mitmproxy('conn.after(2).onQuery(query="COMMIT").kill()');
-SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE');
+SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE', shard_transfer_mode => 'block_writes');
 
 -- failure on transaction commit for dropping old tables
 SELECT citus.mitmproxy('conn.after(2).onQuery(query="COMMIT").cancel(' || :pid || ')');
-SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE');
+SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE', shard_transfer_mode => 'block_writes');
 
 
 -- verify that the tenant is not isolated
@@ -190,7 +196,7 @@ SELECT citus.mitmproxy('conn.allow()');
 -- shard sizes after successful tenant isolation
 CREATE TABLE old_shards AS SELECT shardid FROM pg_dist_shard;
 WITH new_shard AS (
-	SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE') AS shardid
+	SELECT isolate_tenant_to_new_shard('table_1', 5, 'CASCADE', shard_transfer_mode => 'block_writes') AS shardid
 )
 SELECT row_count
 FROM shard_sizes

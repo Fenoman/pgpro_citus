@@ -172,38 +172,41 @@ ExtractDefaultColumnsAndOwnedSequences(Oid relationId, List **columnNameList,
 		 attributeIndex++)
 	{
 		Form_pg_attribute attributeForm = TupleDescAttr(tupleDescriptor, attributeIndex);
-		if (attributeForm->attisdropped || !attributeForm->atthasdef)
-		{
-			/*
-			 * If this column has already been dropped or it has no DEFAULT
-			 * definition, skip it.
-			 */
-			continue;
-		}
 
-		if (attributeForm->attgenerated == ATTRIBUTE_GENERATED_STORED)
+		if (attributeForm->attisdropped ||
+			attributeForm->attgenerated == ATTRIBUTE_GENERATED_STORED)
 		{
-			/* skip columns with GENERATED AS ALWAYS expressions */
+			/* skip dropped columns and columns with GENERATED AS ALWAYS expressions */
 			continue;
 		}
 
 		char *columnName = NameStr(attributeForm->attname);
-		*columnNameList = lappend(*columnNameList, columnName);
-
 		List *columnOwnedSequences =
 			getOwnedSequences_internal(relationId, attributeIndex + 1, 0);
 
-		Oid ownedSequenceId = InvalidOid;
-		if (list_length(columnOwnedSequences) != 0)
+		if (attributeForm->atthasdef && list_length(columnOwnedSequences) == 0)
 		{
 			/*
-			 * A column might only own one sequence.
+			 * Even if there are no owned sequences, the code path still
+			 * expects the columnName to be filled such that it can DROP
+			 * DEFAULT for the existing nextval('seq') columns.
 			 */
-			Assert(list_length(columnOwnedSequences) == 1);
-			ownedSequenceId = linitial_oid(columnOwnedSequences);
+			*ownedSequenceIdList = lappend_oid(*ownedSequenceIdList, InvalidOid);
+			*columnNameList = lappend(*columnNameList, columnName);
+
+			continue;
 		}
 
-		*ownedSequenceIdList = lappend_oid(*ownedSequenceIdList, ownedSequenceId);
+		Oid ownedSequenceId = InvalidOid;
+		foreach_oid(ownedSequenceId, columnOwnedSequences)
+		{
+			/*
+			 * A column might have multiple sequences one via OWNED BY one another
+			 * via bigserial/default nextval.
+			 */
+			*ownedSequenceIdList = lappend_oid(*ownedSequenceIdList, ownedSequenceId);
+			*columnNameList = lappend(*columnNameList, columnName);
+		}
 	}
 
 	relation_close(relation, NoLock);
@@ -318,7 +321,7 @@ PreprocessDropSequenceStmt(Node *node, const char *queryString,
  * statement.
  */
 List *
-SequenceDropStmtObjectAddress(Node *stmt, bool missing_ok)
+SequenceDropStmtObjectAddress(Node *stmt, bool missing_ok, bool isPostprocess)
 {
 	DropStmt *dropSeqStmt = castNode(DropStmt, stmt);
 
@@ -357,7 +360,7 @@ PreprocessRenameSequenceStmt(Node *node, const char *queryString, ProcessUtility
 	Assert(stmt->renameType == OBJECT_SEQUENCE);
 
 	List *addresses = GetObjectAddressListFromParseTree((Node *) stmt,
-														stmt->missing_ok);
+														stmt->missing_ok, false);
 
 	/*  the code-path only supports a single object */
 	Assert(list_length(addresses) == 1);
@@ -384,7 +387,7 @@ PreprocessRenameSequenceStmt(Node *node, const char *queryString, ProcessUtility
  * subject of the RenameStmt.
  */
 List *
-RenameSequenceStmtObjectAddress(Node *node, bool missing_ok)
+RenameSequenceStmtObjectAddress(Node *node, bool missing_ok, bool isPostprocess)
 {
 	RenameStmt *stmt = castNode(RenameStmt, node);
 	Assert(stmt->renameType == OBJECT_SEQUENCE);
@@ -421,7 +424,7 @@ PreprocessAlterSequenceStmt(Node *node, const char *queryString,
 	AlterSeqStmt *stmt = castNode(AlterSeqStmt, node);
 
 	List *addresses = GetObjectAddressListFromParseTree((Node *) stmt,
-														stmt->missing_ok);
+														stmt->missing_ok, false);
 
 	/*  the code-path only supports a single object */
 	Assert(list_length(addresses) == 1);
@@ -478,17 +481,15 @@ SequenceUsedInDistributedTable(const ObjectAddress *sequenceAddress)
 	Oid citusTableId = InvalidOid;
 	foreach_oid(citusTableId, citusTableIdList)
 	{
-		List *attnumList = NIL;
-		List *dependentSequenceList = NIL;
-		GetDependentSequencesWithRelation(citusTableId, &attnumList,
-										  &dependentSequenceList, 0);
-		Oid currentSeqOid = InvalidOid;
-		foreach_oid(currentSeqOid, dependentSequenceList)
+		List *seqInfoList = NIL;
+		GetDependentSequencesWithRelation(citusTableId, &seqInfoList, 0);
+		SequenceInfo *seqInfo = NULL;
+		foreach_ptr(seqInfo, seqInfoList)
 		{
 			/*
 			 * This sequence is used in a distributed table
 			 */
-			if (currentSeqOid == sequenceAddress->objectId)
+			if (seqInfo->sequenceOid == sequenceAddress->objectId)
 			{
 				return citusTableId;
 			}
@@ -504,7 +505,7 @@ SequenceUsedInDistributedTable(const ObjectAddress *sequenceAddress)
  * subject of the AlterSeqStmt.
  */
 List *
-AlterSequenceStmtObjectAddress(Node *node, bool missing_ok)
+AlterSequenceStmtObjectAddress(Node *node, bool missing_ok, bool isPostprocess)
 {
 	AlterSeqStmt *stmt = castNode(AlterSeqStmt, node);
 
@@ -531,7 +532,7 @@ PreprocessAlterSequenceSchemaStmt(Node *node, const char *queryString,
 	Assert(stmt->objectType == OBJECT_SEQUENCE);
 
 	List *addresses = GetObjectAddressListFromParseTree((Node *) stmt,
-														stmt->missing_ok);
+														stmt->missing_ok, false);
 
 	/*  the code-path only supports a single object */
 	Assert(list_length(addresses) == 1);
@@ -558,7 +559,7 @@ PreprocessAlterSequenceSchemaStmt(Node *node, const char *queryString,
  * the subject of the AlterObjectSchemaStmt.
  */
 List *
-AlterSequenceSchemaStmtObjectAddress(Node *node, bool missing_ok)
+AlterSequenceSchemaStmtObjectAddress(Node *node, bool missing_ok, bool isPostprocess)
 {
 	AlterObjectSchemaStmt *stmt = castNode(AlterObjectSchemaStmt, node);
 	Assert(stmt->objectType == OBJECT_SEQUENCE);
@@ -609,7 +610,7 @@ PostprocessAlterSequenceSchemaStmt(Node *node, const char *queryString)
 	AlterObjectSchemaStmt *stmt = castNode(AlterObjectSchemaStmt, node);
 	Assert(stmt->objectType == OBJECT_SEQUENCE);
 	List *addresses = GetObjectAddressListFromParseTree((Node *) stmt,
-														stmt->missing_ok);
+														stmt->missing_ok, true);
 
 	/*  the code-path only supports a single object */
 	Assert(list_length(addresses) == 1);
@@ -640,7 +641,8 @@ PreprocessAlterSequenceOwnerStmt(Node *node, const char *queryString,
 	AlterTableStmt *stmt = castNode(AlterTableStmt, node);
 	Assert(AlterTableStmtObjType_compat(stmt) == OBJECT_SEQUENCE);
 
-	List *sequenceAddresses = GetObjectAddressListFromParseTree((Node *) stmt, false);
+	List *sequenceAddresses = GetObjectAddressListFromParseTree((Node *) stmt, false,
+																false);
 
 	/*  the code-path only supports a single object */
 	Assert(list_length(sequenceAddresses) == 1);
@@ -667,7 +669,7 @@ PreprocessAlterSequenceOwnerStmt(Node *node, const char *queryString,
  * subject of the AlterOwnerStmt.
  */
 List *
-AlterSequenceOwnerStmtObjectAddress(Node *node, bool missing_ok)
+AlterSequenceOwnerStmtObjectAddress(Node *node, bool missing_ok, bool isPostprocess)
 {
 	AlterTableStmt *stmt = castNode(AlterTableStmt, node);
 	Assert(AlterTableStmtObjType_compat(stmt) == OBJECT_SEQUENCE);
@@ -692,7 +694,8 @@ PostprocessAlterSequenceOwnerStmt(Node *node, const char *queryString)
 	AlterTableStmt *stmt = castNode(AlterTableStmt, node);
 	Assert(AlterTableStmtObjType_compat(stmt) == OBJECT_SEQUENCE);
 
-	List *sequenceAddresses = GetObjectAddressListFromParseTree((Node *) stmt, false);
+	List *sequenceAddresses = GetObjectAddressListFromParseTree((Node *) stmt, false,
+																true);
 
 	/*  the code-path only supports a single object */
 	Assert(list_length(sequenceAddresses) == 1);
@@ -707,6 +710,121 @@ PostprocessAlterSequenceOwnerStmt(Node *node, const char *queryString)
 
 	return NIL;
 }
+
+
+#if (PG_VERSION_NUM >= PG_VERSION_15)
+
+/*
+ * PreprocessAlterSequencePersistenceStmt is called for change of persistence
+ * of sequences before the persistence is changed on the local instance.
+ *
+ * If the sequence for which the persistence is changed is distributed, we execute
+ * the change on all the workers to keep the type in sync across the cluster.
+ */
+List *
+PreprocessAlterSequencePersistenceStmt(Node *node, const char *queryString,
+									   ProcessUtilityContext processUtilityContext)
+{
+	AlterTableStmt *stmt = castNode(AlterTableStmt, node);
+	Assert(AlterTableStmtObjType_compat(stmt) == OBJECT_SEQUENCE);
+
+	List *sequenceAddresses = GetObjectAddressListFromParseTree((Node *) stmt, false,
+																false);
+
+	/*  the code-path only supports a single object */
+	Assert(list_length(sequenceAddresses) == 1);
+
+	if (!ShouldPropagateAnyObject(sequenceAddresses))
+	{
+		return NIL;
+	}
+
+	EnsureCoordinator();
+	QualifyTreeNode((Node *) stmt);
+
+	const char *sql = DeparseTreeNode((Node *) stmt);
+
+	List *commands = list_make3(DISABLE_DDL_PROPAGATION, (void *) sql,
+								ENABLE_DDL_PROPAGATION);
+
+	return NodeDDLTaskList(NON_COORDINATOR_METADATA_NODES, commands);
+}
+
+
+/*
+ * AlterSequencePersistenceStmtObjectAddress returns the ObjectAddress of the
+ * sequence that is the subject of the AlterPersistenceStmt.
+ */
+List *
+AlterSequencePersistenceStmtObjectAddress(Node *node, bool missing_ok, bool isPostprocess)
+{
+	AlterTableStmt *stmt = castNode(AlterTableStmt, node);
+	Assert(AlterTableStmtObjType_compat(stmt) == OBJECT_SEQUENCE);
+
+	RangeVar *sequence = stmt->relation;
+	Oid seqOid = RangeVarGetRelid(sequence, NoLock, missing_ok);
+	ObjectAddress *sequenceAddress = palloc0(sizeof(ObjectAddress));
+	ObjectAddressSet(*sequenceAddress, RelationRelationId, seqOid);
+
+	return list_make1(sequenceAddress);
+}
+
+
+/*
+ * PreprocessSequenceAlterTableStmt is called for change of persistence or owner
+ * of sequences before the persistence/owner is changed on the local instance.
+ *
+ * Altering persistence or owner are the only ALTER commands of a sequence
+ * that may pass through an AlterTableStmt as well
+ */
+List *
+PreprocessSequenceAlterTableStmt(Node *node, const char *queryString,
+								 ProcessUtilityContext processUtilityContext)
+{
+	AlterTableStmt *stmt = castNode(AlterTableStmt, node);
+	Assert(AlterTableStmtObjType_compat(stmt) == OBJECT_SEQUENCE);
+
+	ListCell *cmdCell = NULL;
+	foreach(cmdCell, stmt->cmds)
+	{
+		AlterTableCmd *cmd = castNode(AlterTableCmd, lfirst(cmdCell));
+		switch (cmd->subtype)
+		{
+			case AT_ChangeOwner:
+			{
+				return PreprocessAlterSequenceOwnerStmt(node,
+														queryString,
+														processUtilityContext);
+			}
+
+			case AT_SetLogged:
+			{
+				return PreprocessAlterSequencePersistenceStmt(node,
+															  queryString,
+															  processUtilityContext);
+			}
+
+			case AT_SetUnLogged:
+			{
+				return PreprocessAlterSequencePersistenceStmt(node,
+															  queryString,
+															  processUtilityContext);
+			}
+
+			default:
+			{
+				/* normally we shouldn't ever reach this */
+				ereport(ERROR, (errmsg("unsupported subtype for alter sequence command"),
+								errdetail("sub command type: %d",
+										  cmd->subtype)));
+			}
+		}
+	}
+	return NIL;
+}
+
+
+#endif
 
 
 /*

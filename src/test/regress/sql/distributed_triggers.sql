@@ -3,7 +3,6 @@ DROP SCHEMA IF EXISTS distributed_triggers CASCADE;
 CREATE SCHEMA distributed_triggers;
 SET search_path TO 'distributed_triggers';
 SET citus.shard_replication_factor = 1;
-SET citus.shard_count = 32;
 SET citus.next_shard_id TO 800000;
 
 --
@@ -302,7 +301,7 @@ CREATE TRIGGER record_emp_trig
 AFTER INSERT OR UPDATE OR DELETE ON emptest
     FOR EACH STATEMENT EXECUTE FUNCTION distributed_triggers.record_emp();
 
-INSERT INTO emptest VALUES ('test5', 1);
+INSERT INTO emptest VALUES ('test6', 1);
 DELETE FROM emptest;
 SELECT * FROM emptest;
 SELECT operation_type FROM record_op;
@@ -416,10 +415,15 @@ SELECT operation_type, product_sku, state_code FROM record_sale ORDER BY 1,2,3;
 --
 --Test ALTER TRIGGER
 --
+-- Pre PG15, renaming the trigger on the parent table didn't rename the same trigger on
+-- the children as well. Hence, let's not print the trigger names of the children
+-- In PG15, rename is consistent for all partitions of the parent
+-- This is tested in pg15.sql file.
+
 CREATE VIEW sale_triggers AS
     SELECT tgname, tgrelid::regclass, tgenabled
     FROM pg_trigger
-    WHERE tgrelid::regclass::text like 'sale%'
+    WHERE tgrelid::regclass::text = 'sale'
     ORDER BY 1, 2;
 
 SELECT * FROM sale_triggers ORDER BY 1,2;

@@ -10,8 +10,35 @@ SELECT create_distributed_table('test','x');
 
 (1 row)
 
+-- Add 1 row to each shard
+SELECT get_shard_id_for_distribution_column('test', 1);
+ get_shard_id_for_distribution_column
+---------------------------------------------------------------------
+                            801009000
+(1 row)
+
 INSERT INTO test VALUES (1,2);
+SELECT get_shard_id_for_distribution_column('test', 3);
+ get_shard_id_for_distribution_column
+---------------------------------------------------------------------
+                            801009001
+(1 row)
+
 INSERT INTO test VALUES (3,2);
+SELECT get_shard_id_for_distribution_column('test', 6);
+ get_shard_id_for_distribution_column
+---------------------------------------------------------------------
+                            801009002
+(1 row)
+
+INSERT INTO test VALUES (8,2);
+SELECT get_shard_id_for_distribution_column('test', 11);
+ get_shard_id_for_distribution_column
+---------------------------------------------------------------------
+                            801009003
+(1 row)
+
+INSERT INTO test VALUES (11,2);
 -- Set a very high slow start to avoid opening parallel connections
 SET citus.executor_slow_start_interval TO '60s';
 SET citus.max_adaptive_executor_pool_size TO 2;
@@ -19,7 +46,7 @@ BEGIN;
 SELECT count(*) FROM test a JOIN (SELECT x, pg_sleep(0.1) FROM test) b USING (x);
  count
 ---------------------------------------------------------------------
-     2
+     4
 (1 row)
 
 SELECT sum(result::bigint) FROM run_command_on_workers($$
@@ -35,10 +62,10 @@ END;
 -- SELECT takes longer than slow start interval, should open multiple connections
 SET citus.executor_slow_start_interval TO '10ms';
 BEGIN;
-SELECT count(*) FROM test a JOIN (SELECT x, pg_sleep(0.1) FROM test) b USING (x);
+SELECT count(*) FROM test a JOIN (SELECT x, pg_sleep(0.2) FROM test) b USING (x);
  count
 ---------------------------------------------------------------------
-     2
+     4
 (1 row)
 
 SELECT sum(result::bigint) FROM run_command_on_workers($$
@@ -51,5 +78,36 @@ $$);
 (1 row)
 
 END;
+CREATE OR REPLACE FUNCTION select_for_update()
+RETURNS void
+AS $$
+DECLARE
+    my int;
+BEGIN
+    SELECT y INTO my FROM test WHERE x = 1 FOR UPDATE;
+END;
+$$ LANGUAGE plpgsql;
+-- so that we can prove that we open a transaction block by logging below:
+-- "NOTICE:  issuing BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED;..."
+SET citus.log_remote_commands TO on;
+SELECT select_for_update();
+NOTICE:  issuing BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED;SELECT assign_distributed_transaction_id(xx, xx, 'xxxxxxx');
+DETAIL:  on server postgres@localhost:xxxxx connectionId: xxxxxxx
+CONTEXT:  SQL statement "SELECT y         FROM test WHERE x = 1 FOR UPDATE"
+PL/pgSQL function select_for_update() line XX at SQL statement
+NOTICE:  issuing SELECT y FROM adaptive_executor.test_801009000 test WHERE (x OPERATOR(pg_catalog.=) 1) FOR UPDATE OF test
+DETAIL:  on server postgres@localhost:xxxxx connectionId: xxxxxxx
+CONTEXT:  SQL statement "SELECT y         FROM test WHERE x = 1 FOR UPDATE"
+PL/pgSQL function select_for_update() line XX at SQL statement
+NOTICE:  issuing COMMIT
+DETAIL:  on server postgres@localhost:xxxxx connectionId: xxxxxxx
+ select_for_update
+---------------------------------------------------------------------
+
+(1 row)
+
+SET citus.log_remote_commands TO off;
 DROP SCHEMA adaptive_executor CASCADE;
-NOTICE:  drop cascades to table test
+NOTICE:  drop cascades to 2 other objects
+DETAIL:  drop cascades to table test
+drop cascades to function select_for_update()

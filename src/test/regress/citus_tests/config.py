@@ -104,7 +104,8 @@ class CitusBaseClusterConfig(object, metaclass=NewInitCaller):
             "citus.node_conninfo": "sslmode=prefer",
             "citus.enable_repartition_joins": True,
             "citus.repartition_join_bucket_count_per_node": 2,
-            "max_connections": 600,
+            "citus.log_distributed_deadlock_detection": True,
+            "max_connections": 1200,
         }
         self.new_settings = {}
         self.add_coordinator_to_metadata = False

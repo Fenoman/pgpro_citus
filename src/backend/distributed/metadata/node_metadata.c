@@ -2547,6 +2547,24 @@ EnsureCoordinator(void)
 
 
 /*
+ * EnsureCoordinatorIsInMetadata checks whether the coordinator is added to the
+ * metadata, which is required for many operations.
+ */
+void
+EnsureCoordinatorIsInMetadata(void)
+{
+	bool isCoordinatorInMetadata = false;
+	PrimaryNodeForGroup(COORDINATOR_GROUP_ID, &isCoordinatorInMetadata);
+	if (!isCoordinatorInMetadata)
+	{
+		ereport(ERROR, (errmsg("coordinator is not added to the metadata"),
+						errhint("Use SELECT citus_set_coordinator_host('<hostname>') "
+								"to configure the coordinator hostname")));
+	}
+}
+
+
+/*
  * InsertCoordinatorIfClusterEmpty can be used to ensure Citus tables can be
  * created even on a node that has just performed CREATE EXTENSION citus;
  */
@@ -2659,9 +2677,16 @@ DeleteNodeRow(char *nodeName, int32 nodePort)
 
 	/*
 	 * simple_heap_delete() expects that the caller has at least an
-	 * AccessShareLock on replica identity index.
+	 * AccessShareLock on primary key index.
+	 *
+	 * XXX: This does not seem required, do we really need to acquire this lock?
+	 * Postgres doesn't acquire such locks on indexes before deleting catalog tuples.
+	 * Linking here the reasons we added this lock acquirement:
+	 * https://github.com/citusdata/citus/pull/2851#discussion_r306569462
+	 * https://github.com/citusdata/citus/pull/2855#discussion_r313628554
+	 * https://github.com/citusdata/citus/issues/1890
 	 */
-	Relation replicaIndex = index_open(RelationGetReplicaIndex(pgDistNode),
+	Relation replicaIndex = index_open(RelationGetPrimaryKeyIndex(pgDistNode),
 									   AccessShareLock);
 
 	ScanKeyInit(&scanKey[0], Anum_pg_dist_node_nodename,

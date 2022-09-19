@@ -44,6 +44,13 @@ step "s1-update"
 	UPDATE isolation_table SET value = 5 WHERE id = 5;
 }
 
+step "s1-update-complex"
+{
+	UPDATE isolation_table SET value = 5 WHERE id IN (
+        SELECT max(id) FROM isolation_table
+    );
+}
+
 step "s1-delete"
 {
 	DELETE FROM isolation_table WHERE id = 5;
@@ -66,7 +73,7 @@ step "s1-copy"
 
 step "s1-isolate-tenant"
 {
-	SELECT isolate_tenant_to_new_shard('isolation_table', 2);
+	SELECT isolate_tenant_to_new_shard('isolation_table', 2, shard_transfer_mode => 'block_writes');
 }
 
 step "s1-commit"
@@ -83,7 +90,7 @@ step "s2-begin"
 
 step "s2-isolate-tenant"
 {
-	SELECT isolate_tenant_to_new_shard('isolation_table', 5);
+	SELECT isolate_tenant_to_new_shard('isolation_table', 5, shard_transfer_mode => 'block_writes');
 }
 
 step "s2-commit"
@@ -119,6 +126,7 @@ step "s2-print-index-count"
 // we expect DML/DDL queries to fail because the shard they are waiting for is destroyed
 permutation "s1-load-cache" "s1-insert" "s1-begin" "s1-select" "s2-begin" "s2-isolate-tenant" "s1-update" "s2-commit" "s1-commit" "s2-print-cluster"
 permutation "s1-load-cache" "s1-insert" "s1-begin" "s1-select" "s2-begin" "s2-isolate-tenant" "s1-delete" "s2-commit" "s1-commit" "s2-print-cluster"
+permutation "s1-load-cache" "s1-insert" "s1-begin" "s1-select" "s2-begin" "s2-isolate-tenant" "s1-update-complex" "s2-commit" "s1-commit" "s2-print-cluster"
 permutation "s1-load-cache" "s1-begin" "s1-select" "s2-begin" "s2-isolate-tenant" "s1-insert" "s2-commit" "s1-commit" "s2-print-cluster"
 permutation "s1-load-cache" "s1-begin" "s1-select" "s2-begin" "s2-isolate-tenant" "s1-copy" "s2-commit" "s1-commit" "s2-print-cluster"
 permutation "s1-load-cache" "s1-begin" "s1-select" "s2-begin" "s2-isolate-tenant" "s1-ddl" "s2-commit" "s1-commit" "s2-print-cluster" "s2-print-index-count"
@@ -127,6 +135,7 @@ permutation "s1-load-cache" "s1-begin" "s1-select" "s2-begin" "s2-isolate-tenant
 // the same tests without loading the cache at first
 permutation "s1-insert" "s1-begin" "s1-select" "s2-begin" "s2-isolate-tenant" "s1-update" "s2-commit" "s1-commit" "s2-print-cluster"
 permutation "s1-insert" "s1-begin" "s1-select" "s2-begin" "s2-isolate-tenant" "s1-delete" "s2-commit" "s1-commit" "s2-print-cluster"
+permutation "s1-insert" "s1-begin" "s1-select" "s2-begin" "s2-isolate-tenant" "s1-update-complex" "s2-commit" "s1-commit" "s2-print-cluster"
 permutation "s1-begin" "s1-select" "s2-begin" "s2-isolate-tenant" "s1-insert" "s2-commit" "s1-commit" "s2-print-cluster"
 permutation "s1-begin" "s1-select" "s2-begin" "s2-isolate-tenant" "s1-copy" "s2-commit" "s1-commit" "s2-print-cluster"
 permutation "s1-begin" "s1-select" "s2-begin" "s2-isolate-tenant" "s1-ddl" "s2-commit" "s1-commit" "s2-print-cluster" "s2-print-index-count"

@@ -74,6 +74,8 @@ static uint64 NextPlanId = 1;
 /* keep track of planner call stack levels */
 int PlannerLevel = 0;
 
+static void ErrorIfQueryHasMergeCommand(Query *queryTree);
+static bool ContainsMergeCommandWalker(Node *node);
 static bool ListContainsDistributedTableRTE(List *rangeTableList,
 											bool *maybeHasForeignDistributedTable);
 static bool IsUpdateOrDelete(Query *query);
@@ -148,6 +150,12 @@ distributed_planner(Query *parse,
 		/* this cursor flag could only be set when Citus has been loaded */
 		Assert(CitusHasBeenLoaded());
 
+		/*
+		 * We cannot have merge command for this path as well because
+		 * there cannot be recursively planned merge command.
+		 */
+		Assert(!ContainsMergeCommandWalker((Node *) parse));
+
 		needsDistributedPlanning = true;
 	}
 	else if (CitusHasBeenLoaded())
@@ -187,13 +195,20 @@ distributed_planner(Query *parse,
 
 		planContext.originalQuery = copyObject(parse);
 
-		/*
-		 * When there are partitioned tables (not applicable to fast path),
-		 * pretend that they are regular tables to avoid unnecessary work
-		 * in standard_planner.
-		 */
+
 		if (!fastPathRouterQuery)
 		{
+			/*
+			 * Fast path queries cannot have merge command, and we
+			 * prevent the remaining here.
+			 */
+			ErrorIfQueryHasMergeCommand(parse);
+
+			/*
+			 * When there are partitioned tables (not applicable to fast path),
+			 * pretend that they are regular tables to avoid unnecessary work
+			 * in standard_planner.
+			 */
 			bool setPartitionedTablesInherited = false;
 			AdjustPartitioningForDistributedPlanning(rangeTableList,
 													 setPartitionedTablesInherited);
@@ -284,6 +299,59 @@ distributed_planner(Query *parse,
 	}
 
 	return result;
+}
+
+
+/*
+ * ErrorIfQueryHasMergeCommand walks over the query tree and throws error
+ * if there are any Merge command (e.g., CMD_MERGE) in the query tree.
+ */
+static void
+ErrorIfQueryHasMergeCommand(Query *queryTree)
+{
+	/*
+	 * Postgres currently doesn't support Merge queries inside subqueries and
+	 * ctes, but lets be defensive and do query tree walk anyway.
+	 *
+	 * We do not call this path for fast-path queries to avoid this additional
+	 * overhead.
+	 */
+	if (ContainsMergeCommandWalker((Node *) queryTree))
+	{
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("MERGE command is not supported on Citus tables yet")));
+	}
+}
+
+
+/*
+ * ContainsMergeCommandWalker walks over the node and finds if there are any
+ * Merge command (e.g., CMD_MERGE) in the node.
+ */
+static bool
+ContainsMergeCommandWalker(Node *node)
+{
+#if PG_VERSION_NUM >= PG_VERSION_15
+	if (node == NULL)
+	{
+		return false;
+	}
+
+	if (IsA(node, Query))
+	{
+		Query *query = (Query *) node;
+		if (query->commandType == CMD_MERGE)
+		{
+			return true;
+		}
+
+		return query_tree_walker((Query *) node, ContainsMergeCommandWalker, NULL, 0);
+	}
+
+	return expression_tree_walker(node, ContainsMergeCommandWalker, NULL);
+#endif
+
+	return false;
 }
 
 
@@ -491,9 +559,26 @@ int
 GetRTEIdentity(RangeTblEntry *rte)
 {
 	Assert(rte->rtekind == RTE_RELATION);
-	Assert(rte->values_lists != NIL);
+
+	/*
+	 * Since SQL functions might be in-lined by standard_planner,
+	 * we might miss assigning an RTE identity for RangeTblEntries
+	 * related to SQL functions. We already have checks in other
+	 * places to throw an error for SQL functions but they are not
+	 * sufficient due to function in-lining; so here we capture such
+	 * cases and throw an error here.
+	 */
+	if (list_length(rte->values_lists) != 2)
+	{
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("cannot perform distributed planning on this "
+							   "query because parameterized queries for SQL "
+							   "functions referencing distributed tables are "
+							   "not supported"),
+						errhint("Consider using PL/pgSQL functions instead.")));
+	}
+
 	Assert(IsA(rte->values_lists, IntList));
-	Assert(list_length(rte->values_lists) == 2);
 
 	return linitial_int(rte->values_lists);
 }
@@ -1301,7 +1386,14 @@ FinalizePlan(PlannedStmt *localPlan, DistributedPlan *distributedPlan)
 	Node *distributedPlanData = (Node *) distributedPlan;
 
 	customScan->custom_private = list_make1(distributedPlanData);
+
+#if (PG_VERSION_NUM >= PG_VERSION_15)
+
+	/* necessary to avoid extra Result node in PG15 */
+	customScan->flags = CUSTOMPATH_SUPPORT_BACKWARD_SCAN | CUSTOMPATH_SUPPORT_PROJECTION;
+#else
 	customScan->flags = CUSTOMPATH_SUPPORT_BACKWARD_SCAN;
+#endif
 
 	/*
 	 * Fast path queries cannot have any subplans by definition, so skip
@@ -1805,14 +1897,14 @@ multi_relation_restriction_hook(PlannerInfo *root, RelOptInfo *relOptInfo,
 	MemoryContext restrictionsMemoryContext = plannerRestrictionContext->memoryContext;
 	MemoryContext oldMemoryContext = MemoryContextSwitchTo(restrictionsMemoryContext);
 
-	bool distributedTable = IsCitusTable(rte->relid);
+	bool isCitusTable = IsCitusTable(rte->relid);
 
 	RelationRestriction *relationRestriction = palloc0(sizeof(RelationRestriction));
 	relationRestriction->index = restrictionIndex;
 	relationRestriction->relationId = rte->relid;
 	relationRestriction->rte = rte;
 	relationRestriction->relOptInfo = relOptInfo;
-	relationRestriction->distributedRelation = distributedTable;
+	relationRestriction->citusTable = isCitusTable;
 	relationRestriction->plannerInfo = root;
 
 	/* see comments on GetVarFromAssignedParam() */
@@ -1827,9 +1919,41 @@ multi_relation_restriction_hook(PlannerInfo *root, RelOptInfo *relOptInfo,
 	 * We're also keeping track of whether all participant
 	 * tables are reference tables.
 	 */
-	if (distributedTable)
+	if (isCitusTable)
 	{
 		cacheEntry = GetCitusTableCacheEntry(rte->relid);
+
+		/*
+		 * The statistics objects of the distributed table are not relevant
+		 * for the distributed planning, so we can override it.
+		 *
+		 * Normally, we should not need this. However, the combination of
+		 * Postgres commit 269b532aef55a579ae02a3e8e8df14101570dfd9 and
+		 * Citus function AdjustPartitioningForDistributedPlanning()
+		 * forces us to do this. The commit expects statistics objects
+		 * of partitions to have "inh" flag set properly. Whereas, the
+		 * function overrides "inh" flag. To avoid Postgres to throw error,
+		 * we override statlist such that Postgres does not try to process
+		 * any statistics objects during the standard_planner() on the
+		 * coordinator. In the end, we do not need the standard_planner()
+		 * on the coordinator to generate an optimized plan. We call
+		 * into standard_planner() for other purposes, such as generating the
+		 * relationRestrictionContext here.
+		 *
+		 * AdjustPartitioningForDistributedPlanning() is a hack that we use
+		 * to prevent Postgres' standard_planner() to expand all the partitions
+		 * for the distributed planning when a distributed partitioned table
+		 * is queried. It is required for both correctness and performance
+		 * reasons. Although we can eliminate the use of the function for
+		 * the correctness (e.g., make sure that rest of the planner can handle
+		 * partitions), it's performance implication is hard to avoid. Certain
+		 * planning logic of Citus (such as router or query pushdown) relies
+		 * heavily on the relationRestrictionList. If
+		 * AdjustPartitioningForDistributedPlanning() is removed, all the
+		 * partitions show up in the, causing high planning times for
+		 * such queries.
+		 */
+		relOptInfo->statlist = NIL;
 
 		relationRestrictionContext->allReferenceTables &=
 			IsCitusTableTypeCacheEntry(cacheEntry, REFERENCE_TABLE);

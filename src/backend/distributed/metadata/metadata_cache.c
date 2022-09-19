@@ -141,12 +141,40 @@ typedef struct MetadataCacheData
 	bool extensionLoaded;
 	Oid distShardRelationId;
 	Oid distPlacementRelationId;
+	Oid distBackgroundJobRelationId;
+	Oid distBackgroundJobPKeyIndexId;
+	Oid distBackgroundJobJobIdSequenceId;
+	Oid distBackgroundTaskRelationId;
+	Oid distBackgroundTaskPKeyIndexId;
+	Oid distBackgroundTaskJobIdTaskIdIndexId;
+	Oid distBackgroundTaskStatusTaskIdIndexId;
+	Oid distBackgroundTaskTaskIdSequenceId;
+	Oid distBackgroundTaskDependRelationId;
+	Oid distBackgroundTaskDependTaskIdIndexId;
+	Oid distBackgroundTaskDependDependsOnIndexId;
+	Oid citusJobStatusScheduledId;
+	Oid citusJobStatusRunningId;
+	Oid citusJobStatusCancellingId;
+	Oid citusJobStatusFinishedId;
+	Oid citusJobStatusCancelledId;
+	Oid citusJobStatusFailedId;
+	Oid citusJobStatusFailingId;
+	Oid citusTaskStatusBlockedId;
+	Oid citusTaskStatusRunnableId;
+	Oid citusTaskStatusRunningId;
+	Oid citusTaskStatusDoneId;
+	Oid citusTaskStatusErrorId;
+	Oid citusTaskStatusUnscheduledId;
+	Oid citusTaskStatusCancelledId;
+	Oid citusTaskStatusCancellingId;
 	Oid distRebalanceStrategyRelationId;
 	Oid distNodeRelationId;
 	Oid distNodeNodeIdIndexId;
 	Oid distLocalGroupRelationId;
 	Oid distObjectRelationId;
 	Oid distObjectPrimaryKeyIndexId;
+	Oid distCleanupRelationId;
+	Oid distCleanupPrimaryKeyIndexId;
 	Oid distColocationRelationId;
 	Oid distColocationConfigurationIndexId;
 	Oid distPartitionRelationId;
@@ -231,7 +259,7 @@ static ScanKeyData DistObjectScanKey[3];
 
 /* local function forward declarations */
 static HeapTuple PgDistPartitionTupleViaCatalog(Oid relationId);
-static ShardIdCacheEntry * LookupShardIdCacheEntry(int64 shardId);
+static ShardIdCacheEntry * LookupShardIdCacheEntry(int64 shardId, bool missingOk);
 static CitusTableCacheEntry * BuildCitusTableCacheEntry(Oid relationId);
 static void BuildCachedShardList(CitusTableCacheEntry *cacheEntry);
 static void PrepareWorkerNodeCache(void);
@@ -248,7 +276,6 @@ static void RegisterWorkerNodeCacheCallbacks(void);
 static void RegisterLocalGroupIdCacheCallbacks(void);
 static void RegisterAuthinfoCacheCallbacks(void);
 static void RegisterCitusTableCacheEntryReleaseCallbacks(void);
-static uint32 WorkerNodeHashCode(const void *key, Size keySize);
 static void ResetCitusTableCacheEntry(CitusTableCacheEntry *cacheEntry);
 static void RemoveStaleShardIdCacheEntries(CitusTableCacheEntry *tableEntry);
 static void CreateDistTableCache(void);
@@ -281,10 +308,11 @@ static Oid LookupEnumValueId(Oid typeId, char *valueName);
 static void InvalidateCitusTableCacheEntrySlot(CitusTableCacheEntrySlot *cacheSlot);
 static void InvalidateDistTableCache(void);
 static void InvalidateDistObjectCache(void);
-static void InitializeTableCacheEntry(int64 shardId);
+static bool InitializeTableCacheEntry(int64 shardId, bool missingOk);
 static bool IsCitusTableTypeInternal(char partitionMethod, char replicationModel,
 									 CitusTableType tableType);
-static bool RefreshTableCacheEntryIfInvalid(ShardIdCacheEntry *shardEntry);
+static bool RefreshTableCacheEntryIfInvalid(ShardIdCacheEntry *shardEntry, bool
+											missingOk);
 
 static Oid DistAuthinfoRelationId(void);
 static Oid DistAuthinfoIndexId(void);
@@ -495,6 +523,49 @@ IsCitusTableTypeInternal(char partitionMethod, char replicationModel,
 
 
 /*
+ * GetTableTypeName returns string representation of the table type.
+ */
+char *
+GetTableTypeName(Oid tableId)
+{
+	bool regularTable = false;
+	char partitionMethod = ' ';
+	char replicationModel = ' ';
+	if (IsCitusTable(tableId))
+	{
+		CitusTableCacheEntry *referencingCacheEntry = GetCitusTableCacheEntry(tableId);
+		partitionMethod = referencingCacheEntry->partitionMethod;
+		replicationModel = referencingCacheEntry->replicationModel;
+	}
+	else
+	{
+		regularTable = true;
+	}
+
+	if (regularTable)
+	{
+		return "regular table";
+	}
+	else if (partitionMethod == 'h')
+	{
+		return "distributed table";
+	}
+	else if (partitionMethod == 'n' && replicationModel == 't')
+	{
+		return "reference table";
+	}
+	else if (partitionMethod == 'n' && replicationModel != 't')
+	{
+		return "citus local table";
+	}
+	else
+	{
+		return "unknown table";
+	}
+}
+
+
+/*
  * IsCitusTable returns whether relationId is a distributed relation or
  * not.
  */
@@ -617,6 +688,45 @@ PartitionColumnViaCatalog(Oid relationId)
 
 
 /*
+ * ColocationIdViaCatalog gets a relationId and returns the colocation
+ * id column from pg_dist_partition via reading from catalog.
+ */
+uint32
+ColocationIdViaCatalog(Oid relationId)
+{
+	HeapTuple partitionTuple = PgDistPartitionTupleViaCatalog(relationId);
+	if (!HeapTupleIsValid(partitionTuple))
+	{
+		return INVALID_COLOCATION_ID;
+	}
+
+	Datum datumArray[Natts_pg_dist_partition];
+	bool isNullArray[Natts_pg_dist_partition];
+
+	Relation pgDistPartition = table_open(DistPartitionRelationId(), AccessShareLock);
+
+	TupleDesc tupleDescriptor = RelationGetDescr(pgDistPartition);
+	heap_deform_tuple(partitionTuple, tupleDescriptor, datumArray, isNullArray);
+
+	if (isNullArray[Anum_pg_dist_partition_colocationid - 1])
+	{
+		/* colocation id cannot be NULL, still let's make sure */
+		heap_freetuple(partitionTuple);
+		table_close(pgDistPartition, NoLock);
+		return INVALID_COLOCATION_ID;
+	}
+
+	Datum colocationIdDatum = datumArray[Anum_pg_dist_partition_colocationid - 1];
+	uint32 colocationId = DatumGetUInt32(colocationIdDatum);
+
+	heap_freetuple(partitionTuple);
+	table_close(pgDistPartition, NoLock);
+
+	return colocationId;
+}
+
+
+/*
  * PgDistPartitionTupleViaCatalog is a helper function that searches
  * pg_dist_partition for the given relationId. The caller is responsible
  * for ensuring that the returned heap tuple is valid before accessing
@@ -700,7 +810,8 @@ CitusTableList(void)
 ShardInterval *
 LoadShardInterval(uint64 shardId)
 {
-	ShardIdCacheEntry *shardIdEntry = LookupShardIdCacheEntry(shardId);
+	bool missingOk = false;
+	ShardIdCacheEntry *shardIdEntry = LookupShardIdCacheEntry(shardId, missingOk);
 	CitusTableCacheEntry *tableEntry = shardIdEntry->tableEntry;
 	int shardIndex = shardIdEntry->shardIndex;
 
@@ -718,12 +829,32 @@ LoadShardInterval(uint64 shardId)
 
 
 /*
+ * ShardExists returns whether given shard exists or not. It fails if missingOk is false
+ * and shard is not found.
+ */
+bool
+ShardExists(uint64 shardId)
+{
+	bool missingOk = true;
+	ShardIdCacheEntry *shardIdEntry = LookupShardIdCacheEntry(shardId, missingOk);
+
+	if (!shardIdEntry)
+	{
+		return false;
+	}
+
+	return true;
+}
+
+
+/*
  * RelationIdOfShard returns the relationId of the given shardId.
  */
 Oid
 RelationIdForShard(uint64 shardId)
 {
-	ShardIdCacheEntry *shardIdEntry = LookupShardIdCacheEntry(shardId);
+	bool missingOk = false;
+	ShardIdCacheEntry *shardIdEntry = LookupShardIdCacheEntry(shardId, missingOk);
 	CitusTableCacheEntry *tableEntry = shardIdEntry->tableEntry;
 	return tableEntry->relationId;
 }
@@ -736,7 +867,8 @@ RelationIdForShard(uint64 shardId)
 bool
 ReferenceTableShardId(uint64 shardId)
 {
-	ShardIdCacheEntry *shardIdEntry = LookupShardIdCacheEntry(shardId);
+	bool missingOk = false;
+	ShardIdCacheEntry *shardIdEntry = LookupShardIdCacheEntry(shardId, missingOk);
 	CitusTableCacheEntry *tableEntry = shardIdEntry->tableEntry;
 	return IsCitusTableTypeCacheEntry(tableEntry, REFERENCE_TABLE);
 }
@@ -754,7 +886,8 @@ DistributedTableShardId(uint64 shardId)
 		return false;
 	}
 
-	ShardIdCacheEntry *shardIdEntry = LookupShardIdCacheEntry(shardId);
+	bool missingOk = false;
+	ShardIdCacheEntry *shardIdEntry = LookupShardIdCacheEntry(shardId, missingOk);
 	CitusTableCacheEntry *tableEntry = shardIdEntry->tableEntry;
 	return IsCitusTableTypeCacheEntry(tableEntry, DISTRIBUTED_TABLE);
 }
@@ -769,7 +902,8 @@ DistributedTableShardId(uint64 shardId)
 GroupShardPlacement *
 LoadGroupShardPlacement(uint64 shardId, uint64 placementId)
 {
-	ShardIdCacheEntry *shardIdEntry = LookupShardIdCacheEntry(shardId);
+	bool missingOk = false;
+	ShardIdCacheEntry *shardIdEntry = LookupShardIdCacheEntry(shardId, missingOk);
 	CitusTableCacheEntry *tableEntry = shardIdEntry->tableEntry;
 	int shardIndex = shardIdEntry->shardIndex;
 
@@ -804,7 +938,8 @@ LoadGroupShardPlacement(uint64 shardId, uint64 placementId)
 ShardPlacement *
 LoadShardPlacement(uint64 shardId, uint64 placementId)
 {
-	ShardIdCacheEntry *shardIdEntry = LookupShardIdCacheEntry(shardId);
+	bool missingOk = false;
+	ShardIdCacheEntry *shardIdEntry = LookupShardIdCacheEntry(shardId, missingOk);
 	CitusTableCacheEntry *tableEntry = shardIdEntry->tableEntry;
 	int shardIndex = shardIdEntry->shardIndex;
 	GroupShardPlacement *groupPlacement = LoadGroupShardPlacement(shardId, placementId);
@@ -827,7 +962,8 @@ ShardPlacementOnGroupIncludingOrphanedPlacements(int32 groupId, uint64 shardId)
 {
 	ShardPlacement *placementOnNode = NULL;
 
-	ShardIdCacheEntry *shardIdEntry = LookupShardIdCacheEntry(shardId);
+	bool missingOk = false;
+	ShardIdCacheEntry *shardIdEntry = LookupShardIdCacheEntry(shardId, missingOk);
 	CitusTableCacheEntry *tableEntry = shardIdEntry->tableEntry;
 	int shardIndex = shardIdEntry->shardIndex;
 	GroupShardPlacement *placementArray =
@@ -1047,7 +1183,8 @@ ShardPlacementListIncludingOrphanedPlacements(uint64 shardId)
 {
 	List *placementList = NIL;
 
-	ShardIdCacheEntry *shardIdEntry = LookupShardIdCacheEntry(shardId);
+	bool missingOk = false;
+	ShardIdCacheEntry *shardIdEntry = LookupShardIdCacheEntry(shardId, missingOk);
 	CitusTableCacheEntry *tableEntry = shardIdEntry->tableEntry;
 	int shardIndex = shardIdEntry->shardIndex;
 
@@ -1087,15 +1224,24 @@ ShardPlacementListIncludingOrphanedPlacements(uint64 shardId)
  * build the cache entry. Afterwards we know that the shard has to be in the
  * cache if it exists. If the shard does *not* exist, this function errors
  * (because LookupShardRelationFromCatalog errors out).
+ *
+ * If missingOk is true and the shard cannot be found, the function returns false.
  */
-static void
-InitializeTableCacheEntry(int64 shardId)
+static bool
+InitializeTableCacheEntry(int64 shardId, bool missingOk)
 {
-	bool missingOk = false;
 	Oid relationId = LookupShardRelationFromCatalog(shardId, missingOk);
+
+	if (!OidIsValid(relationId))
+	{
+		Assert(missingOk);
+		return false;
+	}
 
 	/* trigger building the cache for the shard id */
 	GetCitusTableCacheEntry(relationId); /* lgtm[cpp/return-value-ignored] */
+
+	return true;
 }
 
 
@@ -1105,7 +1251,7 @@ InitializeTableCacheEntry(int64 shardId)
  * entry in the cache and false if it didn't.
  */
 static bool
-RefreshTableCacheEntryIfInvalid(ShardIdCacheEntry *shardEntry)
+RefreshTableCacheEntryIfInvalid(ShardIdCacheEntry *shardEntry, bool missingOk)
 {
 	/*
 	 * We might have some concurrent metadata changes. In order to get the changes,
@@ -1117,7 +1263,8 @@ RefreshTableCacheEntryIfInvalid(ShardIdCacheEntry *shardEntry)
 		return false;
 	}
 	Oid oldRelationId = shardEntry->tableEntry->relationId;
-	Oid currentRelationId = LookupShardRelationFromCatalog(shardEntry->shardId, false);
+	Oid currentRelationId = LookupShardRelationFromCatalog(shardEntry->shardId,
+														   missingOk);
 
 	/*
 	 * The relation OID to which the shard belongs could have changed,
@@ -1132,11 +1279,12 @@ RefreshTableCacheEntryIfInvalid(ShardIdCacheEntry *shardEntry)
 
 
 /*
- * LookupShardCacheEntry returns the cache entry belonging to a shard, or
- * errors out if that shard is unknown.
+ * LookupShardCacheEntry returns the cache entry belonging to a shard.
+ * It errors out if that shard is unknown and missingOk is false. Else,
+ * it will return a NULL cache entry.
  */
 static ShardIdCacheEntry *
-LookupShardIdCacheEntry(int64 shardId)
+LookupShardIdCacheEntry(int64 shardId, bool missingOk)
 {
 	bool foundInCache = false;
 	bool recheck = false;
@@ -1150,12 +1298,16 @@ LookupShardIdCacheEntry(int64 shardId)
 
 	if (!foundInCache)
 	{
-		InitializeTableCacheEntry(shardId);
+		if (!InitializeTableCacheEntry(shardId, missingOk))
+		{
+			return NULL;
+		}
+
 		recheck = true;
 	}
 	else
 	{
-		recheck = RefreshTableCacheEntryIfInvalid(shardEntry);
+		recheck = RefreshTableCacheEntryIfInvalid(shardEntry, missingOk);
 	}
 
 	/*
@@ -1169,7 +1321,8 @@ LookupShardIdCacheEntry(int64 shardId)
 
 		if (!foundInCache)
 		{
-			ereport(ERROR, (errmsg("could not find valid entry for shard "
+			int eflag = (missingOk) ? DEBUG1 : ERROR;
+			ereport(eflag, (errmsg("could not find valid entry for shard "
 								   UINT64_FORMAT, shardId)));
 		}
 	}
@@ -2365,6 +2518,116 @@ DistLocalGroupIdRelationId(void)
 }
 
 
+Oid
+DistBackgroundJobRelationId(void)
+{
+	CachedRelationLookup("pg_dist_background_job",
+						 &MetadataCache.distBackgroundJobRelationId);
+
+	return MetadataCache.distBackgroundJobRelationId;
+}
+
+
+Oid
+DistBackgroundJobPKeyIndexId(void)
+{
+	CachedRelationLookup("pg_dist_background_job_pkey",
+						 &MetadataCache.distBackgroundJobPKeyIndexId);
+
+	return MetadataCache.distBackgroundJobPKeyIndexId;
+}
+
+
+Oid
+DistBackgroundJobJobIdSequenceId(void)
+{
+	CachedRelationLookup("pg_dist_background_job_job_id_seq",
+						 &MetadataCache.distBackgroundJobJobIdSequenceId);
+
+	return MetadataCache.distBackgroundJobJobIdSequenceId;
+}
+
+
+Oid
+DistBackgroundTaskRelationId(void)
+{
+	CachedRelationLookup("pg_dist_background_task",
+						 &MetadataCache.distBackgroundTaskRelationId);
+
+	return MetadataCache.distBackgroundTaskRelationId;
+}
+
+
+Oid
+DistBackgroundTaskPKeyIndexId(void)
+{
+	CachedRelationLookup("pg_dist_background_task_pkey",
+						 &MetadataCache.distBackgroundTaskPKeyIndexId);
+
+	return MetadataCache.distBackgroundTaskPKeyIndexId;
+}
+
+
+Oid
+DistBackgroundTaskJobIdTaskIdIndexId(void)
+{
+	CachedRelationLookup("pg_dist_background_task_job_id_task_id",
+						 &MetadataCache.distBackgroundTaskJobIdTaskIdIndexId);
+
+	return MetadataCache.distBackgroundTaskJobIdTaskIdIndexId;
+}
+
+
+Oid
+DistBackgroundTaskStatusTaskIdIndexId(void)
+{
+	CachedRelationLookup("pg_dist_background_task_status_task_id_index",
+						 &MetadataCache.distBackgroundTaskStatusTaskIdIndexId);
+
+	return MetadataCache.distBackgroundTaskStatusTaskIdIndexId;
+}
+
+
+Oid
+DistBackgroundTaskTaskIdSequenceId(void)
+{
+	CachedRelationLookup("pg_dist_background_task_task_id_seq",
+						 &MetadataCache.distBackgroundTaskTaskIdSequenceId);
+
+	return MetadataCache.distBackgroundTaskTaskIdSequenceId;
+}
+
+
+Oid
+DistBackgroundTaskDependRelationId(void)
+{
+	CachedRelationLookup("pg_dist_background_task_depend",
+						 &MetadataCache.distBackgroundTaskDependRelationId);
+
+	return MetadataCache.distBackgroundTaskDependRelationId;
+}
+
+
+Oid
+DistBackgroundTaskDependTaskIdIndexId(void)
+{
+	CachedRelationLookup("pg_dist_background_task_depend_task_id",
+						 &MetadataCache.distBackgroundTaskDependTaskIdIndexId);
+
+	return MetadataCache.distBackgroundTaskDependTaskIdIndexId;
+}
+
+
+Oid
+DistBackgroundTaskDependDependsOnIndexId(void)
+{
+	CachedRelationLookup("pg_dist_background_task_depend_depends_on",
+						 &MetadataCache.distBackgroundTaskDependDependsOnIndexId);
+
+	return MetadataCache.distBackgroundTaskDependDependsOnIndexId;
+}
+
+
 /* return oid of pg_dist_rebalance_strategy relation */
 Oid
 DistRebalanceStrategyRelationId(void)
@@ -2463,6 +2726,28 @@ DistObjectPrimaryKeyIndexId(void)
 	}
 
 	return MetadataCache.distObjectPrimaryKeyIndexId;
+}
+
+
+/* return oid of pg_dist_cleanup relation */
+Oid
+DistCleanupRelationId(void)
+{
+	CachedRelationLookup("pg_dist_cleanup",
+						 &MetadataCache.distCleanupRelationId);
+
+	return MetadataCache.distCleanupRelationId;
+}
+
+
+/* return oid of pg_dist_cleanup primary key index */
+Oid
+DistCleanupPrimaryKeyIndexId(void)
+{
+	CachedRelationLookup("pg_dist_cleanup_pkey",
+						 &MetadataCache.distCleanupPrimaryKeyIndexId);
+
+	return MetadataCache.distCleanupPrimaryKeyIndexId;
 }
 
 
@@ -2809,42 +3094,6 @@ TextOutFunctionId(void)
 
 
 /*
- * PgTableVisibleFuncId returns oid of the pg_table_is_visible function.
- */
-Oid
-PgTableVisibleFuncId(void)
-{
-	if (MetadataCache.pgTableIsVisibleFuncId == InvalidOid)
-	{
-		const int argCount = 1;
-
-		MetadataCache.pgTableIsVisibleFuncId =
-			FunctionOid("pg_catalog", "pg_table_is_visible", argCount);
-	}
-
-	return MetadataCache.pgTableIsVisibleFuncId;
-}
-
-
-/*
- * CitusTableVisibleFuncId returns oid of the citus_table_is_visible function.
- */
-Oid
-CitusTableVisibleFuncId(void)
-{
-	if (MetadataCache.citusTableIsVisibleFuncId == InvalidOid)
-	{
-		const int argCount = 1;
-
-		MetadataCache.citusTableIsVisibleFuncId =
-			FunctionOid("pg_catalog", "citus_table_is_visible", argCount);
-	}
-
-	return MetadataCache.citusTableIsVisibleFuncId;
-}
-
-
-/*
  * RelationIsAKnownShardFuncId returns oid of the relation_is_a_known_shard function.
  */
 Oid
@@ -3120,6 +3369,201 @@ SecondaryNodeRoleId(void)
 	}
 
 	return MetadataCache.secondaryNodeRoleId;
+}
+
+
+Oid
+CitusJobStatusScheduledId(void)
+{
+	if (!MetadataCache.citusJobStatusScheduledId)
+	{
+		MetadataCache.citusJobStatusScheduledId =
+			LookupStringEnumValueId("citus_job_status", "scheduled");
+	}
+
+	return MetadataCache.citusJobStatusScheduledId;
+}
+
+
+Oid
+CitusJobStatusRunningId(void)
+{
+	if (!MetadataCache.citusJobStatusRunningId)
+	{
+		MetadataCache.citusJobStatusRunningId =
+			LookupStringEnumValueId("citus_job_status", "running");
+	}
+
+	return MetadataCache.citusJobStatusRunningId;
+}
+
+
+Oid
+CitusJobStatusCancellingId(void)
+{
+	if (!MetadataCache.citusJobStatusCancellingId)
+	{
+		MetadataCache.citusJobStatusCancellingId =
+			LookupStringEnumValueId("citus_job_status", "cancelling");
+	}
+
+	return MetadataCache.citusJobStatusCancellingId;
+}
+
+
+Oid
+CitusJobStatusFinishedId(void)
+{
+	if (!MetadataCache.citusJobStatusFinishedId)
+	{
+		MetadataCache.citusJobStatusFinishedId =
+			LookupStringEnumValueId("citus_job_status", "finished");
+	}
+
+	return MetadataCache.citusJobStatusFinishedId;
+}
+
+
+Oid
+CitusJobStatusCancelledId(void)
+{
+	if (!MetadataCache.citusJobStatusCancelledId)
+	{
+		MetadataCache.citusJobStatusCancelledId =
+			LookupStringEnumValueId("citus_job_status", "cancelled");
+	}
+
+	return MetadataCache.citusJobStatusCancelledId;
+}
+
+
+Oid
+CitusJobStatusFailedId(void)
+{
+	if (!MetadataCache.citusJobStatusFailedId)
+	{
+		MetadataCache.citusJobStatusFailedId =
+			LookupStringEnumValueId("citus_job_status", "failed");
+	}
+
+	return MetadataCache.citusJobStatusFailedId;
+}
+
+
+Oid
+CitusJobStatusFailingId(void)
+{
+	if (!MetadataCache.citusJobStatusFailingId)
+	{
+		MetadataCache.citusJobStatusFailingId =
+			LookupStringEnumValueId("citus_job_status", "failing");
+	}
+
+	return MetadataCache.citusJobStatusFailingId;
+}
+
+
+Oid
+CitusTaskStatusBlockedId(void)
+{
+	if (!MetadataCache.citusTaskStatusBlockedId)
+	{
+		MetadataCache.citusTaskStatusBlockedId =
+			LookupStringEnumValueId("citus_task_status", "blocked");
+	}
+
+	return MetadataCache.citusTaskStatusBlockedId;
+}
+
+
+Oid
+CitusTaskStatusCancelledId(void)
+{
+	if (!MetadataCache.citusTaskStatusCancelledId)
+	{
+		MetadataCache.citusTaskStatusCancelledId =
+			LookupStringEnumValueId("citus_task_status", "cancelled");
+	}
+
+	return MetadataCache.citusTaskStatusCancelledId;
+}
+
+
+Oid
+CitusTaskStatusCancellingId(void)
+{
+	if (!MetadataCache.citusTaskStatusCancellingId)
+	{
+		MetadataCache.citusTaskStatusCancellingId =
+			LookupStringEnumValueId("citus_task_status", "cancelling");
+	}
+
+	return MetadataCache.citusTaskStatusCancellingId;
+}
+
+
+Oid
+CitusTaskStatusRunnableId(void)
+{
+	if (!MetadataCache.citusTaskStatusRunnableId)
+	{
+		MetadataCache.citusTaskStatusRunnableId =
+			LookupStringEnumValueId("citus_task_status", "runnable");
+	}
+
+	return MetadataCache.citusTaskStatusRunnableId;
+}
+
+
+Oid
+CitusTaskStatusRunningId(void)
+{
+	if (!MetadataCache.citusTaskStatusRunningId)
+	{
+		MetadataCache.citusTaskStatusRunningId =
+			LookupStringEnumValueId("citus_task_status", "running");
+	}
+
+	return MetadataCache.citusTaskStatusRunningId;
+}
+
+
+Oid
+CitusTaskStatusDoneId(void)
+{
+	if (!MetadataCache.citusTaskStatusDoneId)
+	{
+		MetadataCache.citusTaskStatusDoneId =
+			LookupStringEnumValueId("citus_task_status", "done");
+	}
+
+	return MetadataCache.citusTaskStatusDoneId;
+}
+
+
+Oid
+CitusTaskStatusErrorId(void)
+{
+	if (!MetadataCache.citusTaskStatusErrorId)
+	{
+		MetadataCache.citusTaskStatusErrorId =
+			LookupStringEnumValueId("citus_task_status", "error");
+	}
+
+	return MetadataCache.citusTaskStatusErrorId;
+}
+
+
+Oid
+CitusTaskStatusUnscheduledId(void)
+{
+	if (!MetadataCache.citusTaskStatusUnscheduledId)
+	{
+		MetadataCache.citusTaskStatusUnscheduledId =
+			LookupStringEnumValueId("citus_task_status", "unscheduled");
+	}
+
+	return MetadataCache.citusTaskStatusUnscheduledId;
 }
 
 
@@ -3967,26 +4411,6 @@ RegisterAuthinfoCacheCallbacks(void)
 
 
 /*
- * WorkerNodeHashCode computes the hash code for a worker node from the node's
- * host name and port number. Nodes that only differ by their rack locations
- * hash to the same value.
- */
-static uint32
-WorkerNodeHashCode(const void *key, Size keySize)
-{
-	const WorkerNode *worker = (const WorkerNode *) key;
-	const char *workerName = worker->workerName;
-	const uint32 *workerPort = &(worker->workerPort);
-
-	/* standard hash function outlined in Effective Java, Item 8 */
-	uint32 result = 17;
-	result = 37 * result + string_hash(workerName, WORKER_LENGTH);
-	result = 37 * result + tag_hash(workerPort, sizeof(uint32));
-	return result;
-}
-
-
-/*
  * ResetCitusTableCacheEntry frees any out-of-band memory used by a cache entry,
  * but does not free the entry itself.
  */
@@ -4228,6 +4652,9 @@ InvalidateCitusTableCacheEntrySlot(CitusTableCacheEntrySlot *cacheSlot)
 	{
 		/* reload the metadata */
 		cacheSlot->citusTableMetadata->isValid = false;
+
+		/* clean up ShardIdCacheHash */
+		RemoveStaleShardIdCacheEntries(cacheSlot->citusTableMetadata);
 	}
 }
 
@@ -4418,17 +4845,6 @@ CitusTableTypeIdList(CitusTableType citusTableType)
 	table_close(pgDistPartition, AccessShareLock);
 
 	return relationIdList;
-}
-
-
-/*
- * ClusterHasReferenceTable returns true if the cluster has
- * any reference table.
- */
-bool
-ClusterHasReferenceTable(void)
-{
-	return list_length(CitusTableTypeIdList(REFERENCE_TABLE)) > 0;
 }
 
 
@@ -4636,37 +5052,6 @@ LookupShardRelationFromCatalog(int64 shardId, bool missingOk)
 	table_close(pgDistShard, NoLock);
 
 	return relationId;
-}
-
-
-/*
- * ShardExists returns whether the given shard ID exists in pg_dist_shard.
- */
-bool
-ShardExists(int64 shardId)
-{
-	ScanKeyData scanKey[1];
-	int scanKeyCount = 1;
-	Relation pgDistShard = table_open(DistShardRelationId(), AccessShareLock);
-	bool shardExists = false;
-
-	ScanKeyInit(&scanKey[0], Anum_pg_dist_shard_shardid,
-				BTEqualStrategyNumber, F_INT8EQ, Int64GetDatum(shardId));
-
-	SysScanDesc scanDescriptor = systable_beginscan(pgDistShard,
-													DistShardShardidIndexId(), true,
-													NULL, scanKeyCount, scanKey);
-
-	HeapTuple heapTuple = systable_getnext(scanDescriptor);
-	if (HeapTupleIsValid(heapTuple))
-	{
-		shardExists = true;
-	}
-
-	systable_endscan(scanDescriptor);
-	table_close(pgDistShard, NoLock);
-
-	return shardExists;
 }
 
 

@@ -63,15 +63,53 @@ CreateCollationDDLInternal(Oid collationId, Oid *collowner, char **quotedCollati
 	const char *collname = NameStr(collationForm->collname);
 	bool collisdeterministic = collationForm->collisdeterministic;
 
+	char *collcollate;
+	char *collctype;
+
 #if PG_VERSION_NUM >= PG_VERSION_15
+
+	/*
+	 * In PG15, there is an added option to use ICU as global locale provider.
+	 * pg_collation has three locale-related fields: collcollate and collctype,
+	 * which are libc-related fields, and a new one colliculocale, which is the
+	 * ICU-related field. Only the libc-related fields or the ICU-related field
+	 * is set, never both.
+	 */
+	char *colliculocale;
 	bool isnull;
+
 	Datum datum = SysCacheGetAttr(COLLOID, heapTuple, Anum_pg_collation_collcollate,
 								  &isnull);
-	Assert(!isnull);
-	char *collcollate = TextDatumGetCString(datum);
+	if (!isnull)
+	{
+		collcollate = TextDatumGetCString(datum);
+	}
+	else
+	{
+		collcollate = NULL;
+	}
+
 	datum = SysCacheGetAttr(COLLOID, heapTuple, Anum_pg_collation_collctype, &isnull);
-	Assert(!isnull);
-	char *collctype = TextDatumGetCString(datum);
+	if (!isnull)
+	{
+		collctype = TextDatumGetCString(datum);
+	}
+	else
+	{
+		collctype = NULL;
+	}
+
+	datum = SysCacheGetAttr(COLLOID, heapTuple, Anum_pg_collation_colliculocale, &isnull);
+	if (!isnull)
+	{
+		colliculocale = TextDatumGetCString(datum);
+	}
+	else
+	{
+		colliculocale = NULL;
+	}
+
+	AssertArg((collcollate && collctype) || colliculocale);
 #else
 
 	/*
@@ -79,8 +117,8 @@ CreateCollationDDLInternal(Oid collationId, Oid *collowner, char **quotedCollati
 	 * pstrdup() to match the interface of 15 so that we consistently free the
 	 * result later.
 	 */
-	char *collcollate = pstrdup(NameStr(collationForm->collcollate));
-	char *collctype = pstrdup(NameStr(collationForm->collctype));
+	collcollate = pstrdup(NameStr(collationForm->collcollate));
+	collctype = pstrdup(NameStr(collationForm->collctype));
 #endif
 
 	if (collowner != NULL)
@@ -106,6 +144,33 @@ CreateCollationDDLInternal(Oid collationId, Oid *collowner, char **quotedCollati
 					 "CREATE COLLATION %s (provider = '%s'",
 					 *quotedCollationName, providerString);
 
+#if PG_VERSION_NUM >= PG_VERSION_15
+	if (colliculocale)
+	{
+		appendStringInfo(&collationNameDef,
+						 ", locale = %s",
+						 quote_literal_cstr(colliculocale));
+		pfree(colliculocale);
+	}
+	else
+	{
+		if (strcmp(collcollate, collctype) == 0)
+		{
+			appendStringInfo(&collationNameDef,
+							 ", locale = %s",
+							 quote_literal_cstr(collcollate));
+		}
+		else
+		{
+			appendStringInfo(&collationNameDef,
+							 ", lc_collate = %s, lc_ctype = %s",
+							 quote_literal_cstr(collcollate),
+							 quote_literal_cstr(collctype));
+		}
+		pfree(collcollate);
+		pfree(collctype);
+	}
+#else
 	if (strcmp(collcollate, collctype) == 0)
 	{
 		appendStringInfo(&collationNameDef,
@@ -122,6 +187,7 @@ CreateCollationDDLInternal(Oid collationId, Oid *collowner, char **quotedCollati
 
 	pfree(collcollate);
 	pfree(collctype);
+#endif
 
 	if (!collisdeterministic)
 	{
@@ -170,7 +236,7 @@ CreateCollationDDLsIdempotent(Oid collationId)
 
 
 List *
-AlterCollationOwnerObjectAddress(Node *node, bool missing_ok)
+AlterCollationOwnerObjectAddress(Node *node, bool missing_ok, bool isPostprocess)
 {
 	AlterOwnerStmt *stmt = castNode(AlterOwnerStmt, node);
 	Relation relation;
@@ -192,7 +258,7 @@ AlterCollationOwnerObjectAddress(Node *node, bool missing_ok)
  * of the RenameStmt. Errors if missing_ok is false.
  */
 List *
-RenameCollationStmtObjectAddress(Node *node, bool missing_ok)
+RenameCollationStmtObjectAddress(Node *node, bool missing_ok, bool isPostprocess)
 {
 	RenameStmt *stmt = castNode(RenameStmt, node);
 	Assert(stmt->renameType == OBJECT_COLLATION);
@@ -215,7 +281,7 @@ RenameCollationStmtObjectAddress(Node *node, bool missing_ok)
  * schemas.
  */
 List *
-AlterCollationSchemaStmtObjectAddress(Node *node, bool missing_ok)
+AlterCollationSchemaStmtObjectAddress(Node *node, bool missing_ok, bool isPostprocess)
 {
 	AlterObjectSchemaStmt *stmt = castNode(AlterObjectSchemaStmt, node);
 	Assert(stmt->objectType == OBJECT_COLLATION);
@@ -297,7 +363,7 @@ GenerateBackupNameForCollationCollision(const ObjectAddress *address)
 
 
 List *
-DefineCollationStmtObjectAddress(Node *node, bool missing_ok)
+DefineCollationStmtObjectAddress(Node *node, bool missing_ok, bool isPostprocess)
 {
 	DefineStmt *stmt = castNode(DefineStmt, node);
 	Assert(stmt->kind == OBJECT_COLLATION);

@@ -2677,9 +2677,6 @@ TargetShardIntervalForFastPathQuery(Query *query, bool *isMultiShardQuery,
 	}
 
 	/* we're only expecting single shard from a single table */
-	Node *distKey PG_USED_FOR_ASSERTS_ONLY = NULL;
-	Assert(FastPathRouterQuery(query, &distKey) || !EnableFastPathRouterPlanner);
-
 	if (list_length(prunedShardIntervalList) > 1)
 	{
 		*isMultiShardQuery = true;
@@ -3695,7 +3692,7 @@ CopyRelationRestrictionContext(RelationRestrictionContext *oldContext)
 
 		newRestriction->index = oldRestriction->index;
 		newRestriction->relationId = oldRestriction->relationId;
-		newRestriction->distributedRelation = oldRestriction->distributedRelation;
+		newRestriction->citusTable = oldRestriction->citusTable;
 		newRestriction->rte = copyObject(oldRestriction->rte);
 
 		/* can't be copied, we copy (flatly) a RelOptInfo, and then decouple baserestrictinfo */

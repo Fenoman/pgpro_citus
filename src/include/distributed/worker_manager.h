@@ -90,6 +90,7 @@ extern WorkerNode * FindWorkerNodeAnyCluster(const char *nodeName, int32 nodePor
 extern WorkerNode * FindNodeWithNodeId(int nodeId, bool missingOk);
 extern List * ReadDistNode(bool includeNodesFromOtherClusters);
 extern void EnsureCoordinator(void);
+extern void EnsureCoordinatorIsInMetadata(void);
 extern void InsertCoordinatorIfClusterEmpty(void);
 extern uint32 GroupForNode(char *nodeName, int32 nodePort);
 extern WorkerNode * PrimaryNodeForGroup(int32 groupId, bool *groupContainsNodes);
@@ -110,6 +111,7 @@ extern List * PgDistTableMetadataSyncCommandList(void);
 
 /* Function declarations for worker node utilities */
 extern int CompareWorkerNodes(const void *leftElement, const void *rightElement);
+extern uint32 WorkerNodeHashCode(const void *key, Size keySize);
 extern int WorkerNodeCompare(const void *lhsKey, const void *rhsKey, Size keySize);
 extern int NodeNamePortCompare(const char *workerLhsName, const char *workerRhsName,
 							   int workerLhsPort, int workerRhsPort);

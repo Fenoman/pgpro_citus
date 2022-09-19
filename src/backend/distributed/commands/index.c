@@ -658,7 +658,7 @@ PreprocessReindexStmt(Node *node, const char *reindexCommand,
  * else, we add invalid address.
  */
 List *
-ReindexStmtObjectAddress(Node *stmt, bool missing_ok)
+ReindexStmtObjectAddress(Node *stmt, bool missing_ok, bool isPostprocess)
 {
 	ReindexStmt *reindexStatement = castNode(ReindexStmt, stmt);
 
@@ -1200,6 +1200,15 @@ ErrorIfUnsupportedIndexStmt(IndexStmt *createIndexStatement)
 			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 							errmsg("creating unique indexes on append-partitioned tables "
 								   "is currently unsupported")));
+		}
+
+		if (AllowUnsafeConstraints)
+		{
+			/*
+			 * The user explicitly wants to allow the constraint without
+			 * distribution column.
+			 */
+			return;
 		}
 
 		Var *partitionKey = DistPartitionKeyOrError(relationId);
