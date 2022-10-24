@@ -1133,7 +1133,8 @@ set_relation_column_names(deparse_namespace *dpns, RangeTblEntry *rte,
 	 * real_colnames[] will be indexed by physical column number, with NULL
 	 * entries for dropped columns.
 	 */
-	if (rte->rtekind == RTE_RELATION)
+	if (rte->rtekind == RTE_RELATION ||
+        GetRangeTblKind(rte) == CITUS_RTE_SHARD)
 	{
 		/* Relation --- look to the system catalogs for up-to-date info */
 		Relation	rel;
@@ -7914,7 +7915,8 @@ get_from_clause_item(Node *jtnode, Query *query, deparse_context *context)
 			/* Reconstruct the columndef list, which is also the aliases */
 			get_from_clause_coldeflist(rtfunc1, colinfo, context);
 		}
-		else if (GetRangeTblKind(rte) != CITUS_RTE_SHARD)
+		else if (GetRangeTblKind(rte) != CITUS_RTE_SHARD ||
+				 (rte->alias != NULL && rte->alias->colnames != NIL))
 		{
 			/* Else print column aliases as needed */
 			get_column_alias_list(colinfo, context);

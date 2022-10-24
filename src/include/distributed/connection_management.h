@@ -289,11 +289,13 @@ extern MultiConnection * StartNodeConnection(uint32 flags, const char *hostname,
 extern MultiConnection * GetNodeUserDatabaseConnection(uint32 flags, const char *hostname,
 													   int32 port, const char *user,
 													   const char *database);
+extern MultiConnection * GetConnectionForLocalQueriesOutsideTransaction(char *userName);
 extern MultiConnection * StartNodeUserDatabaseConnection(uint32 flags,
 														 const char *hostname,
 														 int32 port,
 														 const char *user,
 														 const char *database);
+extern void RestartConnection(MultiConnection *connection);
 extern void CloseAllConnectionsAfterTransaction(void);
 extern void CloseNodeConnectionsAfterTransaction(char *nodeName, int nodePort);
 extern MultiConnection * ConnectionAvailableToNode(char *hostName, int nodePort,

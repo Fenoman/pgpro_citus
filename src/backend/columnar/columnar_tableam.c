@@ -739,7 +739,9 @@ columnar_tuple_insert(Relation relation, TupleTableSlot *slot, CommandId cid,
 	 */
 	ColumnarWriteState *writeState = columnar_init_write_state(relation,
 															   RelationGetDescr(relation),
+															   slot->tts_tableOid,
 															   GetCurrentSubTransactionId());
+
 	MemoryContext oldContext = MemoryContextSwitchTo(ColumnarWritePerTupleContext(
 														 writeState));
 
@@ -781,8 +783,14 @@ columnar_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 {
 	CheckCitusColumnarVersion(ERROR);
 
+	/*
+	 * The callback to .multi_insert is table_multi_insert() and this is only used for the COPY
+	 * command, so slot[i]->tts_tableoid will always be equal to relation->id. Thus, we can send
+	 * RelationGetRelid(relation) as the tupSlotTableOid
+	 */
 	ColumnarWriteState *writeState = columnar_init_write_state(relation,
 															   RelationGetDescr(relation),
+															   RelationGetRelid(relation),
 															   GetCurrentSubTransactionId());
 
 	ColumnarCheckLogicalReplication(relation);
@@ -2568,8 +2576,13 @@ detoast_values(TupleDesc tupleDesc, Datum *orig_values, bool *isnull)
 			if (values == orig_values)
 			{
 				values = palloc(sizeof(Datum) * natts);
-				memcpy_s(values, sizeof(Datum) * natts,
-						 orig_values, sizeof(Datum) * natts);
+
+				/*
+				 * We use IGNORE-BANNED here since we don't want to limit
+				 * size of the buffer that holds the datum array to RSIZE_MAX
+				 * unnecessarily.
+				 */
+				memcpy(values, orig_values, sizeof(Datum) * natts); /* IGNORE-BANNED */
 			}
 
 			/* will be freed when per-tuple context is reset */

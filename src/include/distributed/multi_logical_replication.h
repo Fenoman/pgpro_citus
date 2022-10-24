@@ -131,7 +131,8 @@ extern void LogicallyReplicateShards(List *shardList, char *sourceNodeName,
 									 int sourceNodePort, char *targetNodeName,
 									 int targetNodePort);
 
-extern void ConflictOnlyWithIsolationTesting(void);
+extern void ConflictWithIsolationTestingBeforeCopy(void);
+extern void ConflictWithIsolationTestingAfterCopy(void);
 extern void CreateReplicaIdentities(List *subscriptionInfoList);
 extern void CreateReplicaIdentitiesOnNode(List *shardList,
 										  char *nodeName,
@@ -157,11 +158,11 @@ extern void DropPublications(MultiConnection *sourceConnection,
 extern void DropAllLogicalReplicationLeftovers(LogicalRepType type);
 
 extern char * PublicationName(LogicalRepType type, uint32_t nodeId, Oid ownerId);
-extern char * ReplicationSlotName(LogicalRepType type, uint32_t nodeId, Oid ownerId);
+extern char * ReplicationSlotNameForNodeAndOwner(LogicalRepType type, uint32_t nodeId, Oid
+												 ownerId);
 extern char * SubscriptionName(LogicalRepType type, Oid ownerId);
 extern char * SubscriptionRoleName(LogicalRepType type, Oid ownerId);
 
-extern void WaitForAllSubscriptionsToBecomeReady(HTAB *groupedLogicalRepTargetsHash);
 extern void WaitForAllSubscriptionsToCatchUp(MultiConnection *sourceConnection,
 											 HTAB *groupedLogicalRepTargetsHash);
 extern void WaitForShardSubscriptionToCatchUp(MultiConnection *targetConnection,
@@ -172,10 +173,6 @@ extern HTAB * CreateGroupedLogicalRepTargetsHash(List *subscriptionInfoList);
 extern void CreateGroupedLogicalRepTargetsConnections(HTAB *groupedLogicalRepTargetsHash,
 													  char *user,
 													  char *databaseName);
-extern void RecreateGroupedLogicalRepTargetsConnections(
-	HTAB *groupedLogicalRepTargetsHash,
-	char *user,
-	char *databaseName);
 extern void CloseGroupedLogicalRepTargetsConnections(HTAB *groupedLogicalRepTargetsHash);
 extern void CompleteNonBlockingShardTransfer(List *shardList,
 											 MultiConnection *sourceConnection,

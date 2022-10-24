@@ -39,6 +39,7 @@
 #include "distributed/metadata_cache.h"
 #include "distributed/metadata_utility.h"
 #include "distributed/multi_client_executor.h"
+#include "distributed/multi_logical_replication.h"
 #include "distributed/multi_progress.h"
 #include "distributed/multi_server_executor.h"
 #include "distributed/pg_dist_rebalance_strategy.h"
@@ -60,9 +61,12 @@
 #include "utils/json.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/pg_lsn.h"
 #include "utils/syscache.h"
 #include "common/hashfn.h"
-
+#include "utils/varlena.h"
+#include "utils/guc_tables.h"
+#include "distributed/commands/utility_hook.h"
 
 /* RebalanceOptions are the options used to control the rebalance algorithm */
 typedef struct RebalanceOptions
@@ -75,6 +79,7 @@ typedef struct RebalanceOptions
 	float4 improvementThreshold;
 	Form_pg_dist_rebalance_strategy rebalanceStrategy;
 	const char *operationName;
+	WorkerNode *workerNode;
 } RebalanceOptions;
 
 
@@ -166,6 +171,7 @@ typedef struct ShardStatistics
 
 	/* The shard its size in bytes. */
 	uint64 totalSize;
+	XLogRecPtr shardLSN;
 } ShardStatistics;
 
 /*
@@ -175,6 +181,7 @@ typedef struct ShardStatistics
 typedef struct WorkerShardStatistics
 {
 	WorkerHashKey worker;
+	XLogRecPtr workerLSN;
 
 	/*
 	 * Statistics for each shard on this worker:
@@ -184,6 +191,7 @@ typedef struct WorkerShardStatistics
 	HTAB *statistics;
 } WorkerShardStatistics;
 
+char *VariablesToBePassedToNewConnections = NULL;
 
 /* static declarations for main logic */
 static int ShardActivePlacementCount(HTAB *activePlacementsHash, uint64 shardId,
@@ -205,7 +213,6 @@ static bool WorkerNodeListContains(List *workerNodeList, const char *workerName,
 								   uint32 workerPort);
 static void UpdateColocatedShardPlacementProgress(uint64 shardId, char *sourceName,
 												  int sourcePort, uint64 progress);
-static bool IsPlacementOnWorkerNode(ShardPlacement *placement, WorkerNode *workerNode);
 static NodeFillState * FindFillStateForPlacement(RebalanceState *state,
 												 ShardPlacement *placement);
 static RebalanceState * InitRebalanceState(List *workerNodeList, List *shardPlacementList,
@@ -246,11 +253,15 @@ static HTAB * GetMovedShardIdsByWorker(PlacementUpdateEventProgress *steps,
 									   int stepCount, bool fromSource);
 static uint64 WorkerShardSize(HTAB *workerShardStatistics,
 							  char *workerName, int workerPort, uint64 shardId);
+static XLogRecPtr WorkerShardLSN(HTAB *workerShardStatisticsHash, char *workerName,
+								 int workerPort, uint64 shardId);
+static XLogRecPtr WorkerLSN(HTAB *workerShardStatisticsHash,
+							char *workerName, int workerPort);
 static void AddToWorkerShardIdSet(HTAB *shardsByWorker, char *workerName, int workerPort,
 								  uint64 shardId);
 static HTAB * BuildShardSizesHash(ProgressMonitorData *monitor, HTAB *shardStatistics);
 static void ErrorOnConcurrentRebalance(RebalanceOptions *);
-
+static List * GetSetCommandListForNewConnections(void);
 
 /* declarations for dynamic loading */
 PG_FUNCTION_INFO_V1(rebalance_table_shards);
@@ -268,11 +279,24 @@ PG_FUNCTION_INFO_V1(citus_rebalance_wait);
 
 bool RunningUnderIsolationTest = false;
 int MaxRebalancerLoggedIgnoredMoves = 5;
+bool PropagateSessionSettingsForLoopbackConnection = false;
 
 static const char *PlacementUpdateTypeNames[] = {
 	[PLACEMENT_UPDATE_INVALID_FIRST] = "unknown",
 	[PLACEMENT_UPDATE_MOVE] = "move",
 	[PLACEMENT_UPDATE_COPY] = "copy",
+};
+
+static const char *PlacementUpdateStatusNames[] = {
+	[PLACEMENT_UPDATE_STATUS_NOT_STARTED_YET] = "Not Started Yet",
+	[PLACEMENT_UPDATE_STATUS_SETTING_UP] = "Setting Up",
+	[PLACEMENT_UPDATE_STATUS_COPYING_DATA] = "Copying Data",
+	[PLACEMENT_UPDATE_STATUS_CATCHING_UP] = "Catching Up",
+	[PLACEMENT_UPDATE_STATUS_CREATING_CONSTRAINTS] = "Creating Constraints",
+	[PLACEMENT_UPDATE_STATUS_FINAL_CATCH_UP] = "Final Catchup",
+	[PLACEMENT_UPDATE_STATUS_CREATING_FOREIGN_KEYS] = "Creating Foreign Keys",
+	[PLACEMENT_UPDATE_STATUS_COMPLETING] = "Completing",
+	[PLACEMENT_UPDATE_STATUS_COMPLETED] = "Completed",
 };
 
 #ifdef USE_ASSERT_CHECKING
@@ -461,6 +485,13 @@ GetRebalanceSteps(RebalanceOptions *options)
 														  options->excludedShardArray);
 		List *activeShardPlacementListForRelation =
 			FilterShardPlacementList(shardPlacementList, IsActiveShardPlacement);
+
+		if (options->workerNode != NULL)
+		{
+			activeShardPlacementListForRelation = FilterActiveShardPlacementListByNode(
+				shardPlacementList, options->workerNode);
+		}
+
 		activeShardPlacementListList =
 			lappend(activeShardPlacementListList, activeShardPlacementListForRelation);
 	}
@@ -782,7 +813,8 @@ ExecutePlacementUpdates(List *placementUpdateList, Oid shardReplicationModeOid,
 void
 SetupRebalanceMonitor(List *placementUpdateList,
 					  Oid relationId,
-					  uint64 initialProgressState)
+					  uint64 initialProgressState,
+					  PlacementUpdateStatus initialStatus)
 {
 	List *colocatedUpdateList = GetColocatedRebalanceSteps(placementUpdateList);
 	ListCell *colocatedUpdateCell = NULL;
@@ -807,6 +839,7 @@ SetupRebalanceMonitor(List *placementUpdateList,
 		event->sourcePort = colocatedUpdate->sourceNode->workerPort;
 		event->targetPort = colocatedUpdate->targetNode->workerPort;
 		event->updateType = colocatedUpdate->updateType;
+		pg_atomic_init_u64(&event->updateStatus, initialStatus);
 		pg_atomic_init_u64(&event->progress, initialProgressState);
 
 		eventIndex++;
@@ -1044,6 +1077,7 @@ citus_drain_node(PG_FUNCTION_ARGS)
 	};
 
 	char *nodeName = text_to_cstring(nodeNameText);
+	options.workerNode = FindWorkerNodeOrError(nodeName, nodePort);
 
 	/*
 	 * This is done in a separate session. This way it's not undone if the
@@ -1232,6 +1266,11 @@ get_rebalance_progress(PG_FUNCTION_ARGS)
 			uint64 targetSize = WorkerShardSize(shardStatistics, step->targetName,
 												step->targetPort, shardId);
 
+			XLogRecPtr sourceLSN = WorkerLSN(shardStatistics, step->sourceName,
+											 step->sourcePort);
+			XLogRecPtr targetLSN = WorkerShardLSN(shardStatistics, step->targetName,
+												  step->targetPort, shardId);
+
 			uint64 shardSize = 0;
 			ShardStatistics *shardSizesStat =
 				hash_search(shardSizes, &shardId, HASH_FIND, NULL);
@@ -1240,8 +1279,8 @@ get_rebalance_progress(PG_FUNCTION_ARGS)
 				shardSize = shardSizesStat->totalSize;
 			}
 
-			Datum values[12];
-			bool nulls[12];
+			Datum values[15];
+			bool nulls[15];
 
 			memset(values, 0, sizeof(values));
 			memset(nulls, 0, sizeof(nulls));
@@ -1259,6 +1298,12 @@ get_rebalance_progress(PG_FUNCTION_ARGS)
 			values[10] = UInt64GetDatum(targetSize);
 			values[11] = PointerGetDatum(
 				cstring_to_text(PlacementUpdateTypeNames[step->updateType]));
+			values[12] = LSNGetDatum(sourceLSN);
+			values[13] = LSNGetDatum(targetLSN);
+			values[14] = PointerGetDatum(cstring_to_text(
+											 PlacementUpdateStatusNames[
+												 pg_atomic_read_u64(
+													 &step->updateStatus)]));
 
 			tuplestore_putvalues(tupstore, tupdesc, values, nulls);
 		}
@@ -1393,6 +1438,59 @@ WorkerShardSize(HTAB *workerShardStatisticsHash, char *workerName, int workerPor
 
 
 /*
+ * WorkerShardLSN returns the LSN of a shard on a worker, based on
+ * the workerShardStatisticsHash. If there is no LSN data in the
+ * statistics object, returns InvalidXLogRecPtr.
+ */
+static XLogRecPtr
+WorkerShardLSN(HTAB *workerShardStatisticsHash, char *workerName, int workerPort,
+			   uint64 shardId)
+{
+	WorkerHashKey workerKey = { 0 };
+	strlcpy(workerKey.hostname, workerName, MAX_NODE_LENGTH);
+	workerKey.port = workerPort;
+
+	WorkerShardStatistics *workerStats =
+		hash_search(workerShardStatisticsHash, &workerKey, HASH_FIND, NULL);
+	if (!workerStats)
+	{
+		return InvalidXLogRecPtr;
+	}
+
+	ShardStatistics *shardStats =
+		hash_search(workerStats->statistics, &shardId, HASH_FIND, NULL);
+	if (!shardStats)
+	{
+		return InvalidXLogRecPtr;
+	}
+
+	return shardStats->shardLSN;
+}
+
+
+/*
+ * WorkerLSN returns the LSN of a worker, based on the workerShardStatisticsHash.
+ * If there is no LSN data in the statistics object, returns InvalidXLogRecPtr.
+ */
+static XLogRecPtr
+WorkerLSN(HTAB *workerShardStatisticsHash, char *workerName, int workerPort)
+{
+	WorkerHashKey workerKey = { 0 };
+	strlcpy(workerKey.hostname, workerName, MAX_NODE_LENGTH);
+	workerKey.port = workerPort;
+
+	WorkerShardStatistics *workerStats =
+		hash_search(workerShardStatisticsHash, &workerKey, HASH_FIND, NULL);
+	if (!workerStats)
+	{
+		return InvalidXLogRecPtr;
+	}
+
+	return workerStats->workerLSN;
+}
+
+
+/*
  * BuildWorkerShardStatisticsHash returns a shard id -> shard statistics hash containing
  * sizes of shards on the source node and destination node.
  */
@@ -1430,6 +1528,7 @@ BuildWorkerShardStatisticsHash(PlacementUpdateEventProgress *steps, int stepCoun
 		WorkerShardStatistics *moveStat =
 			hash_search(workerShardStatistics, &entry->worker, HASH_ENTER, NULL);
 		moveStat->statistics = statistics;
+		moveStat->workerLSN = GetRemoteLogPosition(connection);
 	}
 
 	return workerShardStatistics;
@@ -1481,15 +1580,17 @@ GetShardStatistics(MultiConnection *connection, HTAB *shardIds)
 	appendStringInfoString(query, "))");
 	appendStringInfoString(
 		query,
-		" SELECT shard_id, coalesce(pg_total_relation_size(tables.relid),0)"
+		" SELECT shard_id, coalesce(pg_total_relation_size(tables.relid),0), tables.lsn"
 
 		/* for each shard in shardIds */
 		" FROM shard_names"
 
 		/* check if its name can be found in pg_class, if so return size */
 		" LEFT JOIN"
-		" (SELECT c.oid AS relid, c.relname, n.nspname"
-		" FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace) tables"
+		" (SELECT c.oid AS relid, c.relname, n.nspname, ss.latest_end_lsn AS lsn"
+		" FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+		" LEFT JOIN pg_subscription_rel sr ON sr.srrelid = c.oid "
+		" LEFT JOIN pg_stat_subscription ss ON sr.srsubid = ss.subid) tables"
 		" ON tables.relname = shard_names.table_name AND"
 		" tables.nspname = shard_names.schema_name ");
 
@@ -1530,6 +1631,17 @@ GetShardStatistics(MultiConnection *connection, HTAB *shardIds)
 		ShardStatistics *statistics =
 			hash_search(shardStatistics, &shardId, HASH_ENTER, NULL);
 		statistics->totalSize = totalSize;
+
+		if (PQgetisnull(result, rowIndex, 2))
+		{
+			statistics->shardLSN = InvalidXLogRecPtr;
+		}
+		else
+		{
+			char *LSNString = PQgetvalue(result, rowIndex, 2);
+			Datum LSNDatum = DirectFunctionCall1(pg_lsn_in, CStringGetDatum(LSNString));
+			statistics->shardLSN = DatumGetLSN(LSNDatum);
+		}
 	}
 
 	PQclear(result);
@@ -1704,7 +1816,8 @@ RebalanceTableShards(RebalanceOptions *options, Oid shardReplicationModeOid)
 	 * purposes so it does not really matter which to show
 	 */
 	SetupRebalanceMonitor(placementUpdateList, linitial_oid(options->relationIdList),
-						  REBALANCE_PROGRESS_WAITING);
+						  REBALANCE_PROGRESS_WAITING,
+						  PLACEMENT_UPDATE_STATUS_NOT_STARTED_YET);
 	ExecutePlacementUpdates(placementUpdateList, shardReplicationModeOid, "Moving");
 	FinalizeCurrentProgressMonitor();
 }
@@ -1960,9 +2073,10 @@ UpdateShardPlacement(PlacementUpdateEvent *placementUpdateEvent,
 
 
 /*
- * ExecuteCriticalCommandInSeparateTransaction runs a command in a separate
+ * ExecuteRebalancerCommandInSeparateTransaction runs a command in a separate
  * transaction that is commited right away. This is useful for things that you
  * don't want to rollback when the current transaction is rolled back.
+ * Set true to 'useExclusiveTransactionBlock' to initiate a BEGIN and COMMIT statements.
  */
 void
 ExecuteRebalancerCommandInSeparateTransaction(char *command)
@@ -1970,14 +2084,53 @@ ExecuteRebalancerCommandInSeparateTransaction(char *command)
 	int connectionFlag = FORCE_NEW_CONNECTION;
 	MultiConnection *connection = GetNodeConnection(connectionFlag, LocalHostName,
 													PostPortNumber);
-	StringInfo setApplicationName = makeStringInfo();
-	appendStringInfo(setApplicationName, "SET application_name TO %s",
-					 CITUS_REBALANCER_NAME);
+	List *commandList = NIL;
 
-	ExecuteCriticalRemoteCommand(connection, setApplicationName->data);
-	ExecuteCriticalRemoteCommand(connection, command);
+	commandList = lappend(commandList, psprintf("SET LOCAL application_name TO %s;",
+												CITUS_REBALANCER_NAME));
 
+	if (PropagateSessionSettingsForLoopbackConnection)
+	{
+		List *setCommands = GetSetCommandListForNewConnections();
+		char *setCommand = NULL;
+
+		foreach_ptr(setCommand, setCommands)
+		{
+			commandList = lappend(commandList, setCommand);
+		}
+	}
+
+	commandList = lappend(commandList, command);
+
+	SendCommandListToWorkerOutsideTransactionWithConnection(connection, commandList);
 	CloseConnection(connection);
+}
+
+
+/*
+ * GetSetCommandListForNewConnections returns a list of SET statements to
+ * be executed in new connections to worker nodes.
+ */
+static List *
+GetSetCommandListForNewConnections(void)
+{
+	List *commandList = NIL;
+
+	struct config_generic **guc_vars = get_guc_variables();
+	int gucCount = GetNumConfigOptions();
+
+	for (int gucIndex = 0; gucIndex < gucCount; gucIndex++)
+	{
+		struct config_generic *var = (struct config_generic *) guc_vars[gucIndex];
+		if (var->source == PGC_S_SESSION && IsSettingSafeToPropagate(var->name))
+		{
+			const char *variableValue = GetConfigOption(var->name, true, true);
+			commandList = lappend(commandList, psprintf("SET LOCAL %s TO '%s';",
+														var->name, variableValue));
+		}
+	}
+
+	return commandList;
 }
 
 
@@ -2209,21 +2362,6 @@ FindFillStateForPlacement(RebalanceState *state, ShardPlacement *placement)
 		}
 	}
 	return NULL;
-}
-
-
-/*
- * IsPlacementOnWorkerNode checks if the shard placement is for to the given
- * workenode.
- */
-static bool
-IsPlacementOnWorkerNode(ShardPlacement *placement, WorkerNode *workerNode)
-{
-	if (strncmp(workerNode->workerName, placement->nodeName, WORKER_LENGTH) != 0)
-	{
-		return false;
-	}
-	return workerNode->workerPort == placement->nodePort;
 }
 
 

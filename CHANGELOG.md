@@ -1,3 +1,47 @@
+### citus v11.1.4 (October 24, 2022) ###
+
+* Fixes an upgrade problem for `worker_fetch_foreign_file` when upgrade path
+  starts from 8.3 up to 11.1
+
+* Fixes an upgrade problem for `worker_repartition_cleanup` when upgrade path
+  starts from 9.1 up to 11.1
+
+### citus v11.1.3 (October 14, 2022) ###
+
+* Adds support for PostgreSQL 15.0
+
+* Fixes a bug in `ALTER EXTENSION citus UPDATE`
+
+* Fixes a bug that causes a crash with empty/null password
+
+* Fixes a bug that causes not retaining trigger enable/disable settings when
+  re-creating them on shards
+
+* Fixes a bug that prevents retaining columnar table options after a
+  table-rewrite
+
+* Raises memory limits in columnar from 256MB to 1GB for reads and writes
+
+### citus v11.1.2 (September 30, 2022) ###
+
+* Adds support for PostgreSQL 15rc1
+
+* Disallows having `ON DELETE/UPDATE SET DEFAULT` actions on columns that
+  default to sequences
+
+* Fixes a bug that might cause inserting incorrect `DEFAULT` values when
+  applying foreign key actions
+
+* Fixes a performance issue related to shard-moves by creating replica
+  identities before copying shards
+
+* Improves logging during shard-splits and resource cleanup
+
+* Makes sure to reuse connections for shard-splits and logical replication
+
+* Makes sure to try dropping replication slots a few more times after a failure
+  at the end of the shard-split
+
 ### citus v11.1.1 (September 16, 2022) ###
 
 * Fixes a bug that prevents `create_distributed_table_concurrently()` working

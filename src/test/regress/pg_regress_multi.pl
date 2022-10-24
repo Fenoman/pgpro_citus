@@ -550,13 +550,21 @@ if($isolationtester)
 {
    push(@pgOptions, "citus.worker_min_messages='warning'");
    push(@pgOptions, "citus.log_distributed_deadlock_detection=on");
-   push(@pgOptions, "citus.distributed_deadlock_detection_factor=-1");
    push(@pgOptions, "citus.shard_count=4");
    push(@pgOptions, "citus.metadata_sync_interval=1000");
    push(@pgOptions, "citus.metadata_sync_retry_interval=100");
    push(@pgOptions, "client_min_messages='warning'"); # pg12 introduced notice showing during isolation tests
    push(@pgOptions, "citus.running_under_isolation_test=true");
 
+   # Disable all features of the maintenance daemon. Otherwise queries might
+   # randomly show temporarily as "waiting..." because they are waiting for the
+   # maintenance daemon.
+   push(@pgOptions, "citus.distributed_deadlock_detection_factor=-1");
+   push(@pgOptions, "citus.recover_2pc_interval=-1");
+   push(@pgOptions, "citus.enable_statistics_collection=-1");
+   push(@pgOptions, "citus.defer_shard_delete_interval=-1");
+   push(@pgOptions, "citus.stat_statements_purge_interval=-1");
+   push(@pgOptions, "citus.background_task_queue_interval=-1");
 }
 
 # Add externally added options last, so they overwrite the default ones above
@@ -1090,7 +1098,10 @@ sub RunVanillaTests
     system("mkdir", ("-p", "$pgregressOutputdir/sql")) == 0
             or die "Could not create vanilla sql dir.";
 
+    # we need to add regress.so path to dlpath because some tests need to find that lib
+    my $regresslibdir = $pgregressdir;
     $exitcode = system("$plainRegress",
+                        ("--dlpath", $regresslibdir),
                         ("--inputdir",  $pgregressdir),
                         ("--outputdir",  $pgregressOutputdir),
                         ("--schedule",  catfile("$pgregressdir", "parallel_schedule")),

@@ -16,7 +16,7 @@
 #include "miscadmin.h"
 
 #include "safe_lib.h"
-
+#include "postmaster/postmaster.h"
 #include "access/hash.h"
 #include "commands/dbcommands.h"
 #include "distributed/backend_data.h"
@@ -63,7 +63,6 @@ static void FreeConnParamsHashEntryFields(ConnParamsHashEntry *entry);
 static void AfterXactHostConnectionHandling(ConnectionHashEntry *entry, bool isCommit);
 static bool ShouldShutdownConnection(MultiConnection *connection, const int
 									 cachedConnectionCount);
-static void ResetConnection(MultiConnection *connection);
 static bool RemoteTransactionIdle(MultiConnection *connection);
 static int EventSetSizeForConnectionList(List *connections);
 
@@ -239,6 +238,23 @@ GetNodeUserDatabaseConnection(uint32 flags, const char *hostname, int32 port,
 	Assert(connection != NULL);
 
 	FinishConnectionEstablishment(connection);
+
+	return connection;
+}
+
+
+/*
+ * GetConnectionForLocalQueriesOutsideTransaction returns a localhost connection for
+ * subtransaction. To avoid creating excessive connections, we reuse an
+ * existing connection.
+ */
+MultiConnection *
+GetConnectionForLocalQueriesOutsideTransaction(char *userName)
+{
+	int connectionFlag = OUTSIDE_TRANSACTION;
+	MultiConnection *connection =
+		GetNodeUserDatabaseConnection(connectionFlag, LocalHostName, PostPortNumber,
+									  userName, get_database_name(MyDatabaseId));
 
 	return connection;
 }
@@ -688,8 +704,8 @@ CloseConnection(MultiConnection *connection)
 		dlist_delete(&connection->connectionNode);
 
 		/* same for transaction state and shard/placement machinery */
-		CloseRemoteTransaction(connection);
 		CloseShardPlacementAssociation(connection);
+		ResetRemoteTransaction(connection);
 
 		/* we leave the per-host entry alive */
 		pfree(connection);
@@ -1269,7 +1285,12 @@ StartConnectionEstablishment(MultiConnection *connection, ConnectionHashKey *key
 											  (const char **) entry->values,
 											  false);
 	INSTR_TIME_SET_CURRENT(connection->connectionEstablishmentStart);
-	connection->connectionId = connectionId++;
+
+	/* do not increment for restarted connections */
+	if (connection->connectionId == 0)
+	{
+		connection->connectionId = connectionId++;
+	}
 
 	/*
 	 * To avoid issues with interrupts not getting caught all our connections
@@ -1443,7 +1464,10 @@ AfterXactHostConnectionHandling(ConnectionHashEntry *entry, bool isCommit)
 			/*
 			 * reset healthy session lifespan connections.
 			 */
-			ResetConnection(connection);
+			ResetRemoteTransaction(connection);
+
+			UnclaimConnection(connection);
+
 
 			cachedConnectionCount++;
 		}
@@ -1483,20 +1507,53 @@ ShouldShutdownConnection(MultiConnection *connection, const int cachedConnection
 
 
 /*
- * ResetConnection preserves the given connection for later usage by
- * resetting its states.
+ * RestartConnection starts a new connection attempt for the given
+ * MultiConnection.
+ *
+ * The internal state of the MultiConnection is preserved. For example, we
+ * assume that we already went through all the other initialization steps in
+ * StartNodeUserDatabaseConnection, such as incrementing shared connection
+ * counters.
+ *
+ * This function should be used cautiously. If a connection is already
+ * involved in a remote transaction, we cannot restart the underlying
+ * connection. The caller is responsible for enforcing the restrictions
+ * on this.
  */
-static void
-ResetConnection(MultiConnection *connection)
+void
+RestartConnection(MultiConnection *connection)
 {
-	/* reset per-transaction state */
-	ResetRemoteTransaction(connection);
-	ResetShardPlacementAssociation(connection);
+	/* we cannot restart any connection that refers to a placement */
+	Assert(dlist_is_empty(&connection->referencedPlacements));
 
-	/* reset copy state */
-	connection->copyBytesWrittenSinceLastFlush = 0;
+	/* we cannot restart any connection that is part of a transaction */
+	Assert(connection->remoteTransaction.transactionState == REMOTE_TRANS_NOT_STARTED);
 
-	UnclaimConnection(connection);
+	ConnectionHashKey key;
+	strlcpy(key.hostname, connection->hostname, MAX_NODE_LENGTH);
+	key.port = connection->port;
+	strlcpy(key.user, connection->user, NAMEDATALEN);
+	strlcpy(key.database, connection->database, NAMEDATALEN);
+	key.replicationConnParam = connection->requiresReplication;
+
+	/*
+	 * With low-level APIs, we shutdown and restart the connection.
+	 * The main trick here is that we are using the same MultiConnection *
+	 * such that all the state of the connection is preserved.
+	 */
+	ShutdownConnection(connection);
+	StartConnectionEstablishment(connection, &key);
+
+	/*
+	 * We are restarting an already initialized connection which has
+	 * gone through StartNodeUserDatabaseConnection(). That's why we
+	 * can safely mark the state initialized.
+	 *
+	 * Not that we have to do this because ShutdownConnection() sets the
+	 * state to not initialized.
+	 */
+	connection->initilizationState = POOL_STATE_INITIALIZED;
+	connection->connectionState = MULTI_CONNECTION_CONNECTING;
 }
 
 
