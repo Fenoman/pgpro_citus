@@ -11,19 +11,21 @@
 #ifndef CITUS_SHARD_CLEANER_H
 #define CITUS_SHARD_CLEANER_H
 
+#define MAX_BG_TASK_EXECUTORS 1000
+
 /* GUC to configure deferred shard deletion */
 extern int DeferShardDeleteInterval;
 extern int BackgroundTaskQueueCheckInterval;
-extern bool DeferShardDeleteOnMove;
+extern int MaxBackgroundTaskExecutors;
 extern double DesiredPercentFreeAfterMove;
 extern bool CheckAvailableSpaceBeforeMove;
 
-extern bool DeferShardDeleteOnSplit;
 extern int NextOperationId;
 extern int NextCleanupRecordId;
 
-extern int TryDropOrphanedShards(bool waitForLocks);
-extern void DropOrphanedShardsInSeparateTransaction(void);
+extern int TryDropOrphanedResources(void);
+extern void DropOrphanedResourcesInSeparateTransaction(void);
+extern void ErrorIfCleanupRecordForShardExists(char *shardName);
 
 /* Members for cleanup infrastructure */
 typedef uint64 OperationId;
@@ -35,7 +37,11 @@ extern OperationId CurrentOperationId;
 typedef enum CleanupObject
 {
 	CLEANUP_OBJECT_INVALID = 0,
-	CLEANUP_OBJECT_SHARD_PLACEMENT = 1
+	CLEANUP_OBJECT_SHARD_PLACEMENT = 1,
+	CLEANUP_OBJECT_SUBSCRIPTION = 2,
+	CLEANUP_OBJECT_REPLICATION_SLOT = 3,
+	CLEANUP_OBJECT_PUBLICATION = 4,
+	CLEANUP_OBJECT_USER = 5
 } CleanupObject;
 
 /*
@@ -97,13 +103,6 @@ extern void InsertCleanupRecordInSubtransaction(CleanupObject objectType,
 												char *objectName,
 												int nodeGroupId,
 												CleanupPolicy policy);
-
-/*
- * FinalizeOperationNeedingCleanupOnFailure is be called by an operation to signal
- * completion on failure. This will trigger cleanup of appropriate resources
- * and cleanup records.
- */
-extern void FinalizeOperationNeedingCleanupOnFailure(const char *operationName);
 
 /*
  * FinalizeOperationNeedingCleanupOnSuccess is be called by an operation to signal

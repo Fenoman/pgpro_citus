@@ -356,9 +356,9 @@ ErrorIfShardPlacementsNotColocated(Oid leftRelationId, Oid rightRelationId)
 									  leftRelationName, rightRelationName)));
 		}
 
-		List *leftPlacementList = ShardPlacementListWithoutOrphanedPlacements(
+		List *leftPlacementList = ShardPlacementListSortedByWorker(
 			leftShardId);
-		List *rightPlacementList = ShardPlacementListWithoutOrphanedPlacements(
+		List *rightPlacementList = ShardPlacementListSortedByWorker(
 			rightShardId);
 
 		if (list_length(leftPlacementList) != list_length(rightPlacementList))
@@ -398,16 +398,6 @@ ErrorIfShardPlacementsNotColocated(Oid leftRelationId, Oid rightRelationId)
 										  UINT64_FORMAT " of %s are not colocated.",
 										  leftShardId, leftRelationName,
 										  rightShardId, rightRelationName)));
-			}
-
-			/* we also don't allow colocated shards to be in different shard states */
-			if (leftPlacement->shardState != rightPlacement->shardState)
-			{
-				ereport(ERROR, (errmsg("cannot colocate tables %s and %s",
-									   leftRelationName, rightRelationName),
-								errdetail("%s and %s have shard placements in "
-										  "different shard states.",
-										  leftRelationName, rightRelationName)));
 			}
 		}
 	}

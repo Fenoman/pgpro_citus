@@ -32,7 +32,6 @@
 #include "distributed/insert_select_planner.h"
 #include "distributed/insert_select_executor.h"
 #include "distributed/listutils.h"
-#include "distributed/multi_client_executor.h"
 #include "distributed/multi_executor.h"
 #include "distributed/multi_explain.h"
 #include "distributed/multi_logical_optimizer.h"
@@ -50,6 +49,7 @@
 #include "distributed/worker_protocol.h"
 #include "distributed/version_compat.h"
 #include "distributed/jsonbutils.h"
+#include "distributed/commands/utility_hook.h"
 #include "executor/tstoreReceiver.h"
 #include "fmgr.h"
 #include "lib/stringinfo.h"
@@ -196,6 +196,20 @@ CitusExplainScan(CustomScanState *node, List *ancestors, struct ExplainState *es
 		appendStringInfoSpaces(es->str, es->indent * 2);
 		appendStringInfo(es->str, "explain statements for distributed queries ");
 		appendStringInfo(es->str, "are not enabled\n");
+		return;
+	}
+
+	/*
+	 * ALTER TABLE statements are not explained by postgres. However ALTER TABLE statements
+	 * may trigger SELECT statements causing explain hook to run. This situation causes a crash in a worker.
+	 * Therefore we will detect if we are explaining a triggered query when we are processing
+	 * an ALTER TABLE statement and stop explain in this situation.
+	 */
+	if (AlterTableInProgress())
+	{
+		ExplainPropertyText("Citus Explain Scan",
+							"Explain for triggered constraint validation queries during ALTER TABLE commands are not supported by Citus",
+							es);
 		return;
 	}
 

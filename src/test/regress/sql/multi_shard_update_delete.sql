@@ -476,24 +476,6 @@ SET value_1 = 7
 FROM events_test_table
 WHERE users_test_table.user_id = events_test_table.user_id AND TRUE;
 
--- Test with inactive shard-placement
--- manually set shardstate of one placement of users_test_table as inactive
-UPDATE pg_dist_shard_placement SET shardstate = 3 WHERE shardid = 1440000;
-UPDATE users_test_table
-SET    value_2 = 5
-FROM   events_test_table
-WHERE  users_test_table.user_id = events_test_table.user_id;
-
--- manually set shardstate of one placement of events_test_table as inactive
-UPDATE pg_dist_shard_placement SET shardstate = 3 WHERE shardid = 1440004;
-UPDATE users_test_table
-SET    value_2 = 5
-FROM   events_test_table
-WHERE  users_test_table.user_id = events_test_table.user_id;
-
-UPDATE pg_dist_shard_placement SET shardstate = 1 WHERE shardid = 1440000;
-UPDATE pg_dist_shard_placement SET shardstate = 1 WHERE shardid = 1440004;
-
 -- Subquery must return single value to use it with comparison operators
 UPDATE users_test_table as utt
 SET    value_1 = 3
@@ -568,13 +550,18 @@ WHERE  user_id IN
         SELECT user_id
         FROM   events_test_table);
 
--- Reference tables can not locate on the outer part of the outer join
+-- Reference tables can locate on the outer part of the outer join
+-- Note that we don't need to sort the output because
+-- citus.sort_returning is enabled by default during
+-- regression tests.
 UPDATE users_test_table
 SET value_1 = 4
-WHERE user_id IN
-    (SELECT DISTINCT e2.user_id
-     FROM users_reference_copy_table
-     LEFT JOIN users_test_table e2 ON (e2.user_id = users_reference_copy_table.value_1)) RETURNING *;
+WHERE user_id IN (
+    SELECT DISTINCT e2.user_id
+    FROM users_reference_copy_table
+    LEFT JOIN users_test_table e2 ON (e2.user_id = users_reference_copy_table.value_1)
+)
+RETURNING *;
 
 -- Volatile functions are also not supported
 UPDATE users_test_table
@@ -730,6 +717,8 @@ DELETE FROM users_test_table WHERE user_id = 3 or user_id = 5;
 SELECT COUNT(*) FROM users_test_table WHERE user_id = 3 or user_id = 5;
 
 DROP TABLE users_test_table;
+DROP TABLE events_test_table_local;
 DROP TABLE events_test_table;
+DROP TABLE events_test_table_2;
 DROP TABLE events_reference_copy_table;
 DROP TABLE users_reference_copy_table;

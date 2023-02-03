@@ -9,7 +9,6 @@ SELECT nextval('pg_catalog.pg_dist_placement_placementid_seq') AS last_placement
 \gset
 ALTER SEQUENCE pg_catalog.pg_dist_placement_placementid_seq RESTART 100000;
 
-
 CREATE SCHEMA "Tenant Isolation";
 SET search_path to "Tenant Isolation";
 
@@ -217,7 +216,7 @@ SELECT * FROM pg_dist_shard
 	WHERE logicalrelid = 'lineitem_streaming'::regclass OR logicalrelid = 'orders_streaming'::regclass
 	ORDER BY shardminvalue::BIGINT, logicalrelid;
 
-SELECT * FROM pg_dist_shard_placement WHERE shardid >= 1230000 ORDER BY nodeport, shardid;
+SELECT * FROM pg_dist_shard_placement WHERE shardid BETWEEN 1230000 AND 1399999 ORDER BY nodeport, shardid;
 
 -- test failing foreign constraints after multiple tenant isolation
 \COPY lineitem_streaming FROM STDIN WITH DELIMITER '|'
@@ -225,7 +224,7 @@ SELECT * FROM pg_dist_shard_placement WHERE shardid >= 1230000 ORDER BY nodeport
 \.
 
 \c - postgres - :master_port
-CALL pg_catalog.citus_cleanup_orphaned_resources();
+SELECT public.wait_for_resource_cleanup();
 
 -- connect to the worker node with metadata
 \c - mx_isolation_role_ent - :worker_1_port
@@ -318,15 +317,6 @@ SELECT count(*) FROM lineitem_date WHERE l_shipdate = '1997-07-30';
 SELECT count(*) FROM lineitem_date WHERE l_shipdate = '1998-01-15';
 SELECT count(*) FROM lineitem_date WHERE l_shipdate = '1997-08-08';
 
--- test with invalid shard placements
-\c - postgres - :master_port
-SET search_path to "Tenant Isolation";
-
-UPDATE pg_dist_shard_placement SET shardstate = 3 WHERE nodeport = :worker_1_port;
-SELECT isolate_tenant_to_new_shard('lineitem_date', '1997-08-08', shard_transfer_mode => 'block_writes');
-
-UPDATE pg_dist_shard_placement SET shardstate = 1 WHERE nodeport = :worker_1_port;
-
 \c - mx_isolation_role_ent - :master_port
 SET search_path to "Tenant Isolation";
 DROP TABLE lineitem_date;
@@ -345,7 +335,7 @@ SELECT * FROM pg_dist_shard
 	ORDER BY shardminvalue::BIGINT, logicalrelid;
 
 \c - postgres - :master_port
-CALL pg_catalog.citus_cleanup_orphaned_resources();
+SELECT public.wait_for_resource_cleanup();
 
 -- test failure scenarios with triggers on workers
 \c - postgres - :worker_1_port
@@ -398,29 +388,6 @@ RESET citus.enable_metadata_sync;
 
 CREATE EVENT TRIGGER abort_drop ON sql_drop
    EXECUTE PROCEDURE abort_drop_command();
-
-\c - postgres - :master_port
--- Disable deferred drop otherwise we will skip the drop and operation will succeed instead of failing.
-SET citus.defer_drop_after_shard_split TO OFF;
-SET ROLE mx_isolation_role_ent;
-SET search_path to "Tenant Isolation";
-
-\set VERBOSITY terse
-SELECT isolate_tenant_to_new_shard('orders_streaming', 104, 'CASCADE', shard_transfer_mode => 'block_writes');
-
-\set VERBOSITY default
-
--- check if metadata is changed
-SELECT * FROM pg_dist_shard
-	WHERE logicalrelid = 'lineitem_streaming'::regclass OR logicalrelid = 'orders_streaming'::regclass
-	ORDER BY shardminvalue::BIGINT, logicalrelid;
-
-\c - - - :worker_1_port
-SET search_path to "Tenant Isolation";
-
--- however, new tables are already created
-SET citus.override_table_visibility TO false;
-\d
 
 \c - postgres - :worker_1_port
 
@@ -546,7 +513,7 @@ SELECT isolate_tenant_to_new_shard('test_colocated_table_2', 1, 'CASCADE', shard
 SELECT count(*) FROM test_colocated_table_2;
 
 \c - postgres - :master_port
-CALL pg_catalog.citus_cleanup_orphaned_resources();
+SELECT public.wait_for_resource_cleanup();
 
 \c - postgres - :worker_1_port
 
@@ -563,7 +530,6 @@ SET search_path to "Tenant Isolation";
 
 --
 -- Make sure that isolate_tenant_to_new_shard() replicats reference tables
--- when replicate_reference_tables_on_activate is off.
 --
 
 
@@ -603,7 +569,6 @@ SELECT count(*) FROM pg_dist_shard WHERE logicalrelid = 'partitioning_test'::reg
 SELECT count(*) FROM partitioning_test;
 
 
-SET citus.replicate_reference_tables_on_activate TO off;
 SET client_min_messages TO WARNING;
 
 SELECT 1 FROM master_add_node('localhost', :master_port, groupId=>0);

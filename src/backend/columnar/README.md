@@ -52,8 +52,7 @@ Benefits of Citus Columnar over cstore_fdw:
   ... FOR UPDATE``)
 * No support for serializable isolation level
 * Support for PostgreSQL server versions 12+ only
-* No support for foreign keys, unique constraints, or exclusion
-  constraints
+* No support for foreign keys
 * No support for logical decoding
 * No support for intra-node parallel scans
 * No support for ``AFTER ... FOR EACH ROW`` triggers
@@ -234,16 +233,14 @@ CREATE TABLE perf_columnar(LIKE perf_row) USING COLUMNAR;
 ## Data
 
 ```sql
-CREATE OR REPLACE FUNCTION random_words(n INT4) RETURNS TEXT LANGUAGE plpython2u AS $$
-import random
-t = ''
-words = ['zero','one','two','three','four','five','six','seven','eight','nine','ten']
-for i in xrange(0,n):
-  if (i != 0):
-    t += ' '
-  r = random.randint(0,len(words)-1)
-  t += words[r]
-return t
+CREATE OR REPLACE FUNCTION random_words(n INT4) RETURNS TEXT LANGUAGE sql AS $$
+  WITH words(w) AS (
+    SELECT ARRAY['zero','one','two','three','four','five','six','seven','eight','nine','ten']
+  ),
+  random (word) AS (
+    SELECT w[(random()*array_length(w, 1))::int] FROM generate_series(1, $1) AS i, words
+  )
+  SELECT string_agg(word, ' ') FROM random;
 $$;
 ```
 

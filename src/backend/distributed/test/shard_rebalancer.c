@@ -52,7 +52,7 @@ static ShardCost GetShardCost(uint64 shardId, void *context);
 PG_FUNCTION_INFO_V1(shard_placement_rebalance_array);
 PG_FUNCTION_INFO_V1(shard_placement_replication_array);
 PG_FUNCTION_INFO_V1(worker_node_responsive);
-PG_FUNCTION_INFO_V1(run_try_drop_marked_shards);
+PG_FUNCTION_INFO_V1(run_try_drop_marked_resources);
 
 typedef struct ShardPlacementTestInfo
 {
@@ -75,26 +75,13 @@ typedef struct RebalancePlanContext
 } RebalancePlacementContext;
 
 /*
- * run_try_drop_marked_shards is a wrapper to run TryDropOrphanedShards.
+ * run_try_drop_marked_resources is a wrapper to run TryDropOrphanedResources.
  */
 Datum
-run_try_drop_marked_shards(PG_FUNCTION_ARGS)
+run_try_drop_marked_resources(PG_FUNCTION_ARGS)
 {
-	bool waitForLocks = false;
-	TryDropOrphanedShards(waitForLocks);
+	TryDropOrphanedResources();
 	PG_RETURN_VOID();
-}
-
-
-/*
- * IsActiveTestShardPlacement checks if the dummy shard placement created in tests
- * are labelled as active. Note that this function does not check if the worker is also
- * active, because the dummy test workers are not registered as actual workers.
- */
-static inline bool
-IsActiveTestShardPlacement(ShardPlacement *shardPlacement)
-{
-	return shardPlacement->shardState == SHARD_STATE_ACTIVE;
 }
 
 
@@ -151,9 +138,7 @@ shard_placement_rebalance_array(PG_FUNCTION_ARGS)
 		if (shardPlacementTestInfo->nextColocationGroup)
 		{
 			shardPlacementList = SortList(shardPlacementList, CompareShardPlacements);
-			shardPlacementListList = lappend(shardPlacementListList,
-											 FilterShardPlacementList(shardPlacementList,
-																	  IsActiveTestShardPlacement));
+			shardPlacementListList = lappend(shardPlacementListList, shardPlacementList);
 			shardPlacementList = NIL;
 		}
 		shardPlacementList = lappend(shardPlacementList,
@@ -305,8 +290,7 @@ shard_placement_replication_array(PG_FUNCTION_ARGS)
 									 shardPlacementTestInfo->placement);
 	}
 
-	List *activeShardPlacementList = FilterShardPlacementList(shardPlacementList,
-															  IsActiveTestShardPlacement);
+	List *activeShardPlacementList = shardPlacementList;
 
 	/* sort the lists to make the function more deterministic */
 	workerNodeList = SortList(workerNodeList, CompareWorkerNodes);
@@ -359,8 +343,6 @@ JsonArrayToShardPlacementTestInfoList(ArrayType *shardPlacementJsonArrayObject)
 			placementJson, FIELD_NAME_SHARD_ID, placementIndex + 1);
 		uint64 shardLength = JsonFieldValueUInt64Default(
 			placementJson, FIELD_NAME_SHARD_LENGTH, 1);
-		int shardState = JsonFieldValueUInt32Default(
-			placementJson, FIELD_NAME_SHARD_STATE, SHARD_STATE_ACTIVE);
 		char *nodeName = JsonFieldValueString(placementJson, FIELD_NAME_NODE_NAME);
 		if (nodeName == NULL)
 		{
@@ -380,7 +362,6 @@ JsonArrayToShardPlacementTestInfoList(ArrayType *shardPlacementJsonArrayObject)
 		placementTestInfo->placement = palloc0(sizeof(ShardPlacement));
 		placementTestInfo->placement->shardId = shardId;
 		placementTestInfo->placement->shardLength = shardLength;
-		placementTestInfo->placement->shardState = shardState;
 		placementTestInfo->placement->nodeName = pstrdup(nodeName);
 		placementTestInfo->placement->nodePort = nodePort;
 		placementTestInfo->placement->placementId = placementId;

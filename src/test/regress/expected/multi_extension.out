@@ -133,7 +133,7 @@ SELECT * FROM multi_extension.print_extension_changes();
                  | function alter_role_if_exists(text,text) boolean
                  | function any_value(anyelement) anyelement
                  | function any_value_agg(anyelement,anyelement) anyelement
-                 | function array_cat_agg(anyarray) anycompatiblearray
+                 | function array_cat_agg(anycompatiblearray) anycompatiblearray
                  | function assign_distributed_transaction_id(integer,bigint,timestamp with time zone) void
                  | function authinfo_valid(text) boolean
                  | function broadcast_intermediate_result(text,text) bigint
@@ -1189,7 +1189,44 @@ SELECT * FROM multi_extension.print_extension_changes();
 
 -- Test downgrade to 11.1-1 from 11.2-1
 ALTER EXTENSION citus UPDATE TO '11.2-1';
+-- create a table with orphaned shards to see if orphaned shards will be dropped
+-- and cleanup records will be created for them
+SET citus.shard_replication_factor to 1;
+CREATE TABLE table_with_orphaned_shards (a int);
+SELECT create_distributed_table('table_with_orphaned_shards', 'a');
+ create_distributed_table
+---------------------------------------------------------------------
+
+(1 row)
+
+-- show there are 4 placements
+SELECT * FROM pg_dist_placement ORDER BY shardid;
+ placementid | shardid | shardstate | shardlength | groupid
+---------------------------------------------------------------------
+           1 |  102008 |          1 |           0 |       0
+           2 |  102009 |          1 |           0 |       0
+           3 |  102010 |          1 |           0 |       0
+           4 |  102011 |          1 |           0 |       0
+(4 rows)
+
+-- mark two of them as orphaned
+UPDATE pg_dist_placement SET shardstate = 4 WHERE shardid % 2 = 1;
 ALTER EXTENSION citus UPDATE TO '11.1-1';
+-- show placements and cleanup records
+SELECT * FROM pg_dist_placement ORDER BY shardid;
+ placementid | shardid | shardstate | shardlength | groupid
+---------------------------------------------------------------------
+           1 |  102008 |          1 |           0 |       0
+           2 |  102009 |          4 |           0 |       0
+           3 |  102010 |          1 |           0 |       0
+           4 |  102011 |          4 |           0 |       0
+(4 rows)
+
+SELECT * FROM pg_dist_cleanup;
+ record_id | operation_id | object_type | object_name | node_group_id | policy_type
+---------------------------------------------------------------------
+(0 rows)
+
 -- Should be empty result since upgrade+downgrade should be a no-op
 SELECT * FROM multi_extension.print_extension_changes();
  previous_object | current_object
@@ -1198,12 +1235,73 @@ SELECT * FROM multi_extension.print_extension_changes();
 
 -- Snapshot of state at 11.2-1
 ALTER EXTENSION citus UPDATE TO '11.2-1';
+-- verify that the placements are deleted and cleanup records are created
+SELECT * FROM pg_dist_placement ORDER BY shardid;
+ placementid | shardid | shardstate | shardlength | groupid
+---------------------------------------------------------------------
+           1 |  102008 |          1 |           0 |       0
+           3 |  102010 |          1 |           0 |       0
+(2 rows)
+
+SELECT * FROM pg_dist_cleanup;
+ record_id | operation_id | object_type |            object_name            | node_group_id | policy_type
+---------------------------------------------------------------------
+         1 |            0 |           1 | table_with_orphaned_shards_102009 |             0 |           0
+         2 |            0 |           1 | table_with_orphaned_shards_102011 |             0 |           0
+(2 rows)
+
+-- error out as cleanup records remain
+ALTER EXTENSION citus UPDATE TO '11.0-4';
+ERROR:  pg_dist_cleanup is introduced in Citus 11.1
+HINT:  To downgrade Citus to an older version, you should first cleanup all the orphaned resources and make sure pg_dist_cleanup is empty, by executing CALL citus_cleanup_orphaned_resources();
+CONTEXT:  PL/pgSQL function inline_code_block line XX at RAISE
+-- cleanup
+SET client_min_messages TO ERROR;
+CALL citus_cleanup_orphaned_resources();
+DROP TABLE table_with_orphaned_shards;
+RESET client_min_messages;
 SELECT * FROM multi_extension.print_extension_changes();
-                                                                                                                                    previous_object                                                                                                                                     |                                                                                                                                                        current_object
+                                                                                                                                    previous_object                                                                                                                                     |                                                                                                                                                              current_object
 ---------------------------------------------------------------------
  function get_rebalance_progress() TABLE(sessionid integer, table_name regclass, shardid bigint, shard_size bigint, sourcename text, sourceport integer, targetname text, targetport integer, progress bigint, source_shard_size bigint, target_shard_size bigint, operation_type text) |
+ function worker_append_table_to_shard(text,text,text,integer) void                                                                                                                                                                                                                     |
+ function worker_split_shard_replication_setup(split_shard_info[]) SETOF replication_slot_info                                                                                                                                                                                          |
+                                                                                                                                                                                                                                                                                        | function citus_copy_shard_placement(bigint,integer,integer,citus.shard_transfer_mode) void
+                                                                                                                                                                                                                                                                                        | function citus_get_node_clock() cluster_clock
+                                                                                                                                                                                                                                                                                        | function citus_get_transaction_clock() cluster_clock
+                                                                                                                                                                                                                                                                                        | function citus_internal_add_placement_metadata(bigint,bigint,integer,bigint) void
+                                                                                                                                                                                                                                                                                        | function citus_internal_adjust_local_clock_to_remote(cluster_clock) void
+                                                                                                                                                                                                                                                                                        | function citus_is_clock_after(cluster_clock,cluster_clock) boolean
+                                                                                                                                                                                                                                                                                        | function citus_job_list() TABLE(job_id bigint, state citus_job_status, job_type name, description text, started_at timestamp with time zone, finished_at timestamp with time zone)
+                                                                                                                                                                                                                                                                                        | function citus_job_status(bigint,boolean) TABLE(job_id bigint, state citus_job_status, job_type name, description text, started_at timestamp with time zone, finished_at timestamp with time zone, details jsonb)
+                                                                                                                                                                                                                                                                                        | function citus_move_shard_placement(bigint,integer,integer,citus.shard_transfer_mode) void
+                                                                                                                                                                                                                                                                                        | function citus_rebalance_status(boolean) TABLE(job_id bigint, state citus_job_status, job_type name, description text, started_at timestamp with time zone, finished_at timestamp with time zone, details jsonb)
+                                                                                                                                                                                                                                                                                        | function citus_task_wait(bigint,citus_task_status) void
+                                                                                                                                                                                                                                                                                        | function cluster_clock_cmp(cluster_clock,cluster_clock) integer
+                                                                                                                                                                                                                                                                                        | function cluster_clock_eq(cluster_clock,cluster_clock) boolean
+                                                                                                                                                                                                                                                                                        | function cluster_clock_ge(cluster_clock,cluster_clock) boolean
+                                                                                                                                                                                                                                                                                        | function cluster_clock_gt(cluster_clock,cluster_clock) boolean
+                                                                                                                                                                                                                                                                                        | function cluster_clock_in(cstring) cluster_clock
+                                                                                                                                                                                                                                                                                        | function cluster_clock_le(cluster_clock,cluster_clock) boolean
+                                                                                                                                                                                                                                                                                        | function cluster_clock_logical(cluster_clock) bigint
+                                                                                                                                                                                                                                                                                        | function cluster_clock_lt(cluster_clock,cluster_clock) boolean
+                                                                                                                                                                                                                                                                                        | function cluster_clock_ne(cluster_clock,cluster_clock) boolean
+                                                                                                                                                                                                                                                                                        | function cluster_clock_out(cluster_clock) cstring
+                                                                                                                                                                                                                                                                                        | function cluster_clock_recv(internal) cluster_clock
+                                                                                                                                                                                                                                                                                        | function cluster_clock_send(cluster_clock) bytea
                                                                                                                                                                                                                                                                                         | function get_rebalance_progress() TABLE(sessionid integer, table_name regclass, shardid bigint, shard_size bigint, sourcename text, sourceport integer, targetname text, targetport integer, progress bigint, source_shard_size bigint, target_shard_size bigint, operation_type text, source_lsn pg_lsn, target_lsn pg_lsn, status text)
-(2 rows)
+                                                                                                                                                                                                                                                                                        | function worker_split_shard_replication_setup(split_shard_info[],bigint) SETOF replication_slot_info
+                                                                                                                                                                                                                                                                                        | operator <(cluster_clock,cluster_clock)
+                                                                                                                                                                                                                                                                                        | operator <=(cluster_clock,cluster_clock)
+                                                                                                                                                                                                                                                                                        | operator <>(cluster_clock,cluster_clock)
+                                                                                                                                                                                                                                                                                        | operator =(cluster_clock,cluster_clock)
+                                                                                                                                                                                                                                                                                        | operator >(cluster_clock,cluster_clock)
+                                                                                                                                                                                                                                                                                        | operator >=(cluster_clock,cluster_clock)
+                                                                                                                                                                                                                                                                                        | operator class cluster_clock_ops for access method btree
+                                                                                                                                                                                                                                                                                        | operator family cluster_clock_ops for access method btree
+                                                                                                                                                                                                                                                                                        | sequence pg_dist_clock_logical_seq
+                                                                                                                                                                                                                                                                                        | type cluster_clock
+(38 rows)
 
 DROP TABLE multi_extension.prev_objects, multi_extension.extension_diff;
 -- show running version
@@ -1560,7 +1658,6 @@ CREATE EXTENSION citus;
 CREATE TABLE test (x int, y int);
 INSERT INTO test VALUES (1,2);
 SET citus.shard_replication_factor TO 1;
-SET citus.defer_drop_after_shard_split TO off;
 SELECT create_distributed_table_concurrently('test','x');
 NOTICE:  relation test does not have a REPLICA IDENTITY or PRIMARY KEY
 DETAIL:  UPDATE and DELETE commands on the relation will error out during create_distributed_table_concurrently unless there is a REPLICA IDENTITY or PRIMARY KEY. INSERT commands will still work.

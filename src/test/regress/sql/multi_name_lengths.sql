@@ -6,33 +6,11 @@ ALTER SEQUENCE pg_catalog.pg_dist_shardid_seq RESTART 225000;
 
 SET citus.shard_count TO 2;
 
--- this function is dropped in Citus10, added here for tests
-SET citus.enable_metadata_sync TO OFF;
-CREATE OR REPLACE FUNCTION pg_catalog.master_create_distributed_table(table_name regclass,
-                                                                      distribution_column text,
-                                                                      distribution_method citus.distribution_type)
-    RETURNS void
-    LANGUAGE C STRICT
-    AS 'citus', $$master_create_distributed_table$$;
-COMMENT ON FUNCTION pg_catalog.master_create_distributed_table(table_name regclass,
-                                                               distribution_column text,
-                                                               distribution_method citus.distribution_type)
-    IS 'define the table distribution functions';
-
--- this function is dropped in Citus10, added here for tests
-CREATE OR REPLACE FUNCTION pg_catalog.master_create_worker_shards(table_name text, shard_count integer,
-                                                                  replication_factor integer DEFAULT 2)
-    RETURNS void
-    AS 'citus', $$master_create_worker_shards$$
-    LANGUAGE C STRICT;
-RESET citus.enable_metadata_sync;
-
 -- Verify that a table name > 56 characters gets hashed properly.
 CREATE TABLE too_long_12345678901234567890123456789012345678901234567890 (
         col1 integer not null,
         col2 integer not null);
-SELECT master_create_distributed_table('too_long_12345678901234567890123456789012345678901234567890', 'col1', 'hash');
-SELECT master_create_worker_shards('too_long_12345678901234567890123456789012345678901234567890', '2', '2');
+SELECT create_distributed_table('too_long_12345678901234567890123456789012345678901234567890', 'col1');
 
 \c - - :public_worker_1_host :worker_1_port
 \dt too_long_*
@@ -66,11 +44,6 @@ SELECT create_distributed_table('name_lengths', 'col1', 'hash');
 ALTER TABLE name_lengths ADD COLUMN float_col_12345678901234567890123456789012345678901234567890 FLOAT;
 ALTER TABLE name_lengths ADD COLUMN date_col_12345678901234567890123456789012345678901234567890 DATE;
 ALTER TABLE name_lengths ADD COLUMN int_col_12345678901234567890123456789012345678901234567890 INTEGER DEFAULT 1;
-
--- Placeholders for unsupported ALTER TABLE to add constraints with implicit names that are likely too long
-ALTER TABLE name_lengths ADD UNIQUE (float_col_12345678901234567890123456789012345678901234567890);
-ALTER TABLE name_lengths ADD EXCLUDE (int_col_12345678901234567890123456789012345678901234567890 WITH =);
-ALTER TABLE name_lengths ADD CHECK (date_col_12345678901234567890123456789012345678901234567890 > '2014-01-01'::date);
 
 \c - - :public_worker_1_host :worker_1_port
 SELECT "Column", "Type", "Modifiers" FROM table_desc WHERE relid='public.name_lengths_225002'::regclass ORDER BY 1 DESC, 2 DESC;
@@ -206,8 +179,7 @@ CREATE TABLE sneaky_name_lengths (
 \di public.sneaky_name_lengths*
 SELECT "Constraint", "Definition" FROM table_checks WHERE relid='public.sneaky_name_lengths'::regclass ORDER BY 1 DESC, 2 DESC;
 
-SELECT master_create_distributed_table('sneaky_name_lengths', 'int_col_123456789012345678901234567890123456789012345678901234', 'hash');
-SELECT master_create_worker_shards('sneaky_name_lengths', '2', '2');
+SELECT create_distributed_table('sneaky_name_lengths', 'int_col_123456789012345678901234567890123456789012345678901234', 'hash');
 
 \c - - :public_worker_1_host :worker_1_port
 SELECT c1.relname AS sneaky_index_name,
@@ -315,3 +287,5 @@ DROP TABLE multi_name_lengths.too_long_12345678901234567890123456789012345678901
 DROP TABLE name_lengths CASCADE;
 DROP TABLE U&"elephant_!0441!043B!043E!043D!0441!043B!043E!043D!0441!043B!043E!043D!0441!043B!043E!043D!0441!043B!043E!043D!0441!043B!043E!043D" UESCAPE '!' CASCADE;
 RESET citus.force_max_query_parallelization;
+DROP SCHEMA multi_name_lengths CASCADE;
+DROP TABLE append_zero_shard_table_12345678901234567890123456789012345678901234567890;

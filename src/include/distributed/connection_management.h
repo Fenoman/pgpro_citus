@@ -37,10 +37,10 @@
 #define CITUS_APPLICATION_NAME_PREFIX "citus_internal gpid="
 
 /* application name used for internal connections in rebalancer */
-#define CITUS_REBALANCER_NAME "citus_rebalancer"
+#define CITUS_REBALANCER_APPLICATION_NAME_PREFIX "citus_rebalancer gpid="
 
 /* application name used for connections made by run_command_on_* */
-#define CITUS_RUN_COMMAND_APPLICATION_NAME "citus_run_command"
+#define CITUS_RUN_COMMAND_APPLICATION_NAME_PREFIX "citus_run_command gpid="
 
 /* deal with waiteventset errors */
 #define WAIT_EVENT_SET_INDEX_NOT_INITIALIZED -1
@@ -189,8 +189,12 @@ typedef struct MultiConnection
 	/* information about the associated remote transaction */
 	RemoteTransaction remoteTransaction;
 
-	/* membership in list of in-progress transactions */
+	/*
+	 * membership in list of in-progress transactions and a flag to indicate
+	 * that the connection was added to this list
+	 */
 	dlist_node transactionNode;
+	bool transactionInProgress;
 
 	/* list of all placements referenced by this connection */
 	dlist_head referencedPlacements;

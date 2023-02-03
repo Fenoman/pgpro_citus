@@ -17,7 +17,6 @@
 #include "distributed/backend_data.h"
 #include "distributed/connection_management.h"
 #include "distributed/metadata_cache.h"
-#include "distributed/multi_client_executor.h"
 #include "distributed/multi_server_executor.h"
 #include "distributed/remote_commands.h"
 #include "distributed/utils/array_type.h"
@@ -30,9 +29,6 @@
 #include "miscadmin.h"
 #include "utils/builtins.h"
 
-
-#define SET_APPLICATION_NAME_QUERY \
-	"SET application_name TO '" CITUS_RUN_COMMAND_APPLICATION_NAME "'"
 
 PG_FUNCTION_INFO_V1(master_run_on_worker);
 
@@ -257,7 +253,10 @@ ExecuteCommandsInParallelAndStoreResults(StringInfo *nodeNameArray, int *nodePor
 		}
 
 		/* set the application_name to avoid nested execution checks */
-		int querySent = SendRemoteCommand(connection, SET_APPLICATION_NAME_QUERY);
+		int querySent = SendRemoteCommand(connection, psprintf(
+											  "SET application_name TO '%s%ld'",
+											  CITUS_RUN_COMMAND_APPLICATION_NAME_PREFIX,
+											  GetGlobalPID()));
 		if (querySent == 0)
 		{
 			StoreErrorMessage(connection, queryResultString);
@@ -445,9 +444,14 @@ ExecuteCommandsAndStoreResults(StringInfo *nodeNameArray, int *nodePortArray,
 			GetNodeConnection(connectionFlags, nodeName, nodePort);
 
 		/* set the application_name to avoid nested execution checks */
-		bool success = ExecuteOptionalSingleResultCommand(connection,
-														  SET_APPLICATION_NAME_QUERY,
-														  queryResultString);
+		bool success = ExecuteOptionalSingleResultCommand(
+			connection,
+			psprintf(
+				"SET application_name TO '%s%ld'",
+				CITUS_RUN_COMMAND_APPLICATION_NAME_PREFIX,
+				GetGlobalPID()),
+			queryResultString
+			);
 		if (!success)
 		{
 			statusArray[commandIndex] = false;

@@ -61,6 +61,7 @@
 #include "distributed/relation_access_tracking.h"
 #include "distributed/remote_commands.h"
 #include "distributed/resource_lock.h"
+#include "distributed/shard_cleaner.h"
 #include "distributed/shard_rebalancer.h"
 #include "distributed/shard_split.h"
 #include "distributed/shard_transfer.h"
@@ -105,8 +106,7 @@ static void CreateDistributedTableConcurrently(Oid relationId,
 											   char *colocateWithTableName,
 											   int shardCount,
 											   bool shardCountIsStrict);
-static char DecideReplicationModel(char distributionMethod, char *colocateWithTableName,
-								   bool viaDeprecatedAPI);
+static char DecideReplicationModel(char distributionMethod, char *colocateWithTableName);
 static List * HashSplitPointsForShardList(List *shardList);
 static List * HashSplitPointsForShardCount(int shardCount);
 static List * WorkerNodesForShardList(List *shardList);
@@ -116,19 +116,16 @@ static void CreateHashDistributedTableShards(Oid relationId, int shardCount,
 static uint32 ColocationIdForNewTable(Oid relationId, Var *distributionColumn,
 									  char distributionMethod, char replicationModel,
 									  int shardCount, bool shardCountIsStrict,
-									  char *colocateWithTableName,
-									  bool viaDeprecatedAPI);
+									  char *colocateWithTableName);
 static void EnsureRelationCanBeDistributed(Oid relationId, Var *distributionColumn,
 										   char distributionMethod, uint32 colocationId,
-										   char replicationModel, bool viaDeprecatedAPI);
+										   char replicationModel);
 static void EnsureLocalTableEmpty(Oid relationId);
 static void EnsureRelationHasNoTriggers(Oid relationId);
 static Oid SupportFunctionForColumn(Var *partitionColumn, Oid accessMethodId,
 									int16 supportFunctionNumber);
-static void EnsureLocalTableEmptyIfNecessary(Oid relationId, char distributionMethod,
-											 bool viaDeprecatedAPI);
-static bool ShouldLocalTableBeEmpty(Oid relationId, char distributionMethod, bool
-									viaDeprecatedAPI);
+static void EnsureLocalTableEmptyIfNecessary(Oid relationId, char distributionMethod);
+static bool ShouldLocalTableBeEmpty(Oid relationId, char distributionMethod);
 static void EnsureCitusTableCanBeCreated(Oid relationOid);
 static void PropagatePrerequisiteObjectsForDistributedTable(Oid relationId);
 static void EnsureDistributedSequencesHaveOneType(Oid relationId,
@@ -172,34 +169,13 @@ PG_FUNCTION_INFO_V1(create_reference_table);
 
 
 /*
- * master_create_distributed_table accepts a table, distribution column and
- * method and performs the corresponding catalog changes.
- *
- * Note that this UDF is deprecated and cannot create colocated tables, so we
- * always use INVALID_COLOCATION_ID.
+ * master_create_distributed_table is a deprecated predecessor to
+ * create_distributed_table
  */
 Datum
 master_create_distributed_table(PG_FUNCTION_ARGS)
 {
-	CheckCitusVersion(ERROR);
-	Oid relationId = PG_GETARG_OID(0);
-	text *distributionColumnText = PG_GETARG_TEXT_P(1);
-	Oid distributionMethodOid = PG_GETARG_OID(2);
-
-	EnsureCitusTableCanBeCreated(relationId);
-
-	char *colocateWithTableName = NULL;
-	bool viaDeprecatedAPI = true;
-
-	char *distributionColumnName = text_to_cstring(distributionColumnText);
-	Assert(distributionColumnName != NULL);
-
-	char distributionMethod = LookupDistributionMethod(distributionMethodOid);
-
-	CreateDistributedTable(relationId, distributionColumnName, distributionMethod,
-						   ShardCount, false, colocateWithTableName, viaDeprecatedAPI);
-
-	PG_RETURN_VOID();
+	ereport(ERROR, (errmsg("master_create_distributed_table has been deprecated")));
 }
 
 
@@ -217,7 +193,6 @@ create_distributed_table(PG_FUNCTION_ARGS)
 	{
 		PG_RETURN_VOID();
 	}
-	bool viaDeprecatedAPI = false;
 
 	Oid relationId = PG_GETARG_OID(0);
 	text *distributionColumnText = PG_GETARG_TEXT_P(1);
@@ -277,8 +252,7 @@ create_distributed_table(PG_FUNCTION_ARGS)
 	}
 
 	CreateDistributedTable(relationId, distributionColumnName, distributionMethod,
-						   shardCount, shardCountIsStrict, colocateWithTableName,
-						   viaDeprecatedAPI);
+						   shardCount, shardCountIsStrict, colocateWithTableName);
 
 	PG_RETURN_VOID();
 }
@@ -382,6 +356,8 @@ CreateDistributedTableConcurrently(Oid relationId, char *distributionColumnName,
 							   "citus.shard_replication_factor > 1")));
 	}
 
+	DropOrphanedResourcesInSeparateTransaction();
+
 	EnsureCitusTableCanBeCreated(relationId);
 
 	EnsureValidDistributionColumn(relationId, distributionColumnName);
@@ -401,10 +377,8 @@ CreateDistributedTableConcurrently(Oid relationId, char *distributionColumnName,
 
 	EnsureForeignKeysForDistributedTableConcurrently(relationId);
 
-	bool viaDeprecatedAPI = false;
 	char replicationModel = DecideReplicationModel(distributionMethod,
-												   colocateWithTableName,
-												   viaDeprecatedAPI);
+												   colocateWithTableName);
 
 	/*
 	 * we fail transaction before local table conversion if the table could not be colocated with
@@ -519,7 +493,7 @@ CreateDistributedTableConcurrently(Oid relationId, char *distributionColumnName,
 	}
 
 	EnsureRelationCanBeDistributed(relationId, distributionColumn, distributionMethod,
-								   colocationId, replicationModel, viaDeprecatedAPI);
+								   colocationId, replicationModel);
 
 	Oid colocatedTableId = InvalidOid;
 	if (colocationId != INVALID_COLOCATION_ID)
@@ -648,10 +622,8 @@ static void
 EnsureColocateWithTableIsValid(Oid relationId, char distributionMethod,
 							   char *distributionColumnName, char *colocateWithTableName)
 {
-	bool viaDeprecatedAPI = false;
 	char replicationModel = DecideReplicationModel(distributionMethod,
-												   colocateWithTableName,
-												   viaDeprecatedAPI);
+												   colocateWithTableName);
 
 	/*
 	 * we fail transaction before local table conversion if the table could not be colocated with
@@ -891,8 +863,6 @@ create_reference_table(PG_FUNCTION_ARGS)
 	char *colocateWithTableName = NULL;
 	char *distributionColumnName = NULL;
 
-	bool viaDeprecatedAPI = false;
-
 	EnsureCitusTableCanBeCreated(relationId);
 
 	/* enable create_reference_table on an empty node */
@@ -926,7 +896,7 @@ create_reference_table(PG_FUNCTION_ARGS)
 	}
 
 	CreateDistributedTable(relationId, distributionColumnName, DISTRIBUTE_BY_NONE,
-						   ShardCount, false, colocateWithTableName, viaDeprecatedAPI);
+						   ShardCount, false, colocateWithTableName);
 	PG_RETURN_VOID();
 }
 
@@ -987,16 +957,11 @@ EnsureRelationExists(Oid relationId)
  * safe to distribute the table, this function creates distributed table metadata,
  * creates shards and copies local data to shards. This function also handles
  * partitioned tables by distributing its partitions as well.
- *
- * viaDeprecatedAPI boolean flag is not optimal way to implement this function,
- * but it helps reducing code duplication a lot. We hope to remove that flag one
- * day, once we deprecate master_create_distribute_table completely.
  */
 void
 CreateDistributedTable(Oid relationId, char *distributionColumnName,
 					   char distributionMethod, int shardCount,
-					   bool shardCountIsStrict, char *colocateWithTableName,
-					   bool viaDeprecatedAPI)
+					   bool shardCountIsStrict, char *colocateWithTableName)
 {
 	/*
 	 * EnsureTableNotDistributed errors out when relation is a citus table but
@@ -1058,8 +1023,7 @@ CreateDistributedTable(Oid relationId, char *distributionColumnName,
 	PropagatePrerequisiteObjectsForDistributedTable(relationId);
 
 	char replicationModel = DecideReplicationModel(distributionMethod,
-												   colocateWithTableName,
-												   viaDeprecatedAPI);
+												   colocateWithTableName);
 
 	Var *distributionColumn = BuildDistributionKeyFromColumnName(relationId,
 																 distributionColumnName,
@@ -1072,11 +1036,10 @@ CreateDistributedTable(Oid relationId, char *distributionColumnName,
 	uint32 colocationId = ColocationIdForNewTable(relationId, distributionColumn,
 												  distributionMethod, replicationModel,
 												  shardCount, shardCountIsStrict,
-												  colocateWithTableName,
-												  viaDeprecatedAPI);
+												  colocateWithTableName);
 
 	EnsureRelationCanBeDistributed(relationId, distributionColumn, distributionMethod,
-								   colocationId, replicationModel, viaDeprecatedAPI);
+								   colocationId, replicationModel);
 
 	/*
 	 * Make sure that existing reference tables have been replicated to all the nodes
@@ -1112,16 +1075,6 @@ CreateDistributedTable(Oid relationId, char *distributionColumnName,
 	if (RegularTable(relationId))
 	{
 		CreateTruncateTrigger(relationId);
-	}
-
-	/*
-	 * If we are using master_create_distributed_table, we don't need to continue,
-	 * because deprecated API does not supports the following features.
-	 */
-	if (viaDeprecatedAPI)
-	{
-		Assert(colocateWithTableName == NULL);
-		return;
 	}
 
 	/* create shards for hash distributed and reference tables */
@@ -1167,7 +1120,7 @@ CreateDistributedTable(Oid relationId, char *distributionColumnName,
 		{
 			CreateDistributedTable(partitionRelationId, distributionColumnName,
 								   distributionMethod, shardCount, false,
-								   parentRelationName, viaDeprecatedAPI);
+								   parentRelationName);
 		}
 	}
 
@@ -1456,14 +1409,9 @@ DropFKeysRelationInvolvedWithTableType(Oid relationId, int tableTypeFlag)
  * used depending on given distribution configuration.
  */
 static char
-DecideReplicationModel(char distributionMethod, char *colocateWithTableName, bool
-					   viaDeprecatedAPI)
+DecideReplicationModel(char distributionMethod, char *colocateWithTableName)
 {
-	if (viaDeprecatedAPI)
-	{
-		return REPLICATION_MODEL_COORDINATOR;
-	}
-	else if (distributionMethod == DISTRIBUTE_BY_NONE)
+	if (distributionMethod == DISTRIBUTE_BY_NONE)
 	{
 		return REPLICATION_MODEL_2PC;
 	}
@@ -1557,16 +1505,12 @@ static uint32
 ColocationIdForNewTable(Oid relationId, Var *distributionColumn,
 						char distributionMethod, char replicationModel,
 						int shardCount, bool shardCountIsStrict,
-						char *colocateWithTableName, bool viaDeprecatedAPI)
+						char *colocateWithTableName)
 {
 	uint32 colocationId = INVALID_COLOCATION_ID;
 
-	if (viaDeprecatedAPI)
-	{
-		return colocationId;
-	}
-	else if (distributionMethod == DISTRIBUTE_BY_APPEND ||
-			 distributionMethod == DISTRIBUTE_BY_RANGE)
+	if (distributionMethod == DISTRIBUTE_BY_APPEND ||
+		distributionMethod == DISTRIBUTE_BY_RANGE)
 	{
 		if (pg_strncasecmp(colocateWithTableName, "default", NAMEDATALEN) != 0)
 		{
@@ -1660,18 +1604,21 @@ ColocationIdForNewTable(Oid relationId, Var *distributionColumn,
 static void
 EnsureRelationCanBeDistributed(Oid relationId, Var *distributionColumn,
 							   char distributionMethod, uint32 colocationId,
-							   char replicationModel, bool viaDeprecatedAPI)
+							   char replicationModel)
 {
 	Oid parentRelationId = InvalidOid;
 
-	EnsureLocalTableEmptyIfNecessary(relationId, distributionMethod, viaDeprecatedAPI);
+	EnsureLocalTableEmptyIfNecessary(relationId, distributionMethod);
 
 	/* user really wants triggers? */
-	if (!EnableUnsafeTriggers)
+	if (EnableUnsafeTriggers)
+	{
+		ErrorIfRelationHasUnsupportedTrigger(relationId);
+	}
+	else
 	{
 		EnsureRelationHasNoTriggers(relationId);
 	}
-
 
 	/* we assume callers took necessary locks */
 	Relation relation = relation_open(relationId, NoLock);
@@ -1680,16 +1627,9 @@ EnsureRelationCanBeDistributed(Oid relationId, Var *distributionColumn,
 
 	ErrorIfTableIsACatalogTable(relation);
 
-	/* verify target relation does not use identity columns */
-	if (RelationUsesIdentityColumns(relationDesc))
-	{
-		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						errmsg("cannot distribute relation: %s", relationName),
-						errdetail("Distributed relations must not use GENERATED "
-								  "... AS IDENTITY.")));
-	}
 
-	/* verify target relation is not distributed by a generated columns */
+	/* verify target relation is not distributed by a generated stored column
+	 */
 	if (distributionMethod != DISTRIBUTE_BY_NONE &&
 		DistributionColumnUsesGeneratedStoredColumn(relationDesc, distributionColumn))
 	{
@@ -1779,14 +1719,6 @@ EnsureRelationCanBeDistributed(Oid relationId, Var *distributionColumn,
 	 */
 	if (PartitionedTableNoLock(relationId))
 	{
-		/* we cannot distribute partitioned tables with master_create_distributed_table */
-		if (viaDeprecatedAPI)
-		{
-			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							errmsg("distributing partitioned tables in only supported "
-								   "with create_distributed_table UDF")));
-		}
-
 		/* distributing partitioned tables in only supported for hash-distribution */
 		if (distributionMethod != DISTRIBUTE_BY_HASH)
 		{
@@ -1854,10 +1786,9 @@ ErrorIfTableIsACatalogTable(Relation relation)
  * according to ShouldLocalTableBeEmpty but it is not.
  */
 static void
-EnsureLocalTableEmptyIfNecessary(Oid relationId, char distributionMethod,
-								 bool viaDeprecatedAPI)
+EnsureLocalTableEmptyIfNecessary(Oid relationId, char distributionMethod)
 {
-	if (ShouldLocalTableBeEmpty(relationId, distributionMethod, viaDeprecatedAPI))
+	if (ShouldLocalTableBeEmpty(relationId, distributionMethod))
 	{
 		EnsureLocalTableEmpty(relationId);
 	}
@@ -1873,17 +1804,11 @@ EnsureLocalTableEmptyIfNecessary(Oid relationId, char distributionMethod,
  * see whether we need to be ensure emptiness of local table.
  */
 static bool
-ShouldLocalTableBeEmpty(Oid relationId, char distributionMethod,
-						bool viaDeprecatedAPI)
+ShouldLocalTableBeEmpty(Oid relationId, char distributionMethod)
 {
 	bool shouldLocalTableBeEmpty = false;
-	if (viaDeprecatedAPI)
-	{
-		/* we don't support copying local data via deprecated API */
-		shouldLocalTableBeEmpty = true;
-	}
-	else if (distributionMethod != DISTRIBUTE_BY_HASH &&
-			 distributionMethod != DISTRIBUTE_BY_NONE)
+	if (distributionMethod != DISTRIBUTE_BY_HASH &&
+		distributionMethod != DISTRIBUTE_BY_NONE)
 	{
 		/*
 		 * We only support hash distributed tables and reference tables
@@ -2409,27 +2334,6 @@ TupleDescColumnNameList(TupleDesc tupleDescriptor)
 	}
 
 	return columnNameList;
-}
-
-
-/*
- * RelationUsesIdentityColumns returns whether a given relation uses
- * GENERATED ... AS IDENTITY
- */
-bool
-RelationUsesIdentityColumns(TupleDesc relationDesc)
-{
-	for (int attributeIndex = 0; attributeIndex < relationDesc->natts; attributeIndex++)
-	{
-		Form_pg_attribute attributeForm = TupleDescAttr(relationDesc, attributeIndex);
-
-		if (attributeForm->attidentity != '\0')
-		{
-			return true;
-		}
-	}
-
-	return false;
 }
 
 

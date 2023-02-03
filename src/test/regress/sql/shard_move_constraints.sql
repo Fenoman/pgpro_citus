@@ -150,7 +150,7 @@ indrelid IN
 \c - - - :master_port
 -- make sure that constrainst are moved sanely with logical replication
 SELECT citus_move_shard_placement(8970000, 'localhost', :worker_1_port, 'localhost', :worker_2_port, shard_transfer_mode:='force_logical');
-CALL citus_cleanup_orphaned_shards();
+SELECT public.wait_for_resource_cleanup();
 
 
 \c - postgres - :worker_2_port
@@ -249,16 +249,30 @@ CREATE INDEX ii10 ON multiple_unique_keys(a,b,c);
 SELECT create_distributed_table('multiple_unique_keys', 'key', colocate_with:='sensors');
 INSERT INTO multiple_unique_keys SELECT i,i,i,i,i,i,i,i,i FROM generate_series(0,1000)i;
 
+SELECT nodeid AS worker_1_node FROM pg_dist_node WHERE nodeport=:worker_1_port \gset
+SELECT nodeid AS worker_2_node FROM pg_dist_node WHERE nodeport=:worker_2_port \gset
+
 -- make sure that both online and offline rebalance operations succeed
-SELECT citus_move_shard_placement(8970000, 'localhost', :worker_2_port, 'localhost', :worker_1_port, 'force_logical');
-SELECT citus_move_shard_placement(8970000, 'localhost', :worker_1_port, 'localhost', :worker_2_port, 'block_writes');
+SELECT citus_move_shard_placement(8970000, :worker_2_node, :worker_1_node, 'force_logical');
+SELECT citus_move_shard_placement(8970000, :worker_1_node, :worker_2_node, 'block_writes');
 
 -- even on another schema
 SET search_path TO public;
-SELECT citus_move_shard_placement(8970000, 'localhost', :worker_2_port, 'localhost', :worker_1_port, 'force_logical');
-SELECT citus_move_shard_placement(8970000, 'localhost', :worker_1_port, 'localhost', :worker_2_port, 'block_writes');
+SELECT citus_move_shard_placement(8970000, :worker_2_node, :worker_1_node, 'force_logical');
+SELECT citus_move_shard_placement(8970000, :worker_1_node, :worker_2_node, 'block_writes');
+
+SELECT public.wait_for_resource_cleanup();
 
 \c - postgres - :master_port
+
+-- create a fake cleanup record
+INSERT INTO pg_dist_cleanup
+    SELECT nextval('pg_dist_cleanup_recordid_seq'), 0, 1, shard_name(logicalrelid, shardid) AS object_name, -13 AS node_group_id, 0
+        FROM pg_dist_shard WHERE shardid = 8970000;
+-- make sure we error out if there's a cleanup record for the shard to be moved
+SELECT citus_move_shard_placement(8970000, 'localhost', :worker_2_port, 'localhost', :worker_1_port, 'force_logical');
+-- delete the fake record
+DELETE FROM pg_dist_cleanup WHERE node_group_id = -13;
 
 -- stop and re-sync the metadata to make sure all works fine
 SELECT stop_metadata_sync_to_node('localhost', :worker_1_port);
@@ -267,3 +281,4 @@ SELECT start_metadata_sync_to_node('localhost', :worker_1_port);
 SELECT start_metadata_sync_to_node('localhost', :worker_2_port);
 
 DROP SCHEMA "shard Move Fkeys Indexes" CASCADE;
+DROP ROLE mx_rebalancer_role_ent;

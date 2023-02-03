@@ -16,7 +16,7 @@ test: multi_behavioral_analytics_basics multi_behavioral_analytics_single_shard_
 test: multi_shard_update_delete recursive_dml_with_different_planners_executors
 test: insert_select_repartition window_functions dml_recursive multi_insert_select_window
 test: multi_insert_select_conflict citus_table_triggers
-test: multi_row_insert insert_select_into_local_table multi_create_table_new_features
+test: multi_row_insert insert_select_into_local_table
 test: multi_agg_approximate_distinct
 test: tablespace
 
@@ -54,11 +54,12 @@ test: subqueries_deep subquery_view subquery_partitioning subqueries_not_support
 test: subquery_in_targetlist subquery_in_where subquery_complex_target_list subquery_append
 test: subquery_prepared_statements
 test: non_colocated_leaf_subquery_joins non_colocated_subquery_joins
-test: cte_inline recursive_view_local_table values sequences_with_different_types
+test: cte_inline recursive_view_local_table values sequences_with_different_types multi_level_recursive_queries
 test: pg13 pg12
 # run pg14 sequentially as it syncs metadata
 test: pg14
-test: pg15 pg15_jsonpath detect_conn_close
+test: pg15
+test: pg15_jsonpath detect_conn_close
 test: drop_column_partitioned_table
 test: tableam
 
@@ -94,12 +95,18 @@ test: multi_dropped_column_aliases foreign_key_restriction_enforcement
 test: binary_protocol
 test: alter_table_set_access_method
 test: alter_distributed_table
-test: issue_5248 issue_5099
+test: issue_5248 issue_5099 issue_5763 issue_6543
 test: object_propagation_debug
 test: undistribute_table
 test: run_command_on_all_nodes
 test: background_task_queue_monitor
 
+# Causal clock test
+test: clock
+
+# MERGE tests
+test: merge
+test: pgmerge
 
 # ---------
 # test that no tests leaked intermediate results. This should always be last
@@ -112,3 +119,6 @@ test: ensure_no_intermediate_data_leak
 # --------
 test: ensure_no_shared_connection_leak
 test: check_mx
+
+test: generated_identity
+test: drop_database

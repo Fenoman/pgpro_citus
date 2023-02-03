@@ -29,6 +29,7 @@
 #include "distributed/deparse_shard_query.h"
 #include "distributed/distribution_column.h"
 #include "distributed/foreign_key_relationship.h"
+#include "distributed/local_executor.h"
 #include "distributed/listutils.h"
 #include "distributed/metadata_sync.h"
 #include "distributed/metadata/dependency.h"
@@ -40,6 +41,7 @@
 #include "distributed/resource_lock.h"
 #include "distributed/version_compat.h"
 #include "distributed/worker_shard_visibility.h"
+#include "foreign/foreign.h"
 #include "lib/stringinfo.h"
 #include "nodes/parsenodes.h"
 #include "parser/parse_expr.h"
@@ -102,6 +104,8 @@ static List * InterShardDDLTaskList(Oid leftRelationId, Oid rightRelationId,
 									const char *commandString);
 static bool AlterInvolvesPartitionColumn(AlterTableStmt *alterTableStatement,
 										 AlterTableCmd *command);
+static bool AlterColumnInvolvesIdentityColumn(AlterTableStmt *alterTableStatement,
+											  AlterTableCmd *command);
 static void ErrorIfUnsupportedAlterAddConstraintStmt(AlterTableStmt *alterTableStatement);
 static List * CreateRightShardListForInterShardDDLTask(Oid rightRelationId,
 													   Oid leftRelationId,
@@ -113,10 +117,11 @@ static void SetInterShardDDLTaskRelationShardList(Task *task,
 												  ShardInterval *leftShardInterval,
 												  ShardInterval *rightShardInterval);
 static Oid get_attrdef_oid(Oid relationId, AttrNumber attnum);
-static char * GetAlterColumnWithNextvalDefaultCmd(Oid sequenceOid, Oid relationId,
-												  char *colname);
+
 static char * GetAddColumnWithNextvalDefaultCmd(Oid sequenceOid, Oid relationId,
 												char *colname, TypeName *typeName);
+static void ErrorIfAlterTableDropTableNameFromPostgresFdw(List *optionList, Oid
+														  relationId);
 
 
 /*
@@ -391,14 +396,13 @@ PostprocessCreateTableStmtPartitionOf(CreateStmt *createStatement, const
 			ColumnToColumnName(parentRelationId, (Node *) parentDistributionColumn);
 		char parentDistributionMethod = DISTRIBUTE_BY_HASH;
 		char *parentRelationName = generate_qualified_relation_name(parentRelationId);
-		bool viaDeprecatedAPI = false;
 
 		SwitchToSequentialAndLocalExecutionIfPartitionNameTooLong(parentRelationId,
 																  relationId);
 
 		CreateDistributedTable(relationId, distributionColumnName,
 							   parentDistributionMethod, ShardCount, false,
-							   parentRelationName, viaDeprecatedAPI);
+							   parentRelationName);
 	}
 }
 
@@ -598,14 +602,13 @@ DistributePartitionUsingParent(Oid parentCitusRelationId, Oid partitionRelationI
 
 	char distributionMethod = DISTRIBUTE_BY_HASH;
 	char *parentRelationName = generate_qualified_relation_name(parentCitusRelationId);
-	bool viaDeprecatedAPI = false;
 
 	SwitchToSequentialAndLocalExecutionIfPartitionNameTooLong(
 		parentCitusRelationId, partitionRelationId);
 
 	CreateDistributedTable(partitionRelationId, distributionColumnName,
 						   distributionMethod, ShardCount, false,
-						   parentRelationName, viaDeprecatedAPI);
+						   parentRelationName);
 }
 
 
@@ -699,6 +702,331 @@ PostprocessAlterTableSchemaStmt(Node *node, const char *queryString)
 	EnsureAllObjectDependenciesExistOnAllNodes(tableAddresses);
 
 	return NIL;
+}
+
+
+/*
+ * ChooseForeignKeyConstraintNameAddition returns the string of column names to be used when generating a foreign
+ * key constraint name. This function is copied from postgres codebase.
+ */
+static char *
+ChooseForeignKeyConstraintNameAddition(List *columnNames)
+{
+	char buf[NAMEDATALEN * 2];
+	int buflen = 0;
+
+	buf[0] = '\0';
+
+	String *columnNameString = NULL;
+
+	foreach_ptr(columnNameString, columnNames)
+	{
+		const char *name = strVal(columnNameString);
+
+		if (buflen > 0)
+		{
+			buf[buflen++] = '_';                                                                        /* insert _ between names */
+		}
+
+		/*
+		 *  At this point we have buflen <= NAMEDATALEN.  name should be less
+		 *  than NAMEDATALEN already, but use strlcpy for paranoia.
+		 */
+		strlcpy(buf + buflen, name, NAMEDATALEN);
+		buflen += strlen(buf + buflen);
+		if (buflen >= NAMEDATALEN)
+		{
+			break;
+		}
+	}
+	return pstrdup(buf);
+}
+
+
+/*
+ * GenerateConstraintName creates and returns a default name for the constraints Citus supports
+ * for default naming. See ConstTypeCitusCanDefaultName function for the supported constraint types.
+ */
+static char *
+GenerateConstraintName(const char *tableName, Oid namespaceId, Constraint *constraint)
+{
+	char *conname = NULL;
+
+	switch (constraint->contype)
+	{
+		case CONSTR_PRIMARY:
+		{
+			conname = ChooseIndexName(tableName, namespaceId,
+									  NULL, NULL, true, true);
+			break;
+		}
+
+		case CONSTR_UNIQUE:
+		{
+			ListCell *lc;
+			List *indexParams = NIL;
+
+			foreach(lc, constraint->keys)
+			{
+				IndexElem *iparam = makeNode(IndexElem);
+				iparam->name = pstrdup(strVal(lfirst(lc)));
+				indexParams = lappend(indexParams, iparam);
+			}
+
+			conname = ChooseIndexName(tableName, namespaceId,
+									  ChooseIndexColumnNames(indexParams),
+									  NULL, false, true);
+			break;
+		}
+
+		case CONSTR_EXCLUSION:
+		{
+			ListCell *lc;
+			List *indexParams = NIL;
+			List *excludeOpNames = NIL;
+
+			foreach(lc, constraint->exclusions)
+			{
+				List *pair = (List *) lfirst(lc);
+
+				Assert(list_length(pair) == 2);
+				IndexElem *elem = linitial_node(IndexElem, pair);
+				List *opname = lsecond_node(List, pair);
+
+				indexParams = lappend(indexParams, elem);
+				excludeOpNames = lappend(excludeOpNames, opname);
+			}
+
+			conname = ChooseIndexName(tableName, namespaceId,
+									  ChooseIndexColumnNames(indexParams),
+									  excludeOpNames,
+									  false, true);
+			break;
+		}
+
+		case CONSTR_CHECK:
+		{
+			conname = ChooseConstraintName(tableName, NULL, "check", namespaceId, NIL);
+
+			break;
+		}
+
+		case CONSTR_FOREIGN:
+		{
+			conname = ChooseConstraintName(tableName,
+										   ChooseForeignKeyConstraintNameAddition(
+											   constraint->fk_attrs),
+										   "fkey",
+										   namespaceId,
+										   NIL);
+			break;
+		}
+
+		default:
+		{
+			ereport(ERROR, (errmsg(
+								"unsupported constraint type for generating a constraint name: %d",
+								constraint->contype)));
+			break;
+		}
+	}
+
+	return conname;
+}
+
+
+/*
+ * EnsureSequentialModeForAlterTableOperation makes sure that the current transaction is already in
+ * sequential mode, or can still safely be put in sequential mode, it errors if that is
+ * not possible. The error contains information for the user to retry the transaction with
+ * sequential mode set from the beginning.
+ */
+static void
+EnsureSequentialModeForAlterTableOperation(void)
+{
+	const char *objTypeString = "ALTER TABLE ... ADD FOREIGN KEY";
+
+	if (ParallelQueryExecutedInTransaction())
+	{
+		ereport(ERROR, (errmsg("cannot run %s command because there was a "
+							   "parallel operation on a distributed table in the "
+							   "transaction", objTypeString),
+						errdetail("When running command on/for a distributed %s, Citus "
+								  "needs to perform all operations over a single "
+								  "connection per node to ensure consistency.",
+								  objTypeString),
+						errhint("Try re-running the transaction with "
+								"\"SET LOCAL citus.multi_shard_modify_mode TO "
+								"\'sequential\';\"")));
+	}
+
+	ereport(DEBUG1, (errmsg("switching to sequential query execution mode"),
+					 errdetail(
+						 "A command for a distributed %s is run. To make sure subsequent "
+						 "commands see the %s correctly we need to make sure to "
+						 "use only one connection for all future commands",
+						 objTypeString, objTypeString)));
+
+	SetLocalMultiShardModifyModeToSequential();
+}
+
+
+/*
+ * SwitchToSequentialAndLocalExecutionIfConstraintNameTooLong generates the longest index constraint name
+ * among the shards of the partitions, and if exceeds the limit switches to sequential and
+ * local execution to prevent self-deadlocks.
+ */
+static void
+SwitchToSequentialAndLocalExecutionIfConstraintNameTooLong(Oid relationId,
+														   Constraint *constraint)
+{
+	if (!PartitionedTable(relationId))
+	{
+		/* Citus already handles long names for regular tables */
+		return;
+	}
+
+	if (ShardIntervalCount(relationId) == 0)
+	{
+		/*
+		 * Relation has no shards, so we cannot run into "long shard index
+		 * name" issue.
+		 */
+		return;
+	}
+
+	Oid longestNamePartitionId = PartitionWithLongestNameRelationId(relationId);
+
+	if (!OidIsValid(longestNamePartitionId))
+	{
+		/* no partitions have been created yet */
+		return;
+	}
+
+	char *longestPartitionShardName = get_rel_name(longestNamePartitionId);
+	ShardInterval *shardInterval = LoadShardIntervalWithLongestShardName(
+		longestNamePartitionId);
+
+	AppendShardIdToName(&longestPartitionShardName, shardInterval->shardId);
+
+
+	Relation rel = RelationIdGetRelation(longestNamePartitionId);
+	Oid namespaceOid = RelationGetNamespace(rel);
+	RelationClose(rel);
+
+	char *longestConname = GenerateConstraintName(longestPartitionShardName,
+												  namespaceOid, constraint);
+
+	if (longestConname && strnlen(longestConname, NAMEDATALEN) >= NAMEDATALEN - 1)
+	{
+		if (ParallelQueryExecutedInTransaction())
+		{
+			/*
+			 * If there has already been a parallel query executed, the sequential mode
+			 * would still use the already opened parallel connections to the workers,
+			 * thus contradicting our purpose of using sequential mode.
+			 */
+			ereport(ERROR, (errmsg(
+								"The constraint name (%s) on a shard is too long and could lead "
+								"to deadlocks when executed in a transaction "
+								"block after a parallel query", longestConname),
+							errhint("Try re-running the transaction with "
+									"\"SET LOCAL citus.multi_shard_modify_mode TO "
+									"\'sequential\';\"")));
+		}
+		else
+		{
+			elog(DEBUG1, "the constraint name on the shards of the partition "
+						 "is too long, switching to sequential and local execution "
+						 "mode to prevent self deadlocks: %s", longestConname);
+
+			SetLocalMultiShardModifyModeToSequential();
+			SetLocalExecutionStatus(LOCAL_EXECUTION_REQUIRED);
+		}
+	}
+}
+
+
+/*
+ * PreprocessAlterTableAddConstraint creates a new constraint name for {PRIMARY KEY, UNIQUE, EXCLUDE, CHECK, FOREIGN KEY}
+ * and changes the original alterTableCommand run by the standard utility hook to use the new constraint name.
+ * Then it converts the ALTER TABLE ... ADD {PRIMARY KEY, UNIQUE, EXCLUDE, CHECK, FOREIGN KEY} ... command
+ * into ALTER TABLE ... ADD CONSTRAINT <constraint name> {PRIMARY KEY, UNIQUE, EXCLUDE, CHECK, FOREIGN KEY} format and returns the DDLJob
+ * to run this command in the workers.
+ */
+static List *
+PreprocessAlterTableAddConstraint(AlterTableStmt *alterTableStatement, Oid
+								  relationId,
+								  Constraint *constraint)
+{
+	/*
+	 * We should only preprocess an ADD CONSTRAINT command if we have empty conname
+	 * This only happens when we have to create a constraint name in citus since the client does
+	 * not specify a name.
+	 * indexname should also be NULL to make sure this is not an
+	 * ADD {PRIMARY KEY, UNIQUE} USING INDEX command
+	 * which doesn't need a conname since the indexname will be used
+	 */
+	Assert(constraint->conname == NULL && constraint->indexname == NULL);
+
+	Relation rel = RelationIdGetRelation(relationId);
+
+	/*
+	 * Change the alterTableCommand so that the standard utility
+	 * hook runs it with the name we created.
+	 */
+
+	constraint->conname = GenerateConstraintName(RelationGetRelationName(rel),
+												 RelationGetNamespace(rel),
+												 constraint);
+
+	RelationClose(rel);
+
+	SwitchToSequentialAndLocalExecutionIfConstraintNameTooLong(relationId, constraint);
+
+	char *ddlCommand = DeparseTreeNode((Node *) alterTableStatement);
+
+	DDLJob *ddlJob = palloc0(sizeof(DDLJob));
+
+	ObjectAddressSet(ddlJob->targetObjectAddress, RelationRelationId, relationId);
+	ddlJob->startNewTransaction = false;
+	ddlJob->metadataSyncCommand = ddlCommand;
+
+
+	if (constraint->contype == CONSTR_FOREIGN)
+	{
+		Oid rightRelationId = RangeVarGetRelid(constraint->pktable, NoLock,
+											   false);
+
+		if (IsCitusTableType(rightRelationId, REFERENCE_TABLE))
+		{
+			EnsureSequentialModeForAlterTableOperation();
+		}
+
+		/*
+		 * If one of the relations involved in the FOREIGN KEY constraint is not a distributed table, citus errors out eventually.
+		 * PreprocessAlterTableStmt function returns an empty tasklist in those cases.
+		 * leftRelation is checked in PreprocessAlterTableStmt before
+		 * calling PreprocessAlterTableAddConstraint. However, we need to handle the rightRelation since PreprocessAlterTableAddConstraint
+		 * returns early.
+		 */
+		bool referencedIsLocalTable = !IsCitusTable(rightRelationId);
+		if (referencedIsLocalTable)
+		{
+			ddlJob->taskList = NIL;
+		}
+		else
+		{
+			ddlJob->taskList = InterShardDDLTaskList(relationId, rightRelationId,
+													 ddlCommand);
+		}
+	}
+	else
+	{
+		ddlJob->taskList = DDLTaskList(relationId, ddlCommand);
+	}
+
+	return list_make1(ddlJob);
 }
 
 
@@ -940,6 +1268,33 @@ PreprocessAlterTableStmt(Node *node, const char *alterTableCommand,
 				 * transaction is in process, which causes deadlock.
 				 */
 				constraint->skip_validation = true;
+
+				if (constraint->conname == NULL)
+				{
+					return PreprocessAlterTableAddConstraint(alterTableStatement,
+															 leftRelationId,
+															 constraint);
+				}
+			}
+			/*
+			 * When constraint->indexname is not NULL we are handling an
+			 * ADD {PRIMARY KEY, UNIQUE} USING INDEX command. In this case
+			 * we do not have to create a name and change the command.
+			 * The existing index name will be used by the postgres.
+			 */
+			else if (constraint->conname == NULL && constraint->indexname == NULL)
+			{
+				if (ConstrTypeCitusCanDefaultName(constraint->contype))
+				{
+					/*
+					 * Create a constraint name. Convert ALTER TABLE ... ADD PRIMARY ... command into
+					 * ALTER TABLE ... ADD CONSTRAINT <conname> PRIMARY KEY ... form and create the ddl jobs
+					 * for running this form of the command on the workers.
+					 */
+					return PreprocessAlterTableAddConstraint(alterTableStatement,
+															 leftRelationId,
+															 constraint);
+				}
 			}
 		}
 		else if (alterTableType == AT_DropConstraint)
@@ -1020,6 +1375,30 @@ PreprocessAlterTableStmt(Node *node, const char *alterTableCommand,
 							newCmd->def = (Node *) newColDef;
 						}
 					}
+				}
+			}
+
+			/*
+			 * We check for ADD COLUMN .. GENERATED .. AS IDENTITY expr
+			 * since it uses a sequence as an internal dependency
+			 * we should deparse the statement
+			 */
+			constraint = NULL;
+			foreach_ptr(constraint, columnConstraints)
+			{
+				if (constraint->contype == CONSTR_IDENTITY)
+				{
+					deparseAT = true;
+					useInitialDDLCommandString = false;
+
+					/*
+					 * Since we don't support constraints for AT_AddColumn
+					 * we have to set is_not_null to true explicitly for identity columns
+					 */
+					ColumnDef *newColDef = copyObject(columnDefinition);
+					newColDef->constraints = NULL;
+					newColDef->is_not_null = true;
+					newCmd->def = (Node *) newColDef;
 				}
 			}
 
@@ -1690,6 +2069,20 @@ ConstrTypeUsesIndex(ConstrType constrType)
 
 
 /*
+ * ConstrTypeSupportsDefaultNaming returns true if we can generate a default name for the given constraint type
+ */
+bool
+ConstrTypeCitusCanDefaultName(ConstrType constrType)
+{
+	return constrType == CONSTR_PRIMARY ||
+		   constrType == CONSTR_UNIQUE ||
+		   constrType == CONSTR_EXCLUSION ||
+		   constrType == CONSTR_CHECK ||
+		   constrType == CONSTR_FOREIGN;
+}
+
+
+/*
  * AlterTableDropsForeignKey returns true if the given AlterTableStmt drops
  * a foreign key. False otherwise.
  */
@@ -1875,7 +2268,8 @@ PreprocessAlterTableSchemaStmt(Node *node, const char *queryString,
  * ALTER TABLE ... ADD FOREIGN KEY command to skip the validation step.
  */
 void
-SkipForeignKeyValidationIfConstraintIsFkey(AlterTableStmt *alterTableStatement)
+SkipForeignKeyValidationIfConstraintIsFkey(AlterTableStmt *alterTableStatement,
+										   bool processLocalRelation)
 {
 	/* first check whether a distributed relation is affected */
 	if (alterTableStatement->relation == NULL)
@@ -1890,11 +2284,17 @@ SkipForeignKeyValidationIfConstraintIsFkey(AlterTableStmt *alterTableStatement)
 		return;
 	}
 
-	if (!IsCitusTable(leftRelationId))
+	if (!IsCitusTable(leftRelationId) && !processLocalRelation)
 	{
 		return;
 	}
 
+	/*
+	 * We check if there is a ADD FOREIGN CONSTRAINT command in sub commands
+	 * list. We set skip_validation to true to prevent PostgreSQL to verify
+	 * validity of the foreign constraint. Validity will be checked on the
+	 * shards anyway.
+	 */
 	AlterTableCmd *command = NULL;
 	foreach_ptr(command, alterTableStatement->cmds)
 	{
@@ -1906,9 +2306,8 @@ SkipForeignKeyValidationIfConstraintIsFkey(AlterTableStmt *alterTableStatement)
 			Constraint *constraint = (Constraint *) command->def;
 			if (constraint->contype == CONSTR_FOREIGN)
 			{
-				/* set the GUC skip_constraint_validation to on */
-				EnableSkippingConstraintValidation();
-				return;
+				/* foreign constraint validations will be done in shards. */
+				constraint->skip_validation = true;
 			}
 		}
 	}
@@ -2140,6 +2539,34 @@ PostprocessAlterTableStmt(AlterTableStmt *alterTableStatement)
 					}
 				}
 			}
+
+			/*
+			 * We check for ADD COLUMN .. GENERATED AS IDENTITY expr
+			 * since it uses a seqeunce as an internal dependency
+			 */
+			constraint = NULL;
+			foreach_ptr(constraint, columnConstraints)
+			{
+				if (constraint->contype == CONSTR_IDENTITY)
+				{
+					AttrNumber attnum = get_attnum(relationId,
+												   columnDefinition->colname);
+					bool missing_ok = false;
+					Oid seqOid = getIdentitySequence(relationId, attnum, missing_ok);
+
+					if (ShouldSyncTableMetadata(relationId))
+					{
+						needMetadataSyncForNewSequences = true;
+						alterTableDefaultNextvalCmd =
+							GetAddColumnWithNextvalDefaultCmd(seqOid,
+															  relationId,
+															  columnDefinition
+															  ->colname,
+															  columnDefinition
+															  ->typeName);
+					}
+				}
+			}
 		}
 		/*
 		 * We check for ALTER COLUMN .. SET DEFAULT nextval('user_defined_seq')
@@ -2161,8 +2588,9 @@ PostprocessAlterTableStmt(AlterTableStmt *alterTableStatement)
 					if (ShouldSyncTableMetadata(relationId))
 					{
 						needMetadataSyncForNewSequences = true;
+						bool missingTableOk = false;
 						alterTableDefaultNextvalCmd = GetAlterColumnWithNextvalDefaultCmd(
-							seqOid, relationId, command->name);
+							seqOid, relationId, command->name, missingTableOk);
 					}
 				}
 			}
@@ -2350,8 +2778,9 @@ get_attrdef_oid(Oid relationId, AttrNumber attnum)
  * ALTER TABLE ALTER COLUMN .. SET DEFAULT nextval()
  * If sequence type is not bigint, we use worker_nextval() instead of nextval().
  */
-static char *
-GetAlterColumnWithNextvalDefaultCmd(Oid sequenceOid, Oid relationId, char *colname)
+char *
+GetAlterColumnWithNextvalDefaultCmd(Oid sequenceOid, Oid relationId, char *colname, bool
+									missingTableOk)
 {
 	char *qualifiedSequenceName = generate_qualified_relation_name(sequenceOid);
 	char *qualifiedRelationName = generate_qualified_relation_name(relationId);
@@ -2370,9 +2799,18 @@ GetAlterColumnWithNextvalDefaultCmd(Oid sequenceOid, Oid relationId, char *colna
 
 	StringInfoData str = { 0 };
 	initStringInfo(&str);
-	appendStringInfo(&str, "ALTER TABLE %s ALTER COLUMN %s "
+
+	appendStringInfo(&str, "ALTER TABLE ");
+
+	if (missingTableOk)
+	{
+		appendStringInfo(&str, "IF EXISTS ");
+	}
+
+	appendStringInfo(&str, "%s ALTER COLUMN %s "
 						   "SET DEFAULT %s(%s::regclass)",
-					 qualifiedRelationName, colname,
+					 qualifiedRelationName,
+					 colname,
 					 quote_qualified_identifier("pg_catalog", nextvalFunctionName),
 					 quote_literal_cstr(qualifiedSequenceName));
 
@@ -2644,6 +3082,42 @@ ErrorIfUnsupportedConstraint(Relation relation, char distributionMethod,
 
 
 /*
+ * ErrorIfAlterTableDropTableNameFromPostgresFdw errors if given alter foreign table
+ * option list drops 'table_name' from a postgresfdw foreign table which is
+ * inside metadata.
+ */
+static void
+ErrorIfAlterTableDropTableNameFromPostgresFdw(List *optionList, Oid relationId)
+{
+	char relationKind PG_USED_FOR_ASSERTS_ONLY =
+		get_rel_relkind(relationId);
+	Assert(relationKind == RELKIND_FOREIGN_TABLE);
+
+	ForeignTable *foreignTable = GetForeignTable(relationId);
+	Oid serverId = foreignTable->serverid;
+	if (!ServerUsesPostgresFdw(serverId))
+	{
+		return;
+	}
+
+	if (IsCitusTableType(relationId, CITUS_LOCAL_TABLE) &&
+		ForeignTableDropsTableNameOption(optionList))
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg(
+					 "alter foreign table alter options (drop table_name) command "
+					 "is not allowed for Citus tables"),
+				 errdetail(
+					 "Table_name option can not be dropped from a foreign table "
+					 "which is inside metadata."),
+				 errhint(
+					 "Try to undistribute foreign table before dropping table_name option.")));
+	}
+}
+
+
+/*
  * ErrorIfUnsupportedAlterTableStmt checks if the corresponding alter table
  * statement is supported for distributed tables and errors out if it is not.
  * Currently, only the following commands are supported.
@@ -2741,6 +3215,26 @@ ErrorIfUnsupportedAlterTableStmt(AlterTableStmt *alterTableStatement)
 							}
 						}
 					}
+
+
+					Constraint *columnConstraint = NULL;
+					foreach_ptr(columnConstraint, column->constraints)
+					{
+						if (columnConstraint->contype == CONSTR_IDENTITY)
+						{
+							/*
+							 * Currently we don't support backfilling the new identity column with default values
+							 * if the table is not empty
+							 */
+							if (!TableEmpty(relationId))
+							{
+								ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+												errmsg(
+													"Cannot add an identity column because the table is not empty")));
+							}
+						}
+					}
+
 
 					List *columnConstraints = column->constraints;
 
@@ -2840,8 +3334,21 @@ ErrorIfUnsupportedAlterTableStmt(AlterTableStmt *alterTableStatement)
 
 				/*
 				 * We check for ALTER COLUMN TYPE ...
+				 * if the column is an identity column,
+				 * changing the type of the column
+				 * should not be allowed for now
+				 */
+				if (AlterColumnInvolvesIdentityColumn(alterTableStatement, command))
+				{
+					ereport(ERROR, (errmsg("cannot execute ALTER COLUMN command "
+										   "involving identity column")));
+				}
+
+				/*
+				 * We check for ALTER COLUMN TYPE ...
 				 * if the column has default coming from a user-defined sequence
-				 * changing the type of the column should not be allowed for now
+				 * changing the type of the column
+				 * should not be allowed for now
 				 */
 				AttrNumber attnum = get_attnum(relationId, command->name);
 				List *seqInfoList = NIL;
@@ -2868,8 +3375,6 @@ ErrorIfUnsupportedAlterTableStmt(AlterTableStmt *alterTableStatement)
 
 			case AT_AddConstraint:
 			{
-				Constraint *constraint = (Constraint *) command->def;
-
 				/* we only allow constraints if they are only subcommand */
 				if (commandList->length > 1)
 				{
@@ -2877,17 +3382,6 @@ ErrorIfUnsupportedAlterTableStmt(AlterTableStmt *alterTableStatement)
 									errmsg("cannot execute ADD CONSTRAINT command with "
 										   "other subcommands"),
 									errhint("You can issue each subcommand separately")));
-				}
-
-				/*
-				 * We will use constraint name in each placement by extending it at
-				 * workers. Therefore we require it to be exist.
-				 */
-				if (constraint->conname == NULL)
-				{
-					ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-									errmsg("cannot create constraint without a name on a "
-										   "distributed table")));
 				}
 
 				break;
@@ -2994,6 +3488,9 @@ ErrorIfUnsupportedAlterTableStmt(AlterTableStmt *alterTableStatement)
 				break;
 			}
 
+#if PG_VERSION_NUM >= PG_VERSION_15
+			case AT_SetAccessMethod:
+#endif
 			case AT_SetNotNull:
 			case AT_ReplicaIdentity:
 			case AT_ChangeOwner:
@@ -3009,6 +3506,7 @@ ErrorIfUnsupportedAlterTableStmt(AlterTableStmt *alterTableStatement)
 				{
 					/*
 					 * We will not perform any special check for:
+					 * ALTER TABLE .. SET ACCESS METHOD ..
 					 * ALTER TABLE .. ALTER COLUMN .. SET NOT NULL
 					 * ALTER TABLE .. REPLICA IDENTITY ..
 					 * ALTER TABLE .. VALIDATE CONSTRAINT ..
@@ -3031,6 +3529,8 @@ ErrorIfUnsupportedAlterTableStmt(AlterTableStmt *alterTableStatement)
 			{
 				if (IsForeignTable(relationId))
 				{
+					List *optionList = (List *) command->def;
+					ErrorIfAlterTableDropTableNameFromPostgresFdw(optionList, relationId);
 					break;
 				}
 			}
@@ -3333,6 +3833,41 @@ SetInterShardDDLTaskRelationShardList(Task *task, ShardInterval *leftShardInterv
 	rightRelationShard->shardId = rightShardInterval->shardId;
 
 	task->relationShardList = list_make2(leftRelationShard, rightRelationShard);
+}
+
+
+/*
+ * AlterColumnInvolvesIdentityColumn checks if the given alter column command
+ * involves relation's identity column.
+ */
+static bool
+AlterColumnInvolvesIdentityColumn(AlterTableStmt *alterTableStatement,
+								  AlterTableCmd *command)
+{
+	bool involvesIdentityColumn = false;
+	char *alterColumnName = command->name;
+
+	LOCKMODE lockmode = AlterTableGetLockLevel(alterTableStatement->cmds);
+	Oid relationId = AlterTableLookupRelation(alterTableStatement, lockmode);
+	if (!OidIsValid(relationId))
+	{
+		return false;
+	}
+
+	HeapTuple tuple = SearchSysCacheAttName(relationId, alterColumnName);
+	if (HeapTupleIsValid(tuple))
+	{
+		Form_pg_attribute targetAttr = (Form_pg_attribute) GETSTRUCT(tuple);
+
+		if (targetAttr->attidentity)
+		{
+			involvesIdentityColumn = true;
+		}
+
+		ReleaseSysCache(tuple);
+	}
+
+	return involvesIdentityColumn;
 }
 
 

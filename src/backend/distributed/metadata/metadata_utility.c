@@ -1078,7 +1078,7 @@ TableShardReplicationFactor(Oid relationId)
 	{
 		uint64 shardId = shardInterval->shardId;
 
-		List *shardPlacementList = ShardPlacementListWithoutOrphanedPlacements(shardId);
+		List *shardPlacementList = ShardPlacementListSortedByWorker(shardId);
 		uint32 shardPlacementCount = list_length(shardPlacementList);
 
 		/*
@@ -1328,25 +1328,18 @@ ShardLength(uint64 shardId)
  * NodeGroupHasShardPlacements returns whether any active shards are placed on the group
  */
 bool
-NodeGroupHasShardPlacements(int32 groupId, bool onlyConsiderActivePlacements)
+NodeGroupHasShardPlacements(int32 groupId)
 {
-	const int scanKeyCount = (onlyConsiderActivePlacements ? 2 : 1);
+	const int scanKeyCount = 1;
 	const bool indexOK = false;
 
-
-	ScanKeyData scanKey[2];
+	ScanKeyData scanKey[1];
 
 	Relation pgPlacement = table_open(DistPlacementRelationId(),
 									  AccessShareLock);
 
 	ScanKeyInit(&scanKey[0], Anum_pg_dist_placement_groupid,
 				BTEqualStrategyNumber, F_INT4EQ, Int32GetDatum(groupId));
-	if (onlyConsiderActivePlacements)
-	{
-		ScanKeyInit(&scanKey[1], Anum_pg_dist_placement_shardstate,
-					BTEqualStrategyNumber, F_INT4EQ,
-					Int32GetDatum(SHARD_STATE_ACTIVE));
-	}
 
 	SysScanDesc scanDescriptor = systable_beginscan(pgPlacement,
 													DistPlacementGroupidIndexId(),
@@ -1381,8 +1374,7 @@ IsActiveShardPlacement(ShardPlacement *shardPlacement)
 							   shardPlacement->nodePort)));
 	}
 
-	return shardPlacement->shardState == SHARD_STATE_ACTIVE &&
-		   workerNode->isActive;
+	return workerNode->isActive;
 }
 
 
@@ -1480,8 +1472,7 @@ ActiveShardPlacementListOnGroup(uint64 shardId, int32 groupId)
 List *
 ActiveShardPlacementList(uint64 shardId)
 {
-	List *shardPlacementList =
-		ShardPlacementListIncludingOrphanedPlacements(shardId);
+	List *shardPlacementList = ShardPlacementList(shardId);
 
 	List *activePlacementList = FilterShardPlacementList(shardPlacementList,
 														 IsActiveShardPlacement);
@@ -1491,30 +1482,14 @@ ActiveShardPlacementList(uint64 shardId)
 
 
 /*
- * IsShardPlacementNotOrphaned checks returns true if a shard placement is not orphaned
- * Orphaned shards are shards marked to be deleted at a later point (shardstate = 4).
- */
-static inline bool
-IsShardPlacementNotOrphaned(ShardPlacement *shardPlacement)
-{
-	return shardPlacement->shardState != SHARD_STATE_TO_DELETE;
-}
-
-
-/*
- * ShardPlacementListWithoutOrphanedPlacements returns shard placements exluding
- * the ones that are orphaned.
+ * ShardPlacementListSortedByWorker returns shard placements sorted by worker port.
  */
 List *
-ShardPlacementListWithoutOrphanedPlacements(uint64 shardId)
+ShardPlacementListSortedByWorker(uint64 shardId)
 {
-	List *shardPlacementList =
-		ShardPlacementListIncludingOrphanedPlacements(shardId);
+	List *shardPlacementList = ShardPlacementList(shardId);
 
-	List *activePlacementList = FilterShardPlacementList(shardPlacementList,
-														 IsShardPlacementNotOrphaned);
-
-	return SortList(activePlacementList, CompareShardPlacementsByWorker);
+	return SortList(shardPlacementList, CompareShardPlacementsByWorker);
 }
 
 
@@ -1659,46 +1634,6 @@ AllShardPlacementsOnNodeGroup(int32 groupId)
 
 
 /*
- * AllShardPlacementsWithShardPlacementState finds shard placements with the given
- * shardState from system catalogs, converts these placements to their in-memory
- * representation, and returns the converted shard placements in a new list.
- */
-List *
-AllShardPlacementsWithShardPlacementState(ShardState shardState)
-{
-	List *shardPlacementList = NIL;
-	ScanKeyData scanKey[1];
-	int scanKeyCount = 1;
-
-	Relation pgPlacement = table_open(DistPlacementRelationId(), AccessShareLock);
-
-	ScanKeyInit(&scanKey[0], Anum_pg_dist_placement_shardstate,
-				BTEqualStrategyNumber, F_INT4EQ, Int32GetDatum(shardState));
-
-	SysScanDesc scanDescriptor = systable_beginscan(pgPlacement, InvalidOid, false,
-													NULL, scanKeyCount, scanKey);
-
-	HeapTuple heapTuple = systable_getnext(scanDescriptor);
-	while (HeapTupleIsValid(heapTuple))
-	{
-		TupleDesc tupleDescriptor = RelationGetDescr(pgPlacement);
-
-		GroupShardPlacement *placement =
-			TupleToGroupShardPlacement(tupleDescriptor, heapTuple);
-
-		shardPlacementList = lappend(shardPlacementList, placement);
-
-		heapTuple = systable_getnext(scanDescriptor);
-	}
-
-	systable_endscan(scanDescriptor);
-	table_close(pgPlacement, NoLock);
-
-	return shardPlacementList;
-}
-
-
-/*
  * TupleToGroupShardPlacement takes in a heap tuple from pg_dist_placement,
  * and converts this tuple to in-memory struct. The function assumes the
  * caller already has locks on the tuple, and doesn't perform any locking.
@@ -1728,8 +1663,6 @@ TupleToGroupShardPlacement(TupleDesc tupleDescriptor, HeapTuple heapTuple)
 		datumArray[Anum_pg_dist_placement_shardid - 1]);
 	shardPlacement->shardLength = DatumGetInt64(
 		datumArray[Anum_pg_dist_placement_shardlength - 1]);
-	shardPlacement->shardState = DatumGetUInt32(
-		datumArray[Anum_pg_dist_placement_shardstate - 1]);
 	shardPlacement->groupId = DatumGetInt32(
 		datumArray[Anum_pg_dist_placement_groupid - 1]);
 
@@ -1796,8 +1729,7 @@ InsertShardRow(Oid relationId, uint64 shardId, char storageType,
  */
 uint64
 InsertShardPlacementRow(uint64 shardId, uint64 placementId,
-						char shardState, uint64 shardLength,
-						int32 groupId)
+						uint64 shardLength, int32 groupId)
 {
 	Datum values[Natts_pg_dist_placement];
 	bool isNulls[Natts_pg_dist_placement];
@@ -1812,7 +1744,7 @@ InsertShardPlacementRow(uint64 shardId, uint64 placementId,
 	}
 	values[Anum_pg_dist_placement_placementid - 1] = Int64GetDatum(placementId);
 	values[Anum_pg_dist_placement_shardid - 1] = Int64GetDatum(shardId);
-	values[Anum_pg_dist_placement_shardstate - 1] = CharGetDatum(shardState);
+	values[Anum_pg_dist_placement_shardstate - 1] = Int32GetDatum(1);
 	values[Anum_pg_dist_placement_shardlength - 1] = Int64GetDatum(shardLength);
 	values[Anum_pg_dist_placement_groupid - 1] = Int32GetDatum(groupId);
 
@@ -2049,62 +1981,6 @@ DeleteShardPlacementRow(uint64 placementId)
 	CitusInvalidateRelcacheByShardId(shardId);
 
 	CommandCounterIncrement();
-	table_close(pgDistPlacement, NoLock);
-}
-
-
-/*
- * UpdateShardPlacementState sets the shardState for the placement identified
- * by placementId.
- */
-void
-UpdateShardPlacementState(uint64 placementId, char shardState)
-{
-	ScanKeyData scanKey[1];
-	int scanKeyCount = 1;
-	bool indexOK = true;
-	Datum values[Natts_pg_dist_placement];
-	bool isnull[Natts_pg_dist_placement];
-	bool replace[Natts_pg_dist_placement];
-	bool colIsNull = false;
-
-	Relation pgDistPlacement = table_open(DistPlacementRelationId(), RowExclusiveLock);
-	TupleDesc tupleDescriptor = RelationGetDescr(pgDistPlacement);
-	ScanKeyInit(&scanKey[0], Anum_pg_dist_placement_placementid,
-				BTEqualStrategyNumber, F_INT8EQ, Int64GetDatum(placementId));
-
-	SysScanDesc scanDescriptor = systable_beginscan(pgDistPlacement,
-													DistPlacementPlacementidIndexId(),
-													indexOK,
-													NULL, scanKeyCount, scanKey);
-
-	HeapTuple heapTuple = systable_getnext(scanDescriptor);
-	if (!HeapTupleIsValid(heapTuple))
-	{
-		ereport(ERROR, (errmsg("could not find valid entry for shard placement "
-							   UINT64_FORMAT,
-							   placementId)));
-	}
-
-	memset(replace, 0, sizeof(replace));
-
-	values[Anum_pg_dist_placement_shardstate - 1] = CharGetDatum(shardState);
-	isnull[Anum_pg_dist_placement_shardstate - 1] = false;
-	replace[Anum_pg_dist_placement_shardstate - 1] = true;
-
-	heapTuple = heap_modify_tuple(heapTuple, tupleDescriptor, values, isnull, replace);
-
-	CatalogTupleUpdate(pgDistPlacement, &heapTuple->t_self, heapTuple);
-
-	uint64 shardId = DatumGetInt64(heap_getattr(heapTuple,
-												Anum_pg_dist_placement_shardid,
-												tupleDescriptor, &colIsNull));
-	Assert(!colIsNull);
-	CitusInvalidateRelcacheByShardId(shardId);
-
-	CommandCounterIncrement();
-
-	systable_endscan(scanDescriptor);
 	table_close(pgDistPlacement, NoLock);
 }
 
@@ -2425,7 +2301,7 @@ IsForeignTable(Oid relationId)
  * For a task to be able to run the following conditions apply:
  *  - Task is in Running state. This could happen when a Background Tasks Queue Monitor
  *    had crashed or is otherwise restarted. To recover from such a failure tasks in
- *    Running state are deeed Runnable.
+ *    Running state are deemed Runnable.
  *  - Task is in Runnable state with either _no_ value set in not_before, or a value that
  *    has currently passed. If the not_before field is set to a time in the future the
  *    task is currently not ready to be started.

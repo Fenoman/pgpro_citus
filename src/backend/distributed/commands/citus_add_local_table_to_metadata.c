@@ -46,6 +46,7 @@
 #include "utils/lsyscache.h"
 #include "utils/ruleutils.h"
 #include "utils/syscache.h"
+#include "foreign/foreign.h"
 
 
 /*
@@ -60,7 +61,8 @@ static void citus_add_local_table_to_metadata_internal(Oid relationId,
 static void ErrorIfAddingPartitionTableToMetadata(Oid relationId);
 static void ErrorIfUnsupportedCreateCitusLocalTable(Relation relation);
 static void ErrorIfUnsupportedCitusLocalTableKind(Oid relationId);
-static void ErrorIfUnsupportedCitusLocalColumnDefinition(Relation relation);
+static void EnsureIfPostgresFdwHasTableName(Oid relationId);
+static void ErrorIfOptionListHasNoTableName(List *optionList);
 static void NoticeIfAutoConvertingLocalTables(bool autoConverted, Oid relationId);
 static CascadeOperationType GetCascadeTypeForCitusLocalTables(bool autoConverted);
 static List * GetShellTableDDLEventsForCitusLocalTable(Oid relationId);
@@ -82,6 +84,7 @@ static char * GetRenameShardTriggerCommand(Oid shardRelationId, char *triggerNam
 static void DropRelationTruncateTriggers(Oid relationId);
 static char * GetDropTriggerCommand(Oid relationId, char *triggerName);
 static void DropViewsOnTable(Oid relationId);
+static void DropIdentitiesOnTable(Oid relationId);
 static List * GetRenameStatsCommandList(List *statsOidList, uint64 shardId);
 static List * ReversedOidList(List *oidList);
 static void AppendExplicitIndexIdsToList(Form_pg_index indexForm,
@@ -338,6 +341,12 @@ CreateCitusLocalTable(Oid relationId, bool cascadeViaForeignKeys, bool autoConve
 	char *relationName = get_rel_name(relationId);
 	Oid relationSchemaId = get_rel_namespace(relationId);
 
+	/*
+	 * Drop identities before local shard conversion since the shell table owns
+	 * identities
+	 */
+	DropIdentitiesOnTable(relationId);
+
 	/* below we convert relation with relationId to the shard relation */
 	uint64 shardId = ConvertLocalTableToShard(relationId);
 
@@ -486,7 +495,17 @@ ErrorIfUnsupportedCreateCitusLocalTable(Relation relation)
 	ErrorIfCoordinatorNotAddedAsWorkerNode();
 	ErrorIfUnsupportedCitusLocalTableKind(relationId);
 	EnsureTableNotDistributed(relationId);
-	ErrorIfUnsupportedCitusLocalColumnDefinition(relation);
+	ErrorIfRelationHasUnsupportedTrigger(relationId);
+
+	/*
+	 * Error out with a hint if the foreign table is using postgres_fdw and
+	 * the option table_name is not provided.
+	 * Citus relays all the Citus local foreign table logic to the placement of the
+	 * Citus local table. If table_name is NOT provided, Citus would try to talk to
+	 * the foreign postgres table over the shard's table name, which would not exist
+	 * on the remote server.
+	 */
+	EnsureIfPostgresFdwHasTableName(relationId);
 
 	/*
 	 * When creating other citus table types, we don't need to check that case as
@@ -500,6 +519,93 @@ ErrorIfUnsupportedCreateCitusLocalTable(Relation relation)
 
 	/* we do not support policies in citus community */
 	ErrorIfUnsupportedPolicy(relation);
+}
+
+
+/*
+ * ServerUsesPostgresFdw gets a foreign server Oid and returns true if the FDW that
+ * the server depends on is postgres_fdw. Returns false otherwise.
+ */
+bool
+ServerUsesPostgresFdw(Oid serverId)
+{
+	ForeignServer *server = GetForeignServer(serverId);
+	ForeignDataWrapper *fdw = GetForeignDataWrapper(server->fdwid);
+
+	if (strcmp(fdw->fdwname, "postgres_fdw") == 0)
+	{
+		return true;
+	}
+
+	return false;
+}
+
+
+/*
+ * EnsureIfPostgresFdwHasTableName errors out with a hint if the foreign table is using postgres_fdw and
+ * the option table_name is not provided.
+ */
+static void
+EnsureIfPostgresFdwHasTableName(Oid relationId)
+{
+	char relationKind = get_rel_relkind(relationId);
+	if (relationKind == RELKIND_FOREIGN_TABLE)
+	{
+		ForeignTable *foreignTable = GetForeignTable(relationId);
+		if (ServerUsesPostgresFdw(foreignTable->serverid))
+		{
+			ErrorIfOptionListHasNoTableName(foreignTable->options);
+		}
+	}
+}
+
+
+/*
+ * ErrorIfOptionListHasNoTableName gets an option list (DefElem) and errors out
+ * if the list does not contain a table_name element.
+ */
+static void
+ErrorIfOptionListHasNoTableName(List *optionList)
+{
+	char *table_nameString = "table_name";
+	DefElem *option = NULL;
+	foreach_ptr(option, optionList)
+	{
+		char *optionName = option->defname;
+		if (strcmp(optionName, table_nameString) == 0)
+		{
+			return;
+		}
+	}
+
+	ereport(ERROR, (errmsg(
+						"table_name option must be provided when using postgres_fdw with Citus"),
+					errhint("Provide the option \"table_name\" with value target table's"
+							" name")));
+}
+
+
+/*
+ * ForeignTableDropsTableNameOption returns true if given option list contains
+ * (DROP table_name).
+ */
+bool
+ForeignTableDropsTableNameOption(List *optionList)
+{
+	char *table_nameString = "table_name";
+	DefElem *option = NULL;
+	foreach_ptr(option, optionList)
+	{
+		char *optionName = option->defname;
+		DefElemAction optionAction = option->defaction;
+		if (strcmp(optionName, table_nameString) == 0 &&
+			optionAction == DEFELEM_DROP)
+		{
+			return true;
+		}
+	}
+
+	return false;
 }
 
 
@@ -544,30 +650,6 @@ ErrorIfUnsupportedCitusLocalTableKind(Oid relationId)
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						errmsg("constraints on temporary tables may reference only "
 							   "temporary tables")));
-	}
-}
-
-
-/*
- * ErrorIfUnsupportedCitusLocalColumnDefinition errors out if given relation
- * has unsupported column definition for citus local table creation.
- */
-static void
-ErrorIfUnsupportedCitusLocalColumnDefinition(Relation relation)
-{
-	TupleDesc relationDesc = RelationGetDescr(relation);
-	if (RelationUsesIdentityColumns(relationDesc))
-	{
-		/*
-		 * pg_get_tableschemadef_string doesn't know how to deparse identity
-		 * columns so we cannot reflect those columns when creating shell
-		 * relation. For this reason, error out here.
-		 */
-		Oid relationId = relation->rd_id;
-		ereport(ERROR, (errmsg("cannot add %s to citus metadata since table "
-							   "has identity column",
-							   generate_qualified_relation_name(relationId)),
-						errhint("Drop the identity columns and re-try the command")));
 	}
 }
 
@@ -665,10 +747,12 @@ GetShellTableDDLEventsForCitusLocalTable(Oid relationId)
 	 * a sequence.
 	 */
 	IncludeSequenceDefaults includeSequenceDefaults = NEXTVAL_SEQUENCE_DEFAULTS;
+	IncludeIdentities includeIdentityDefaults = INCLUDE_IDENTITY;
 
 	bool creatingShellTableOnRemoteNode = false;
 	List *tableDDLCommands = GetFullTableCreationCommands(relationId,
 														  includeSequenceDefaults,
+														  includeIdentityDefaults,
 														  creatingShellTableOnRemoteNode);
 
 	List *shellTableDDLEvents = NIL;
@@ -1036,6 +1120,46 @@ GetDropTriggerCommand(Oid relationId, char *triggerName)
 					 quotedTriggerName, qualifiedRelationName);
 
 	return dropCommand->data;
+}
+
+
+/*
+ * DropIdentitiesOnTable drops the identities that depend on the given relation.
+ */
+static void
+DropIdentitiesOnTable(Oid relationId)
+{
+	Relation relation = relation_open(relationId, AccessShareLock);
+	TupleDesc tupleDescriptor = RelationGetDescr(relation);
+	relation_close(relation, NoLock);
+
+	for (int attributeIndex = 0; attributeIndex < tupleDescriptor->natts;
+		 attributeIndex++)
+	{
+		Form_pg_attribute attributeForm = TupleDescAttr(tupleDescriptor, attributeIndex);
+		char *columnName = NameStr(attributeForm->attname);
+
+		if (attributeForm->attidentity)
+		{
+			char *tableName = get_rel_name(relationId);
+			char *schemaName = get_namespace_name(get_rel_namespace(relationId));
+			char *qualifiedTableName = quote_qualified_identifier(schemaName, tableName);
+
+			StringInfo dropCommand = makeStringInfo();
+
+			appendStringInfo(dropCommand, "ALTER TABLE %s ALTER %s DROP IDENTITY",
+							 qualifiedTableName,
+							 columnName);
+
+			/*
+			 * We need to disable/enable ddl propagation for this command, to prevent
+			 * sending unnecessary ALTER COLUMN commands for partitions, to MX workers.
+			 */
+			ExecuteAndLogUtilityCommandList(list_make3(DISABLE_DDL_PROPAGATION,
+													   dropCommand->data,
+													   ENABLE_DDL_PROPAGATION));
+		}
+	}
 }
 
 

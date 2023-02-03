@@ -38,7 +38,6 @@
 #include "distributed/coordinator_protocol.h"
 #include "distributed/metadata_cache.h"
 #include "distributed/metadata_utility.h"
-#include "distributed/multi_client_executor.h"
 #include "distributed/multi_logical_replication.h"
 #include "distributed/multi_progress.h"
 #include "distributed/multi_server_executor.h"
@@ -424,7 +423,6 @@ FullShardPlacementList(Oid relationId, ArrayType *excludedShardArray)
 			ShardPlacement *placement = CitusMakeNode(ShardPlacement);
 			placement->shardId = groupPlacement->shardId;
 			placement->shardLength = groupPlacement->shardLength;
-			placement->shardState = groupPlacement->shardState;
 			placement->nodeId = worker->nodeId;
 			placement->nodeName = pstrdup(worker->workerName);
 			placement->nodePort = worker->workerPort;
@@ -773,7 +771,7 @@ ExecutePlacementUpdates(List *placementUpdateList, Oid shardReplicationModeOid,
 
 	ListCell *placementUpdateCell = NULL;
 
-	DropOrphanedShardsInSeparateTransaction();
+	DropOrphanedResourcesInSeparateTransaction();
 
 	foreach(placementUpdateCell, placementUpdateList)
 	{
@@ -1299,7 +1297,17 @@ get_rebalance_progress(PG_FUNCTION_ARGS)
 			values[11] = PointerGetDatum(
 				cstring_to_text(PlacementUpdateTypeNames[step->updateType]));
 			values[12] = LSNGetDatum(sourceLSN);
+			if (sourceLSN == InvalidXLogRecPtr)
+			{
+				nulls[12] = true;
+			}
+
 			values[13] = LSNGetDatum(targetLSN);
+			if (targetLSN == InvalidXLogRecPtr)
+			{
+				nulls[13] = true;
+			}
+
 			values[14] = PointerGetDatum(cstring_to_text(
 											 PlacementUpdateStatusNames[
 												 pg_atomic_read_u64(
@@ -1844,9 +1852,7 @@ ErrorOnConcurrentRebalance(RebalanceOptions *options)
 					errmsg("A rebalance is already running as job %ld", jobId),
 					errdetail("A rebalance was already scheduled as background job"),
 					errhint("To monitor progress, run: SELECT * FROM "
-							"pg_dist_background_task WHERE job_id = %ld ORDER BY task_id "
-							"ASC; or SELECT * FROM get_rebalance_progress();",
-							jobId)));
+							"citus_rebalance_status();")));
 	}
 }
 
@@ -1902,7 +1908,7 @@ RebalanceTableShardsBackground(RebalanceOptions *options, Oid shardReplicationMo
 		return 0;
 	}
 
-	DropOrphanedShardsInSeparateTransaction();
+	DropOrphanedResourcesInSeparateTransaction();
 
 	/* find the name of the shard transfer mode to interpolate in the scheduled command */
 	Datum shardTranferModeLabelDatum =
@@ -1931,7 +1937,10 @@ RebalanceTableShardsBackground(RebalanceOptions *options, Oid shardReplicationMo
 
 	if (HasNodesWithMissingReferenceTables(&referenceTableIdList))
 	{
-		VerifyTablesHaveReplicaIdentity(referenceTableIdList);
+		if (shardTransferMode == TRANSFER_MODE_AUTOMATIC)
+		{
+			VerifyTablesHaveReplicaIdentity(referenceTableIdList);
+		}
 
 		/*
 		 * Reference tables need to be copied to (newly-added) nodes, this needs to be the
@@ -1954,12 +1963,10 @@ RebalanceTableShardsBackground(RebalanceOptions *options, Oid shardReplicationMo
 		resetStringInfo(&buf);
 
 		appendStringInfo(&buf,
-						 "SELECT pg_catalog.citus_move_shard_placement(%ld,%s,%u,%s,%u,%s)",
+						 "SELECT pg_catalog.citus_move_shard_placement(%ld,%u,%u,%s)",
 						 move->shardId,
-						 quote_literal_cstr(move->sourceNode->workerName),
-						 move->sourceNode->workerPort,
-						 quote_literal_cstr(move->targetNode->workerName),
-						 move->targetNode->workerPort,
+						 move->sourceNode->nodeId,
+						 move->targetNode->nodeId,
 						 quote_literal_cstr(shardTranferModeLabel));
 
 		BackgroundTask *task = ScheduleBackgroundTask(jobId, GetUserId(), buf.data,
@@ -1976,10 +1983,8 @@ RebalanceTableShardsBackground(RebalanceOptions *options, Oid shardReplicationMo
 			(errmsg("Scheduled %d moves as job %ld",
 					list_length(placementUpdateList), jobId),
 			 errdetail("Rebalance scheduled as background job"),
-			 errhint("To monitor progress, run: "
-					 "SELECT * FROM pg_dist_background_task WHERE job_id = %ld ORDER BY "
-					 "task_id ASC; or SELECT * FROM get_rebalance_progress();",
-					 jobId)));
+			 errhint("To monitor progress, run: SELECT * FROM "
+					 "citus_rebalance_status();")));
 
 	return jobId;
 }
@@ -2029,23 +2034,19 @@ UpdateShardPlacement(PlacementUpdateEvent *placementUpdateEvent,
 	if (updateType == PLACEMENT_UPDATE_MOVE)
 	{
 		appendStringInfo(placementUpdateCommand,
-						 "SELECT citus_move_shard_placement(%ld,%s,%u,%s,%u,%s)",
+						 "SELECT citus_move_shard_placement(%ld,%u,%u,%s)",
 						 shardId,
-						 quote_literal_cstr(sourceNode->workerName),
-						 sourceNode->workerPort,
-						 quote_literal_cstr(targetNode->workerName),
-						 targetNode->workerPort,
+						 sourceNode->nodeId,
+						 targetNode->nodeId,
 						 quote_literal_cstr(shardTranferModeLabel));
 	}
 	else if (updateType == PLACEMENT_UPDATE_COPY)
 	{
 		appendStringInfo(placementUpdateCommand,
-						 "SELECT citus_copy_shard_placement(%ld,%s,%u,%s,%u,%s)",
+						 "SELECT citus_copy_shard_placement(%ld,%u,%u,%s)",
 						 shardId,
-						 quote_literal_cstr(sourceNode->workerName),
-						 sourceNode->workerPort,
-						 quote_literal_cstr(targetNode->workerName),
-						 targetNode->workerPort,
+						 sourceNode->nodeId,
+						 targetNode->nodeId,
 						 quote_literal_cstr(shardTranferModeLabel));
 	}
 	else
@@ -2086,8 +2087,10 @@ ExecuteRebalancerCommandInSeparateTransaction(char *command)
 													PostPortNumber);
 	List *commandList = NIL;
 
-	commandList = lappend(commandList, psprintf("SET LOCAL application_name TO %s;",
-												CITUS_REBALANCER_NAME));
+	commandList = lappend(commandList, psprintf(
+							  "SET LOCAL application_name TO '%s%ld'",
+							  CITUS_REBALANCER_APPLICATION_NAME_PREFIX,
+							  GetGlobalPID()));
 
 	if (PropagateSessionSettingsForLoopbackConnection)
 	{

@@ -93,7 +93,6 @@ SELECT create_distributed_table('nation_append_search_path', 'n_nationkey', 'app
 
 SELECT master_create_empty_shard('nation_append_search_path') AS shardid \gset
 copy nation_append_search_path FROM STDIN with (delimiter '|', append_to_shard :shardid);
--- create shard with master_create_worker_shards
 CREATE TABLE test_schema_support.nation_hash(
     n_nationkey integer not null,
     n_name char(25) not null,
@@ -362,7 +361,7 @@ SELECT master_get_table_ddl_events('test_schema_support.nation_hash_collation') 
                                                                                                      master_get_table_ddl_events
 ---------------------------------------------------------------------
  ALTER TABLE test_schema_support.nation_hash_collation OWNER TO postgres
- CREATE TABLE test_schema_support.nation_hash_collation (n_nationkey integer NOT NULL, n_name character(25) NOT NULL COLLATE test_schema_support.english, n_regionkey integer NOT NULL, n_comment character varying(152))
+ CREATE TABLE test_schema_support.nation_hash_collation (n_nationkey integer NOT NULL, n_name character(25) NOT NULL COLLATE test_schema_support.english, n_regionkey integer NOT NULL, n_comment character varying(152)) USING heap
 (2 rows)
 
 SELECT create_distributed_table('test_schema_support.nation_hash_collation', 'n_nationkey', 'hash', shard_count := 4, colocate_with := 'none');
@@ -1155,13 +1154,6 @@ SET citus.next_shard_id TO 1197000;
 -- we do not use run_command_on_coordinator_and_workers here because when there is CASCADE, it causes deadlock
 DROP OWNED BY "test-user" CASCADE;
 NOTICE:  drop cascades to table schema_with_user.test_table
-SELECT run_command_on_workers('DROP OWNED BY "test-user" CASCADE');
-      run_command_on_workers
----------------------------------------------------------------------
- (localhost,57637,t,"DROP OWNED")
- (localhost,57638,t,"DROP OWNED")
-(2 rows)
-
 DROP USER "test-user";
 DROP FUNCTION run_command_on_coordinator_and_workers(p_sql text);
 -- test run_command_on_* UDFs with schema

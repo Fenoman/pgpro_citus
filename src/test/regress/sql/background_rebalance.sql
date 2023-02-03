@@ -43,7 +43,7 @@ SELECT pg_sleep(1);
 
 -- failing move due to a stopped rebalance, first clean orphans to make the error stable
 SET client_min_messages TO WARNING;
-CALL citus_cleanup_orphaned_shards();
+CALL citus_cleanup_orphaned_resources();
 RESET client_min_messages;
 SELECT citus_move_shard_placement(85674000, 'localhost', :worker_1_port, 'localhost', :worker_2_port, shard_transfer_mode => 'block_writes');
 
@@ -61,7 +61,6 @@ SELECT citus_rebalance_wait();
 
 DROP TABLE t1;
 
-
 -- make sure a non-super user can stop rebalancing
 CREATE USER non_super_user_rebalance WITH LOGIN;
 GRANT ALL ON SCHEMA background_rebalance TO non_super_user_rebalance;
@@ -77,6 +76,38 @@ SELECT citus_rebalance_stop();
 
 RESET ROLE;
 
+CREATE TABLE ref_no_pk(a int);
+SELECT create_reference_table('ref_no_pk');
+CREATE TABLE ref_with_pk(a int primary key);
+SELECT create_reference_table('ref_with_pk');
+-- Add coordinator so there's a node which doesn't have the reference tables
+SELECT 1 FROM citus_add_node('localhost', :master_port, groupId=>0);
+
+-- fails
+BEGIN;
+SELECT 1 FROM citus_rebalance_start();
+ROLLBACK;
+-- success
+BEGIN;
+SELECT 1 FROM citus_rebalance_start(shard_transfer_mode := 'force_logical');
+ROLLBACK;
+-- success
+BEGIN;
+SELECT 1 FROM citus_rebalance_start(shard_transfer_mode := 'block_writes');
+ROLLBACK;
+
+-- fails
+SELECT 1 FROM citus_rebalance_start();
+-- succeeds
+SELECT 1 FROM citus_rebalance_start(shard_transfer_mode := 'force_logical');
+-- wait for success
+SELECT citus_rebalance_wait();
+SELECT state, details from citus_rebalance_status();
+
+-- Remove coordinator again to allow rerunning of this test
+SELECT 1 FROM citus_remove_node('localhost', :master_port);
+SELECT public.wait_until_metadata_sync(30000);
 
 SET client_min_messages TO WARNING;
 DROP SCHEMA background_rebalance CASCADE;
+DROP USER non_super_user_rebalance;

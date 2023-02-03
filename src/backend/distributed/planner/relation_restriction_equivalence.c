@@ -1551,7 +1551,21 @@ AddRteRelationToAttributeEquivalenceClass(AttributeEquivalenceClass *
 
 	Assert(rangeTableEntry->rtekind == RTE_RELATION);
 
-	/* we don't need reference tables in the equality on columns */
+	/*
+	 * we only calculate the equivalence of distributed tables.
+	 * This leads to certain shortcomings in the query planning when reference
+	 * tables and/or intermediate results are involved in the query. For example,
+	 * the following query patterns could actually be pushed-down in a single iteration
+	 *    "(intermediate_res INNER JOIN dist dist1) INNER JOIN dist dist2 " or
+	 *    "(ref INNER JOIN dist dist1) JOIN dist dist2"
+	 *
+	 * However, if there are no explicit join conditions between distributed tables,
+	 * the planner cannot deduce the equivalence between the distributed tables.
+	 *
+	 * Instead, we should be able to track all the equivalences between range table
+	 * entries, and expand distributed table equivalences that happens via
+	 * reference table/intermediate results
+	 */
 	if (relationPartitionKey == NULL)
 	{
 		return;
@@ -2230,6 +2244,7 @@ FilterJoinRestrictionContext(JoinRestrictionContext *joinRestrictionContext, Rel
 	 * the same query and as these values are calculated per-query basis.
 	 */
 	filtererdJoinRestrictionContext->hasSemiJoin = joinRestrictionContext->hasSemiJoin;
+	filtererdJoinRestrictionContext->hasOuterJoin = joinRestrictionContext->hasOuterJoin;
 
 	return filtererdJoinRestrictionContext;
 }

@@ -4,6 +4,15 @@ setup
 	SET citus.shard_count TO 4;
 	SET citus.shard_replication_factor TO 1;
 	SELECT 1 FROM master_add_node('localhost', 57637);
+
+	CREATE OR REPLACE PROCEDURE isolation_cleanup_orphaned_resources()
+		LANGUAGE C
+		AS 'citus', $$isolation_cleanup_orphaned_resources$$;
+	COMMENT ON PROCEDURE isolation_cleanup_orphaned_resources()
+		IS 'cleanup orphaned shards';
+		RESET citus.enable_metadata_sync;
+	CALL isolation_cleanup_orphaned_resources();
+
 	SELECT master_set_node_property('localhost', 57638, 'shouldhaveshards', false);
 	CREATE TABLE colocated1 (test_id integer NOT NULL, data text);
 	SELECT create_distributed_table('colocated1', 'test_id', 'hash', 'none');
@@ -135,9 +144,9 @@ step "s7-get-progress"
 		( SELECT size FROM possible_sizes WHERE ABS(size - target_shard_size) = (SELECT MIN(ABS(size - target_shard_size)) FROM possible_sizes )) target_shard_size,
 		progress,
 		operation_type,
-		source_lsn >= target_lsn as lsn_sanity_check,
-		source_lsn > '0/0' as source_lsn_available,
-		target_lsn > '0/0' as target_lsn_available,
+		target_lsn IS NULL OR source_lsn >= target_lsn AS lsn_sanity_check,
+		source_lsn IS NOT NULL AS source_lsn_available,
+		target_lsn IS NOT NULL AS target_lsn_available,
 		status
 	FROM get_rebalance_progress();
 }
@@ -161,9 +170,9 @@ step "s7-get-progress-ordered"
 		( SELECT size FROM possible_sizes WHERE ABS(size - target_shard_size) = (SELECT MIN(ABS(size - target_shard_size)) FROM possible_sizes )) target_shard_size,
 		progress,
 		operation_type,
-		source_lsn >= target_lsn as lsn_sanity_check,
-		source_lsn > '0/0' as source_lsn_available,
-		target_lsn > '0/0' as target_lsn_available
+		target_lsn IS NULL OR source_lsn >= target_lsn AS lsn_sanity_check,
+		source_lsn IS NOT NULL AS source_lsn_available,
+		target_lsn IS NOT NULL AS target_lsn_available
 	FROM get_rebalance_progress()
 	ORDER BY 1, 2, 3, 4, 5;
 }

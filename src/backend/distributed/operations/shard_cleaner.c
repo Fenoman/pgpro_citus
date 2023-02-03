@@ -1,9 +1,8 @@
 /*-------------------------------------------------------------------------
  *
  * shard_cleaner.c
- *	  This implements the background process that cleans shards that are
- *	  left around. Shards that are left around are marked as state 4
- *	  (SHARD_STATE_TO_DELETE) in pg_dist_placement.
+ *	  This implements the background process that cleans shards and resources
+ *	  that are left around.
  *
  * Copyright (c) 2018, Citus Data, Inc.
  *
@@ -32,6 +31,10 @@
 #include "distributed/resource_lock.h"
 #include "distributed/worker_transaction.h"
 #include "distributed/pg_dist_cleanup.h"
+
+#define REPLICATION_SLOT_CATALOG_TABLE_NAME "pg_replication_slots"
+#define STR_ERRCODE_OBJECT_IN_USE "55006"
+#define STR_ERRCODE_UNDEFINED_OBJECT "42704"
 
 /* GUC configuration for shard cleaner */
 int NextOperationId = 0;
@@ -68,15 +71,28 @@ OperationId CurrentOperationId = INVALID_OPERATION_ID;
 
 /* declarations for dynamic loading */
 PG_FUNCTION_INFO_V1(citus_cleanup_orphaned_shards);
-PG_FUNCTION_INFO_V1(isolation_cleanup_orphaned_shards);
 PG_FUNCTION_INFO_V1(citus_cleanup_orphaned_resources);
+PG_FUNCTION_INFO_V1(isolation_cleanup_orphaned_resources);
 
-static int DropOrphanedShardsForMove(bool waitForLocks);
-static bool TryDropShardOutsideTransaction(OperationId operationId,
-										   char *qualifiedTableName,
+static bool TryDropResourceByCleanupRecordOutsideTransaction(CleanupRecord *record,
+															 char *nodeName,
+															 int nodePort);
+static bool TryDropShardOutsideTransaction(char *qualifiedTableName,
 										   char *nodeName,
 										   int nodePort);
-static bool TryLockRelationAndPlacementCleanup(Oid relationId, LOCKMODE lockmode);
+static bool TryDropSubscriptionOutsideTransaction(char *subscriptionName,
+												  char *nodeName,
+												  int nodePort);
+static bool TryDropPublicationOutsideTransaction(char *publicationName,
+												 char *nodeName,
+												 int nodePort);
+static bool TryDropReplicationSlotOutsideTransaction(char *replicationSlotName,
+													 char *nodeName,
+													 int nodePort);
+static bool TryDropUserOutsideTransaction(char *username, char *nodeName, int nodePort);
+
+static CleanupRecord * GetCleanupRecordByNameAndType(char *objectName,
+													 CleanupObject type);
 
 /* Functions for cleanup infrastructure */
 static CleanupRecord * TupleToCleanupRecord(HeapTuple heapTuple,
@@ -91,60 +107,19 @@ static void DeleteCleanupRecordByRecordIdOutsideTransaction(uint64 recordId);
 static bool CleanupRecordExists(uint64 recordId);
 static List * ListCleanupRecords(void);
 static List * ListCleanupRecordsForCurrentOperation(void);
-static int DropOrphanedShardsForCleanup(void);
+static int DropOrphanedResourcesForCleanup(void);
+static int CompareCleanupRecordsByObjectType(const void *leftElement,
+											 const void *rightElement);
 
 /*
- * citus_cleanup_orphaned_shards implements a user-facing UDF to delete
- * orphaned shards that are still haning around in the system. These shards are
- * orphaned by previous actions that were not directly able to delete the
- * placements eg. shard moving or dropping of a distributed table while one of
- * the data nodes was not online.
- *
- * This function iterates through placements where shardstate is
- * SHARD_STATE_TO_DELETE (shardstate = 4), drops the corresponding tables from
- * the node and removes the placement information from the catalog.
- *
- * The function takes no arguments and runs cluster wide. It cannot be run in a
- * transaction, because holding the locks it takes for a long time is not good.
- * While the locks are held, it is impossible for the background daemon to
- * cleanup orphaned shards.
+ * citus_cleanup_orphaned_shards is noop.
+ * Use citus_cleanup_orphaned_resources instead.
  */
 Datum
 citus_cleanup_orphaned_shards(PG_FUNCTION_ARGS)
 {
-	CheckCitusVersion(ERROR);
-	EnsureCoordinator();
-	PreventInTransactionBlock(true, "citus_cleanup_orphaned_shards");
-
-	bool waitForLocks = true;
-	int droppedShardCount = DropOrphanedShardsForMove(waitForLocks);
-	if (droppedShardCount > 0)
-	{
-		ereport(NOTICE, (errmsg("cleaned up %d orphaned shards", droppedShardCount)));
-	}
-
-	PG_RETURN_VOID();
-}
-
-
-/*
- * isolation_cleanup_orphaned_shards implements a test UDF that's the same as
- * citus_cleanup_orphaned_shards. The only difference is that this command can
- * be run in transactions, this is to test
- */
-Datum
-isolation_cleanup_orphaned_shards(PG_FUNCTION_ARGS)
-{
-	CheckCitusVersion(ERROR);
-	EnsureCoordinator();
-
-	bool waitForLocks = true;
-	int droppedShardCount = DropOrphanedShardsForMove(waitForLocks);
-	if (droppedShardCount > 0)
-	{
-		ereport(NOTICE, (errmsg("cleaned up %d orphaned shards", droppedShardCount)));
-	}
-
+	ereport(WARNING, (errmsg("citus_cleanup_orphaned_shards is deprecated. "
+							 "Use citus_cleanup_orphaned_resources instead")));
 	PG_RETURN_VOID();
 }
 
@@ -154,8 +129,6 @@ isolation_cleanup_orphaned_shards(PG_FUNCTION_ARGS)
  * orphaned resources that are present in the system. These resources are
  * orphaned by previous actions that either failed or marked the resources
  * for deferred cleanup.
- * The UDF only supports dropping shards at the moment but will be extended in
- * near future to clean any type of resource.
  *
  * The function takes no arguments and runs on co-ordinator. It cannot be run in a
  * transaction, because holding the locks it takes for a long time is not good.
@@ -169,7 +142,7 @@ citus_cleanup_orphaned_resources(PG_FUNCTION_ARGS)
 	EnsureCoordinator();
 	PreventInTransactionBlock(true, "citus_cleanup_orphaned_resources");
 
-	int droppedCount = DropOrphanedShardsForCleanup();
+	int droppedCount = DropOrphanedResourcesForCleanup();
 	if (droppedCount > 0)
 	{
 		ereport(NOTICE, (errmsg("cleaned up %d orphaned resources", droppedCount)));
@@ -180,33 +153,49 @@ citus_cleanup_orphaned_resources(PG_FUNCTION_ARGS)
 
 
 /*
- * DropOrphanedShardsInSeparateTransaction cleans up orphaned shards by
- * connecting to localhost. This is done, so that the locks that
- * DropOrphanedShardsForMove takes are only held for a short time.
+ * isolation_cleanup_orphaned_resources implements a test UDF that's the same as
+ * citus_cleanup_orphaned_resources. The only difference is that this command can
+ * be run in transactions, this is needed to test this function in isolation tests
+ * since commands are automatically run in transactions there.
+ */
+Datum
+isolation_cleanup_orphaned_resources(PG_FUNCTION_ARGS)
+{
+	CheckCitusVersion(ERROR);
+	EnsureCoordinator();
+
+	DropOrphanedResourcesForCleanup();
+
+	PG_RETURN_VOID();
+}
+
+
+/*
+ * DropOrphanedResourcesInSeparateTransaction cleans up orphaned resources by
+ * connecting to localhost.
  */
 void
-DropOrphanedShardsInSeparateTransaction(void)
+DropOrphanedResourcesInSeparateTransaction(void)
 {
 	int connectionFlag = FORCE_NEW_CONNECTION;
 	MultiConnection *connection = GetNodeConnection(connectionFlag, LocalHostName,
 													PostPortNumber);
-	ExecuteCriticalRemoteCommand(connection, "CALL citus_cleanup_orphaned_shards()");
+	ExecuteCriticalRemoteCommand(connection, "CALL citus_cleanup_orphaned_resources()");
 	CloseConnection(connection);
 }
 
 
 /*
- * TryDropOrphanedShards is a wrapper around DropOrphanedShardsForMove and
- * DropOrphanedShardsForCleanup that catches any errors to make it safe to
- * use in the maintenance daemon.
+ * TryDropOrphanedResources is a wrapper around DropOrphanedResourcesForCleanup
+ * that catches any errors to make it safe to use in the maintenance daemon.
  *
- * If dropping any of the shards failed this function returns -1, otherwise it
- * returns the number of dropped shards.
+ * If dropping any of the resources failed this function returns -1, otherwise it
+ * returns the number of dropped resources.
  */
 int
-TryDropOrphanedShards(bool waitForLocks)
+TryDropOrphanedResources()
 {
-	int droppedShardCount = 0;
+	int droppedResourceCount = 0;
 	MemoryContext savedContext = CurrentMemoryContext;
 
 	/*
@@ -217,8 +206,7 @@ TryDropOrphanedShards(bool waitForLocks)
 
 	PG_TRY();
 	{
-		droppedShardCount = DropOrphanedShardsForMove(waitForLocks);
-		droppedShardCount += DropOrphanedShardsForCleanup();
+		droppedResourceCount = DropOrphanedResourcesForCleanup();
 
 		/*
 		 * Releasing a subtransaction doesn't free its memory context, since the
@@ -241,19 +229,19 @@ TryDropOrphanedShards(bool waitForLocks)
 	}
 	PG_END_TRY();
 
-	return droppedShardCount;
+	return droppedResourceCount;
 }
 
 
 /*
- * DropOrphanedShardsForCleanup removes resources that were marked for cleanup by operation.
+ * DropOrphanedResourcesForCleanup removes resources that were marked for cleanup by operation.
  * It does so by trying to take an exclusive lock on the resources. If the lock cannot be
  * obtained it skips the resource and continues with others.
  * The resource that has been skipped will be removed at a later iteration when there are no
  * locks held anymore.
  */
 static int
-DropOrphanedShardsForCleanup()
+DropOrphanedResourcesForCleanup()
 {
 	/* Only runs on Coordinator */
 	if (!IsCoordinator())
@@ -263,20 +251,19 @@ DropOrphanedShardsForCleanup()
 
 	List *cleanupRecordList = ListCleanupRecords();
 
-	int removedShardCountForCleanup = 0;
-	int failedShardCountForCleanup = 0;
+	/*
+	 * We sort the records before cleaning up by their types, because of dependencies.
+	 * For example, a subscription might depend on a publication.
+	 */
+	cleanupRecordList = SortList(cleanupRecordList,
+								 CompareCleanupRecordsByObjectType);
+
+	int removedResourceCountForCleanup = 0;
+	int failedResourceCountForCleanup = 0;
 	CleanupRecord *record = NULL;
 
 	foreach_ptr(record, cleanupRecordList)
 	{
-		/* We only support one resource type at the moment */
-		if (record->objectType != CLEANUP_OBJECT_SHARD_PLACEMENT)
-		{
-			ereport(WARNING, (errmsg("Invalid object type %d for cleanup record ",
-									 record->objectType)));
-			continue;
-		}
-
 		if (!PrimaryNodeForGroup(record->nodeGroupId, NULL))
 		{
 			continue;
@@ -289,7 +276,7 @@ DropOrphanedShardsForCleanup()
 			continue;
 		}
 
-		char *qualifiedTableName = record->objectName;
+		char *resourceName = record->objectName;
 		WorkerNode *workerNode = LookupNodeForGroup(record->nodeGroupId);
 
 		/*
@@ -302,29 +289,28 @@ DropOrphanedShardsForCleanup()
 			continue;
 		}
 
-		if (TryDropShardOutsideTransaction(record->operationId,
-										   qualifiedTableName,
-										   workerNode->workerName,
-										   workerNode->workerPort))
+		if (TryDropResourceByCleanupRecordOutsideTransaction(record,
+															 workerNode->workerName,
+															 workerNode->workerPort))
 		{
 			if (record->policy == CLEANUP_DEFERRED_ON_SUCCESS)
 			{
-				ereport(LOG, (errmsg("deferred drop of orphaned shard %s on %s:%d "
+				ereport(LOG, (errmsg("deferred drop of orphaned resource %s on %s:%d "
 									 "completed",
-									 qualifiedTableName,
+									 resourceName,
 									 workerNode->workerName, workerNode->workerPort)));
 			}
 			else
 			{
-				ereport(LOG, (errmsg("cleaned up orphaned shard %s on %s:%d which "
+				ereport(LOG, (errmsg("cleaned up orphaned resource %s on %s:%d which "
 									 "was left behind after a failed operation",
-									 qualifiedTableName,
+									 resourceName,
 									 workerNode->workerName, workerNode->workerPort)));
 			}
 
 			/* delete the cleanup record */
 			DeleteCleanupRecordByRecordId(record->recordId);
-			removedShardCountForCleanup++;
+			removedResourceCountForCleanup++;
 		}
 		else
 		{
@@ -332,120 +318,18 @@ DropOrphanedShardsForCleanup()
 			 * We log failures at the end, since they occur repeatedly
 			 * for a large number of objects.
 			 */
-			failedShardCountForCleanup++;
+			failedResourceCountForCleanup++;
 		}
 	}
 
-	if (failedShardCountForCleanup > 0)
+	if (failedResourceCountForCleanup > 0)
 	{
-		ereport(WARNING, (errmsg("failed to clean up %d orphaned shards out of %d",
-								 failedShardCountForCleanup,
+		ereport(WARNING, (errmsg("failed to clean up %d orphaned resources out of %d",
+								 failedResourceCountForCleanup,
 								 list_length(cleanupRecordList))));
 	}
 
-	return removedShardCountForCleanup;
-}
-
-
-/*
- * DropOrphanedShardsForMove removes shards that were marked SHARD_STATE_TO_DELETE before.
- *
- * It does so by trying to take an exclusive lock on the shard and its
- * colocated placements before removing. If the lock cannot be obtained it
- * skips the group and continues with others. The group that has been skipped
- * will be removed at a later time when there are no locks held anymore on
- * those placements.
- *
- * If waitForLocks is false, then if we cannot take a lock on pg_dist_placement
- * we continue without waiting.
- *
- * Before doing any of this it will take an exclusive PlacementCleanup lock.
- * This is to ensure that this function is not being run concurrently.
- * Otherwise really bad race conditions are possible, such as removing all
- * placements of a shard. waitForLocks indicates if this function should
- * wait for this lock or not.
- *
- */
-static int
-DropOrphanedShardsForMove(bool waitForLocks)
-{
-	int removedShardCount = 0;
-
-	/*
-	 * We should try to take the highest lock that we take
-	 * later in this function for pg_dist_placement. We take RowExclusiveLock
-	 * in DeleteShardPlacementRow.
-	 */
-	LOCKMODE lockmode = RowExclusiveLock;
-
-	if (!IsCoordinator())
-	{
-		return 0;
-	}
-
-	if (waitForLocks)
-	{
-		LockPlacementCleanup();
-	}
-	else
-	{
-		Oid distPlacementId = DistPlacementRelationId();
-		if (!TryLockRelationAndPlacementCleanup(distPlacementId, lockmode))
-		{
-			return 0;
-		}
-	}
-
-	int failedShardDropCount = 0;
-	List *shardPlacementList = AllShardPlacementsWithShardPlacementState(
-		SHARD_STATE_TO_DELETE);
-
-	GroupShardPlacement *placement = NULL;
-	foreach_ptr(placement, shardPlacementList)
-	{
-		if (!PrimaryNodeForGroup(placement->groupId, NULL) ||
-			!ShardExists(placement->shardId))
-		{
-			continue;
-		}
-
-		ShardPlacement *shardPlacement = LoadShardPlacement(placement->shardId,
-															placement->placementId);
-		ShardInterval *shardInterval = LoadShardInterval(placement->shardId);
-		char *qualifiedTableName = ConstructQualifiedShardName(shardInterval);
-
-		if (TryDropShardOutsideTransaction(INVALID_OPERATION_ID,
-										   qualifiedTableName,
-										   shardPlacement->nodeName,
-										   shardPlacement->nodePort))
-		{
-			ereport(LOG, (errmsg("deferred drop of orphaned shard %s on %s:%d "
-								 "after a move completed",
-								 qualifiedTableName,
-								 shardPlacement->nodeName,
-								 shardPlacement->nodePort)));
-
-			/* delete the actual placement */
-			DeleteShardPlacementRow(placement->placementId);
-			removedShardCount++;
-		}
-		else
-		{
-			/*
-			 * We log failures at the end, since they occur repeatedly
-			 * for a large number of objects.
-			 */
-			failedShardDropCount++;
-		}
-	}
-
-	if (failedShardDropCount > 0)
-	{
-		ereport(WARNING, (errmsg("failed to clean up %d orphaned shards out of %d",
-								 failedShardDropCount, list_length(shardPlacementList))));
-	}
-
-	return removedShardCount;
+	return removedResourceCountForCleanup;
 }
 
 
@@ -465,85 +349,6 @@ RegisterOperationNeedingCleanup(void)
 
 
 /*
- * FinalizeOperationNeedingCleanupOnFailure is be called by an operation to signal
- * completion with failure. This will trigger cleanup of appropriate resources.
- */
-void
-FinalizeOperationNeedingCleanupOnFailure(const char *operationName)
-{
-	/* We must have a valid OperationId. Any operation requring cleanup
-	 * will call RegisterOperationNeedingCleanup.
-	 */
-	Assert(CurrentOperationId != INVALID_OPERATION_ID);
-
-	List *currentOperationRecordList = ListCleanupRecordsForCurrentOperation();
-
-	int removedShardCountOnComplete = 0;
-	int failedShardCountOnComplete = 0;
-
-	CleanupRecord *record = NULL;
-	foreach_ptr(record, currentOperationRecordList)
-	{
-		/* We only supporting cleaning shards right now */
-		if (record->objectType != CLEANUP_OBJECT_SHARD_PLACEMENT)
-		{
-			ereport(WARNING, (errmsg(
-								  "Invalid object type %d on failed operation cleanup",
-								  record->objectType)));
-			continue;
-		}
-
-		if (record->policy == CLEANUP_ALWAYS || record->policy == CLEANUP_ON_FAILURE)
-		{
-			char *qualifiedTableName = record->objectName;
-			WorkerNode *workerNode = LookupNodeForGroup(record->nodeGroupId);
-
-			/*
-			 * For all resources of CurrentOperationId that are marked as 'CLEANUP_ALWAYS' or
-			 * 'CLEANUP_ON_FAILURE', drop resource and cleanup records.
-			 */
-			if (TryDropShardOutsideTransaction(CurrentOperationId,
-											   qualifiedTableName,
-											   workerNode->workerName,
-											   workerNode->workerPort))
-			{
-				ereport(LOG, (errmsg("cleaned up orphaned shard %s on %s:%d after a "
-									 "%s operation failed",
-									 qualifiedTableName,
-									 workerNode->workerName, workerNode->workerPort,
-									 operationName)));
-
-				/*
-				 * Given the operation is failing and we will abort its transaction, we cannot delete
-				 * records in the current transaction. Delete these records outside of the
-				 * current transaction via a localhost connection.
-				 */
-				DeleteCleanupRecordByRecordIdOutsideTransaction(record->recordId);
-				removedShardCountOnComplete++;
-			}
-			else
-			{
-				/*
-				 * We log failures at the end, since they occur repeatedly
-				 * for a large number of objects.
-				 */
-				failedShardCountOnComplete++;
-			}
-		}
-	}
-
-	if (failedShardCountOnComplete > 0)
-	{
-		ereport(WARNING, (errmsg("failed to clean up %d orphaned shards out of %d after "
-								 "a %s operation failed",
-								 failedShardCountOnComplete,
-								 list_length(currentOperationRecordList),
-								 operationName)));
-	}
-}
-
-
-/*
  * FinalizeOperationNeedingCleanupOnSuccess is be called by an operation to signal
  * completion with success. This will trigger cleanup of appropriate resources.
  */
@@ -557,50 +362,38 @@ FinalizeOperationNeedingCleanupOnSuccess(const char *operationName)
 
 	List *currentOperationRecordList = ListCleanupRecordsForCurrentOperation();
 
-	int removedShardCountOnComplete = 0;
+	/*
+	 * We sort the records before cleaning up by their types, because of dependencies.
+	 * For example, a subscription might depend on a publication.
+	 */
+	currentOperationRecordList = SortList(currentOperationRecordList,
+										  CompareCleanupRecordsByObjectType);
+
 	int failedShardCountOnComplete = 0;
 
 	CleanupRecord *record = NULL;
 	foreach_ptr(record, currentOperationRecordList)
 	{
-		/* We only supporting cleaning shards right now */
-		if (record->objectType != CLEANUP_OBJECT_SHARD_PLACEMENT)
-		{
-			ereport(WARNING, (errmsg(
-								  "Invalid object type %d on operation cleanup",
-								  record->objectType)));
-			continue;
-		}
-
 		if (record->policy == CLEANUP_ALWAYS)
 		{
-			char *qualifiedTableName = record->objectName;
 			WorkerNode *workerNode = LookupNodeForGroup(record->nodeGroupId);
 
 			/*
 			 * For all resources of CurrentOperationId that are marked as 'CLEANUP_ALWAYS'
 			 * drop resource and cleanup records.
 			 */
-			if (TryDropShardOutsideTransaction(CurrentOperationId,
-											   qualifiedTableName,
-											   workerNode->workerName,
-											   workerNode->workerPort))
+			if (TryDropResourceByCleanupRecordOutsideTransaction(record,
+																 workerNode->workerName,
+																 workerNode->workerPort))
 			{
-				ereport(LOG, (errmsg("cleaned up orphaned shard %s on %s:%d after a "
-									 "%s operation completed",
-									 qualifiedTableName,
-									 workerNode->workerName, workerNode->workerPort,
-									 operationName)));
-
 				/*
 				 * Delete cleanup records outside transaction as:
 				 * The resources are marked as 'CLEANUP_ALWAYS' and should be cleaned no matter
 				 * the operation succeeded or failed.
 				 */
 				DeleteCleanupRecordByRecordIdOutsideTransaction(record->recordId);
-				removedShardCountOnComplete++;
 			}
-			else
+			else if (record->objectType == CLEANUP_OBJECT_SHARD_PLACEMENT)
 			{
 				/*
 				 * We log failures at the end, since they occur repeatedly
@@ -629,6 +422,30 @@ FinalizeOperationNeedingCleanupOnSuccess(const char *operationName)
 							  list_length(currentOperationRecordList),
 							  operationName)));
 	}
+}
+
+
+/*
+ * CompareRecordsByObjectType is a comparison function for sort
+ * cleanup records by their object type.
+ */
+static int
+CompareCleanupRecordsByObjectType(const void *leftElement, const void *rightElement)
+{
+	CleanupRecord *leftRecord = *((CleanupRecord **) leftElement);
+	CleanupRecord *rightRecord = *((CleanupRecord **) rightElement);
+
+	/* we compare 64-bit integers, instead of casting their difference to int */
+	if (leftRecord->objectType > rightRecord->objectType)
+	{
+		return 1;
+	}
+	else if (leftRecord->objectType < rightRecord->objectType)
+	{
+		return -1;
+	}
+
+	return 0;
 }
 
 
@@ -680,7 +497,7 @@ InsertCleanupRecordInCurrentTransaction(CleanupObject objectType,
 
 
 /*
- * InsertCleanupRecordInSeparateTransaction inserts a new pg_dist_cleanup_record entry
+ * InsertCleanupRecordInSubtransaction inserts a new pg_dist_cleanup_record entry
  * in a separate transaction to ensure the record persists after rollback. We should
  * delete these records if the operation completes successfully.
  *
@@ -745,36 +562,64 @@ DeleteCleanupRecordByRecordIdOutsideTransaction(uint64 recordId)
 
 
 /*
- * TryLockRelationAndPlacementCleanup tries to lock the given relation
- * and the placement cleanup. If it cannot, it returns false.
- *
+ * TryDropResourceByCleanupRecordOutsideTransaction tries to drop the given resource
+ * and returns true on success.
  */
 static bool
-TryLockRelationAndPlacementCleanup(Oid relationId, LOCKMODE lockmode)
+TryDropResourceByCleanupRecordOutsideTransaction(CleanupRecord *record,
+												 char *nodeName,
+												 int nodePort)
 {
-	if (!ConditionalLockRelationOid(relationId, lockmode))
+	switch (record->objectType)
 	{
-		ereport(DEBUG1, (errmsg(
-							 "could not acquire shard lock to cleanup placements")));
-		return false;
+		case CLEANUP_OBJECT_SHARD_PLACEMENT:
+		{
+			return TryDropShardOutsideTransaction(record->objectName,
+												  nodeName, nodePort);
+		}
+
+		case CLEANUP_OBJECT_SUBSCRIPTION:
+		{
+			return TryDropSubscriptionOutsideTransaction(record->objectName,
+														 nodeName, nodePort);
+		}
+
+		case CLEANUP_OBJECT_PUBLICATION:
+		{
+			return TryDropPublicationOutsideTransaction(record->objectName,
+														nodeName, nodePort);
+		}
+
+		case CLEANUP_OBJECT_REPLICATION_SLOT:
+		{
+			return TryDropReplicationSlotOutsideTransaction(record->objectName,
+															nodeName, nodePort);
+		}
+
+		case CLEANUP_OBJECT_USER:
+		{
+			return TryDropUserOutsideTransaction(record->objectName, nodeName, nodePort);
+		}
+
+		default:
+		{
+			ereport(WARNING, (errmsg(
+								  "Invalid object type %d on failed operation cleanup",
+								  record->objectType)));
+			return false;
+		}
 	}
 
-	if (!TryLockPlacementCleanup())
-	{
-		ereport(DEBUG1, (errmsg("could not acquire lock to cleanup placements")));
-		return false;
-	}
-	return true;
+	return false;
 }
 
 
 /*
- * TryDropShard tries to drop the given shard placement and returns
+ * TryDropShardOutsideTransaction tries to drop the given shard placement and returns
  * true on success.
  */
 static bool
-TryDropShardOutsideTransaction(OperationId operationId,
-							   char *qualifiedTableName,
+TryDropShardOutsideTransaction(char *qualifiedTableName,
 							   char *nodeName,
 							   int nodePort)
 {
@@ -805,6 +650,255 @@ TryDropShardOutsideTransaction(OperationId operationId,
 		dropCommandList);
 
 	return success;
+}
+
+
+/*
+ * TryDropSubscriptionOutsideTransaction drops subscription with the given name on the
+ * subscriber node if it exists. Note that this doesn't drop the replication slot on the
+ * publisher node. The reason is that sometimes this is not possible. To known
+ * cases where this is not possible are:
+ * 1. Due to the node with the replication slot being down.
+ * 2. Due to a deadlock when the replication is on the same node as the
+ *    subscription, which is the case for shard splits to the local node.
+ *
+ * So instead of directly dropping the subscription, including the attached
+ * replication slot, the subscription is first disconnected from the
+ * replication slot before dropping it. The replication slot itself should be
+ * dropped using DropReplicationSlot on the source connection.
+ */
+static bool
+TryDropSubscriptionOutsideTransaction(char *subscriptionName,
+									  char *nodeName,
+									  int nodePort)
+{
+	int connectionFlags = OUTSIDE_TRANSACTION;
+	MultiConnection *connection = GetNodeUserDatabaseConnection(connectionFlags,
+																nodeName, nodePort,
+																CitusExtensionOwnerName(),
+																NULL);
+
+	RemoteTransactionBegin(connection);
+
+	if (ExecuteOptionalRemoteCommand(connection,
+									 "SET LOCAL lock_timeout TO '1s'", NULL) != 0)
+	{
+		RemoteTransactionAbort(connection);
+		ResetRemoteTransaction(connection);
+		return false;
+	}
+
+	int querySent = SendRemoteCommand(
+		connection,
+		psprintf("ALTER SUBSCRIPTION %s DISABLE", quote_identifier(subscriptionName)));
+	if (querySent == 0)
+	{
+		ReportConnectionError(connection, WARNING);
+		RemoteTransactionAbort(connection);
+		ResetRemoteTransaction(connection);
+		return false;
+	}
+
+	bool raiseInterrupts = true;
+	PGresult *result = GetRemoteCommandResult(connection, raiseInterrupts);
+
+	if (!IsResponseOK(result))
+	{
+		char *errorcode = PQresultErrorField(result, PG_DIAG_SQLSTATE);
+		if (errorcode != NULL && strcmp(errorcode, STR_ERRCODE_UNDEFINED_OBJECT) == 0)
+		{
+			/*
+			 * The subscription doesn't exist, so we can return right away.
+			 * This DropSubscription call is effectively a no-op.
+			 */
+			PQclear(result);
+			ForgetResults(connection);
+			RemoteTransactionAbort(connection);
+			ResetRemoteTransaction(connection);
+			return true;
+		}
+		else
+		{
+			ReportResultError(connection, result, WARNING);
+			PQclear(result);
+			ForgetResults(connection);
+			RemoteTransactionAbort(connection);
+			ResetRemoteTransaction(connection);
+			return false;
+		}
+	}
+
+	PQclear(result);
+	ForgetResults(connection);
+	RemoteTransactionCommit(connection);
+	ResetRemoteTransaction(connection);
+
+	StringInfo alterQuery = makeStringInfo();
+	appendStringInfo(alterQuery,
+					 "ALTER SUBSCRIPTION %s SET (slot_name = NONE)",
+					 quote_identifier(subscriptionName));
+
+	StringInfo dropQuery = makeStringInfo();
+	appendStringInfo(dropQuery,
+					 "DROP SUBSCRIPTION %s",
+					 quote_identifier(subscriptionName));
+
+	List *dropCommandList = list_make3("SET LOCAL lock_timeout TO '1s'",
+									   alterQuery->data, dropQuery->data);
+	bool success = SendOptionalCommandListToWorkerOutsideTransactionWithConnection(
+		connection,
+		dropCommandList);
+
+	return success;
+}
+
+
+/*
+ * TryDropPublicationOutsideTransaction drops the publication with the given name if it
+ * exists.
+ */
+static bool
+TryDropPublicationOutsideTransaction(char *publicationName,
+									 char *nodeName,
+									 int nodePort)
+{
+	int connectionFlags = OUTSIDE_TRANSACTION;
+	MultiConnection *connection = GetNodeUserDatabaseConnection(connectionFlags,
+																nodeName, nodePort,
+																CitusExtensionOwnerName(),
+																NULL);
+	StringInfo dropQuery = makeStringInfo();
+	appendStringInfo(dropQuery,
+					 "DROP PUBLICATION IF EXISTS %s",
+					 quote_identifier(publicationName));
+
+	List *dropCommandList = list_make2("SET LOCAL lock_timeout TO '1s'",
+									   dropQuery->data);
+	bool success = SendOptionalCommandListToWorkerOutsideTransactionWithConnection(
+		connection,
+		dropCommandList);
+
+	return success;
+}
+
+
+/*
+ * TryDropReplicationSlotOutsideTransaction drops the replication slot with the given
+ * name if it exists.
+ */
+static bool
+TryDropReplicationSlotOutsideTransaction(char *replicationSlotName,
+										 char *nodeName,
+										 int nodePort)
+{
+	int connectionFlags = OUTSIDE_TRANSACTION;
+	MultiConnection *connection = GetNodeUserDatabaseConnection(connectionFlags,
+																nodeName, nodePort,
+																CitusExtensionOwnerName(),
+																NULL);
+
+	RemoteTransactionBegin(connection);
+
+	if (ExecuteOptionalRemoteCommand(connection,
+									 "SET LOCAL lock_timeout TO '1s'", NULL) != 0)
+	{
+		RemoteTransactionAbort(connection);
+		ResetRemoteTransaction(connection);
+		return false;
+	}
+
+	int querySent = SendRemoteCommand(
+		connection,
+		psprintf(
+			"select pg_drop_replication_slot(slot_name) from "
+			REPLICATION_SLOT_CATALOG_TABLE_NAME
+			" where slot_name = %s",
+			quote_literal_cstr(replicationSlotName))
+		);
+
+	if (querySent == 0)
+	{
+		ReportConnectionError(connection, WARNING);
+		RemoteTransactionAbort(connection);
+		ResetRemoteTransaction(connection);
+		return false;
+	}
+
+	bool raiseInterrupts = true;
+	PGresult *result = GetRemoteCommandResult(connection, raiseInterrupts);
+
+	if (IsResponseOK(result))
+	{
+		PQclear(result);
+		ForgetResults(connection);
+		RemoteTransactionCommit(connection);
+		ResetRemoteTransaction(connection);
+		return true;
+	}
+
+	char *errorcode = PQresultErrorField(result, PG_DIAG_SQLSTATE);
+	if (errorcode != NULL && strcmp(errorcode, STR_ERRCODE_OBJECT_IN_USE) != 0)
+	{
+		/* throw a warning unless object is in use */
+		ReportResultError(connection, result, WARNING);
+	}
+
+	PQclear(result);
+	ForgetResults(connection);
+	RemoteTransactionAbort(connection);
+	ResetRemoteTransaction(connection);
+
+	return false;
+}
+
+
+/*
+ * TryDropUserOutsideTransaction drops the user with the given name if it exists.
+ */
+static bool
+TryDropUserOutsideTransaction(char *username,
+							  char *nodeName, int nodePort)
+{
+	int connectionFlags = OUTSIDE_TRANSACTION;
+	MultiConnection *connection = GetNodeUserDatabaseConnection(connectionFlags,
+																nodeName, nodePort,
+																CitusExtensionOwnerName(),
+																NULL);
+
+	/*
+	 * The DROP USER command should not propagate, so we temporarily disable
+	 * DDL propagation.
+	 */
+	bool success = SendOptionalCommandListToWorkerOutsideTransactionWithConnection(
+		connection,
+		list_make3(
+			"SET LOCAL lock_timeout TO '1s'",
+			"SET LOCAL citus.enable_ddl_propagation TO OFF;",
+			psprintf("DROP USER IF EXISTS %s;",
+					 quote_identifier(username))));
+
+	return success;
+}
+
+
+/*
+ * ErrorIfCleanupRecordForShardExists errors out if a cleanup record for the given
+ * shard name exists.
+ */
+void
+ErrorIfCleanupRecordForShardExists(char *shardName)
+{
+	CleanupRecord *record =
+		GetCleanupRecordByNameAndType(shardName, CLEANUP_OBJECT_SHARD_PLACEMENT);
+
+	if (record == NULL)
+	{
+		return;
+	}
+
+	ereport(ERROR, (errmsg("shard move failed as the orphaned shard %s leftover "
+						   "from the previous move could not be cleaned up",
+						   record->objectName)));
 }
 
 
@@ -932,6 +1026,47 @@ ListCleanupRecordsForCurrentOperation(void)
 	table_close(pgDistCleanup, NoLock);
 
 	return recordList;
+}
+
+
+/*
+ * GetCleanupRecordByNameAndType returns the cleanup record with given name and type,
+ * if any, returns NULL otherwise.
+ */
+static CleanupRecord *
+GetCleanupRecordByNameAndType(char *objectName, CleanupObject type)
+{
+	CleanupRecord *objectFound = NULL;
+
+	Relation pgDistCleanup = table_open(DistCleanupRelationId(), AccessShareLock);
+	TupleDesc tupleDescriptor = RelationGetDescr(pgDistCleanup);
+
+	ScanKeyData scanKey[1];
+	ScanKeyInit(&scanKey[0], Anum_pg_dist_cleanup_object_type, BTEqualStrategyNumber,
+				F_INT4EQ, Int32GetDatum(type));
+
+	int scanKeyCount = 1;
+	Oid scanIndexId = InvalidOid;
+	bool useIndex = false;
+	SysScanDesc scanDescriptor = systable_beginscan(pgDistCleanup, scanIndexId, useIndex,
+													NULL,
+													scanKeyCount, scanKey);
+
+	HeapTuple heapTuple = NULL;
+	while (HeapTupleIsValid(heapTuple = systable_getnext(scanDescriptor)))
+	{
+		CleanupRecord *record = TupleToCleanupRecord(heapTuple, tupleDescriptor);
+		if (strcmp(record->objectName, objectName) == 0)
+		{
+			objectFound = record;
+			break;
+		}
+	}
+
+	systable_endscan(scanDescriptor);
+	table_close(pgDistCleanup, NoLock);
+
+	return objectFound;
 }
 
 

@@ -561,7 +561,7 @@ if($isolationtester)
    # maintenance daemon.
    push(@pgOptions, "citus.distributed_deadlock_detection_factor=-1");
    push(@pgOptions, "citus.recover_2pc_interval=-1");
-   push(@pgOptions, "citus.enable_statistics_collection=-1");
+   push(@pgOptions, "citus.enable_statistics_collection=false");
    push(@pgOptions, "citus.defer_shard_delete_interval=-1");
    push(@pgOptions, "citus.stat_statements_purge_interval=-1");
    push(@pgOptions, "citus.background_task_queue_interval=-1");
@@ -623,6 +623,17 @@ for my $port (@followerWorkerPorts)
 	    remove_tree(catfile($TMP_CHECKDIR, "follower.$port")) or die "Could not remove worker directory";
 	}
 }
+
+for my $tablespace ("ts0", "ts1", "ts2")
+{
+	if (-e catfile($TMP_CHECKDIR, $tablespace))
+	{
+	    remove_tree(catfile($TMP_CHECKDIR, $tablespace)) or die "Could not remove tablespace directory";
+	}
+    system("mkdir", ("-p", catfile($TMP_CHECKDIR, $tablespace))) == 0
+            or die "Could not create vanilla testtablespace dir.";
+}
+
 
 # Prepare directory in which 'psql' has some helpful variables for locating the workers
 make_path(catfile($TMP_CHECKDIR, $TMP_BINDIR)) or die "Could not create $TMP_BINDIR directory $!\n";
@@ -1075,14 +1086,19 @@ sub RunVanillaTests
                     '-c', $citus_depended_object_def)) == 0
                 or die "Could not create FUNCTION is_citus_depended_object on master";
 
-    my $pgregressdir="";
+    # we need to set regress path to find test input files(sqls and schedule)
+    # we need to add regress.so path to dlpath because some tests need to find that lib
+    my $pgregressInputdir="";
+    my $dlpath="";
     if (-f "$vanillaSchedule")
 	{
-	    $pgregressdir=catfile(dirname("$pgxsdir"), "regress");
+	    $pgregressInputdir=catfile(dirname("$pgxsdir"), "regress");
+        $dlpath=dirname("$pgxsdir")
 	}
 	else
 	{
-	    $pgregressdir=catfile("$postgresSrcdir", "src", "test", "regress");
+	    $pgregressInputdir=catfile("$postgresSrcdir", "src", "test", "regress");
+        $dlpath=$pgregressInputdir
 	}
 
     # output dir
@@ -1098,13 +1114,11 @@ sub RunVanillaTests
     system("mkdir", ("-p", "$pgregressOutputdir/sql")) == 0
             or die "Could not create vanilla sql dir.";
 
-    # we need to add regress.so path to dlpath because some tests need to find that lib
-    my $regresslibdir = $pgregressdir;
     $exitcode = system("$plainRegress",
-                        ("--dlpath", $regresslibdir),
-                        ("--inputdir",  $pgregressdir),
+                        ("--dlpath", $dlpath),
+                        ("--inputdir",  $pgregressInputdir),
                         ("--outputdir",  $pgregressOutputdir),
-                        ("--schedule",  catfile("$pgregressdir", "parallel_schedule")),
+                        ("--schedule",  catfile("$pgregressInputdir", "parallel_schedule")),
                         ("--use-existing"),
                         ("--host","$host"),
                         ("--port","$masterPort"),

@@ -125,10 +125,10 @@ SELECT shard.shardid, logicalrelid, shardminvalue, shardmaxvalue, nodename, node
 SET ROLE test_split_role;
 SET search_path TO "citus_split_test_schema";
 SET citus.next_shard_id TO 8981007;
-SET citus.defer_drop_after_shard_move TO OFF;
 
 SELECT citus_move_shard_placement(8981000, 'localhost', :worker_1_port, 'localhost', :worker_2_port, shard_transfer_mode:='force_logical');
 -- END : Move one shard before we split it.
+SELECT public.wait_for_resource_cleanup();
 
 -- BEGIN : Set node id variables
 SELECT nodeid AS worker_1_node FROM pg_dist_node WHERE nodeport=:worker_1_port \gset
@@ -144,7 +144,7 @@ SELECT pg_catalog.citus_split_shard_by_split_points(
     'block_writes');
 
 -- BEGIN: Perform deferred cleanup.
-CALL pg_catalog.citus_cleanup_orphaned_resources();
+SELECT public.wait_for_resource_cleanup();
 -- END: Perform deferred cleanup.
 
 -- Perform 3 way split
@@ -156,12 +156,14 @@ SELECT pg_catalog.citus_split_shard_by_split_points(
 -- END : Split two shards : One with move and One without move.
 
 -- BEGIN: Perform deferred cleanup.
-CALL pg_catalog.citus_cleanup_orphaned_resources();
+SELECT public.wait_for_resource_cleanup();
 -- END: Perform deferred cleanup.
 
 -- BEGIN : Move a shard post split.
 SELECT citus_move_shard_placement(8981007, 'localhost', :worker_1_port, 'localhost', :worker_2_port, shard_transfer_mode:='block_writes');
 -- END : Move a shard post split.
+
+SELECT public.wait_for_resource_cleanup();
 
 -- BEGIN : Display current state.
 SELECT shard.shardid, logicalrelid, shardminvalue, shardmaxvalue, nodename, nodeport
@@ -230,7 +232,7 @@ SELECT pg_catalog.citus_split_shard_by_split_points(
     'block_writes');
 
 -- BEGIN: Perform deferred cleanup.
-CALL pg_catalog.citus_cleanup_orphaned_resources();
+SELECT public.wait_for_resource_cleanup();
 -- END: Perform deferred cleanup.
 
 SET search_path TO "citus_split_test_schema";
@@ -254,4 +256,5 @@ SELECT COUNT(*) FROM colocated_dist_table;
 ALTER SYSTEM RESET citus.defer_shard_delete_interval;
 SELECT pg_reload_conf();
 DROP SCHEMA "citus_split_test_schema" CASCADE;
+DROP USER test_split_role;
 --END : Cleanup

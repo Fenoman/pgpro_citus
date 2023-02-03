@@ -212,6 +212,7 @@ typedef struct MetadataCacheData
 	Oid jsonbExtractPathFuncId;
 	Oid jsonbExtractPathTextFuncId;
 	Oid CitusDependentObjectFuncId;
+	Oid distClockLogicalSequenceId;
 	bool databaseNameValid;
 	char databaseName[NAMEDATALEN];
 } MetadataCacheData;
@@ -1000,10 +1001,6 @@ ActiveShardPlacementOnGroup(int32 groupId, uint64 shardId)
 	{
 		return NULL;
 	}
-	if (placement->shardState != SHARD_STATE_ACTIVE)
-	{
-		return NULL;
-	}
 	return placement;
 }
 
@@ -1172,14 +1169,13 @@ LookupNodeForGroup(int32 groupId)
 
 /*
  * ShardPlacementList returns the list of placements for the given shard from
- * the cache. This list includes placements that are orphaned, because they
- * their deletion is postponed to a later point (shardstate = 4).
+ * the cache.
  *
  * The returned list is deep copied from the cache and thus can be modified
  * and pfree()d freely.
  */
 List *
-ShardPlacementListIncludingOrphanedPlacements(uint64 shardId)
+ShardPlacementList(uint64 shardId)
 {
 	List *placementList = NIL;
 
@@ -2595,6 +2591,16 @@ DistBackgroundTaskTaskIdSequenceId(void)
 						 &MetadataCache.distBackgroundTaskTaskIdSequenceId);
 
 	return MetadataCache.distBackgroundTaskTaskIdSequenceId;
+}
+
+
+Oid
+DistClockLogicalSequenceId(void)
+{
+	CachedRelationLookup("pg_dist_clock_logical_seq",
+						 &MetadataCache.distClockLogicalSequenceId);
+
+	return MetadataCache.distClockLogicalSequenceId;
 }
 
 

@@ -77,7 +77,6 @@ typedef struct GroupShardPlacement
 	uint64 placementId;     /* sequence that implies this placement creation order */
 	uint64 shardId;
 	uint64 shardLength;
-	ShardState shardState;
 	int32 groupId;
 } GroupShardPlacement;
 
@@ -92,7 +91,6 @@ typedef struct ShardPlacement
 	uint64 placementId;
 	uint64 shardId;
 	uint64 shardLength;
-	ShardState shardState;
 	int32 groupId;
 
 	/* the rest of the fields aren't from pg_dist_placement */
@@ -286,8 +284,7 @@ extern int ShardIntervalCount(Oid relationId);
 extern List * LoadShardList(Oid relationId);
 extern ShardInterval * CopyShardInterval(ShardInterval *srcInterval);
 extern uint64 ShardLength(uint64 shardId);
-extern bool NodeGroupHasShardPlacements(int32 groupId,
-										bool onlyConsiderActivePlacements);
+extern bool NodeGroupHasShardPlacements(int32 groupId);
 extern bool IsActiveShardPlacement(ShardPlacement *ShardPlacement);
 extern bool IsPlacementOnWorkerNode(ShardPlacement *placement, WorkerNode *workerNode);
 extern List * FilterShardPlacementList(List *shardPlacementList, bool (*filter)(
@@ -296,12 +293,11 @@ extern List * FilterActiveShardPlacementListByNode(List *shardPlacementList,
 												   WorkerNode *workerNode);
 extern List * ActiveShardPlacementListOnGroup(uint64 shardId, int32 groupId);
 extern List * ActiveShardPlacementList(uint64 shardId);
-extern List * ShardPlacementListWithoutOrphanedPlacements(uint64 shardId);
+extern List * ShardPlacementListSortedByWorker(uint64 shardId);
 extern ShardPlacement * ActiveShardPlacement(uint64 shardId, bool missingOk);
 extern WorkerNode * ActiveShardPlacementWorkerNode(uint64 shardId);
 extern List * BuildShardPlacementList(int64 shardId);
 extern List * AllShardPlacementsOnNodeGroup(int32 groupId);
-extern List * AllShardPlacementsWithShardPlacementState(ShardState shardState);
 extern List * GroupShardPlacementsForTableOnGroup(Oid relationId, int32 groupId);
 extern StringInfo GenerateSizeQueryOnMultiplePlacements(List *shardIntervalList,
 														SizeQueryType sizeQueryType,
@@ -313,8 +309,7 @@ extern void InsertShardRow(Oid relationId, uint64 shardId, char storageType,
 						   text *shardMinValue, text *shardMaxValue);
 extern void DeleteShardRow(uint64 shardId);
 extern uint64 InsertShardPlacementRow(uint64 shardId, uint64 placementId,
-									  char shardState, uint64 shardLength,
-									  int32 groupId);
+									  uint64 shardLength, int32 groupId);
 extern void InsertIntoPgDistPartition(Oid relationId, char distributionMethod,
 									  Var *distributionColumn, uint32 colocationId,
 									  char replicationModel, bool autoConverted);
@@ -325,13 +320,11 @@ extern void UpdateDistributionColumn(Oid relationId, char distributionMethod,
 									 Var *distributionColumn, int colocationId);
 extern void DeletePartitionRow(Oid distributedRelationId);
 extern void DeleteShardRow(uint64 shardId);
-extern void UpdateShardPlacementState(uint64 placementId, char shardState);
 extern void UpdatePlacementGroupId(uint64 placementId, int groupId);
 extern void DeleteShardPlacementRow(uint64 placementId);
 extern void CreateDistributedTable(Oid relationId, char *distributionColumnName,
 								   char distributionMethod, int shardCount,
-								   bool shardCountIsStrict, char *colocateWithTableName,
-								   bool viaDeprecatedAPI);
+								   bool shardCountIsStrict, char *colocateWithTableName);
 extern void CreateTruncateTrigger(Oid relationId);
 extern TableConversionReturn * UndistributeTable(TableConversionParameters *params);
 
@@ -360,7 +353,8 @@ extern void EnsureRelationExists(Oid relationId);
 extern bool RegularTable(Oid relationId);
 extern bool TableEmpty(Oid tableId);
 extern bool IsForeignTable(Oid relationId);
-extern bool RelationUsesIdentityColumns(TupleDesc relationDesc);
+extern bool ForeignTableDropsTableNameOption(List *optionList);
+extern bool ServerUsesPostgresFdw(Oid serverId);
 extern char * ConstructQualifiedShardName(ShardInterval *shardInterval);
 extern uint64 GetFirstShardId(Oid relationId);
 extern Datum StringToDatum(char *inputString, Oid dataType);

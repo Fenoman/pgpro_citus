@@ -153,6 +153,8 @@ typedef enum SearchForeignKeyColumnFlags
 	/* callers can also pass union of above flags */
 } SearchForeignKeyColumnFlags;
 
+/* begin.c - forward declarations */
+extern void SaveBeginCommandProperties(TransactionStmt *transactionStmt);
 
 /* cluster.c - forward declarations */
 extern List * PreprocessClusterStmt(Node *node, const char *clusterCommand,
@@ -285,7 +287,6 @@ extern bool TableHasExternalForeignKeys(Oid relationId);
 extern List * GetForeignKeyOids(Oid relationId, int flags);
 extern Oid GetReferencedTableId(Oid foreignKeyId);
 extern Oid GetReferencingTableId(Oid foreignKeyId);
-extern void EnableSkippingConstraintValidation(void);
 extern bool RelationInvolvedInAnyNonInheritedForeignKeys(Oid relationId);
 
 
@@ -383,6 +384,9 @@ extern bool IsReindexWithParam_compat(ReindexStmt *stmt, char *paramName);
 extern List * CreateExtensionStmtObjectAddress(Node *stmt, bool missing_ok, bool
 											   isPostprocess);
 
+/* owned.c -  forward declarations */
+extern List * PreprocessDropOwnedStmt(Node *node, const char *queryString,
+									  ProcessUtilityContext processUtilityContext);
 
 /* policy.c -  forward declarations */
 extern List * CreatePolicyCommands(Oid relationId);
@@ -403,6 +407,7 @@ extern void RenamePolicyEventExtendNames(RenameStmt *stmt, const char *schemaNam
 extern void DropPolicyEventExtendNames(DropStmt *stmt, const char *schemaName, uint64
 									   shardId);
 
+extern void AddRangeTableEntryToQueryCompat(ParseState *parseState, Relation relation);
 
 /* rename.c - forward declarations*/
 extern List * PreprocessRenameStmt(Node *renameStmt, const char *renameCommand,
@@ -541,7 +546,8 @@ extern List * PreprocessAlterTableMoveAllStmt(Node *node, const char *queryStrin
 											  ProcessUtilityContext processUtilityContext);
 extern List * PreprocessAlterTableSchemaStmt(Node *node, const char *queryString,
 											 ProcessUtilityContext processUtilityContext);
-extern void SkipForeignKeyValidationIfConstraintIsFkey(AlterTableStmt *alterTableStmt);
+extern void SkipForeignKeyValidationIfConstraintIsFkey(AlterTableStmt *alterTableStmt,
+													   bool processLocalRelation);
 extern bool IsAlterTableRenameStmt(RenameStmt *renameStmt);
 extern void ErrorIfAlterDropsPartitionColumn(AlterTableStmt *alterTableStatement);
 extern void PostprocessAlterTableStmt(AlterTableStmt *pStmt);
@@ -556,7 +562,9 @@ extern List * AlterTableSchemaStmtObjectAddress(Node *stmt,
 extern List * MakeNameListFromRangeVar(const RangeVar *rel);
 extern Oid GetSequenceOid(Oid relationId, AttrNumber attnum);
 extern bool ConstrTypeUsesIndex(ConstrType constrType);
-
+extern bool ConstrTypeCitusCanDefaultName(ConstrType constrType);
+extern char * GetAlterColumnWithNextvalDefaultCmd(Oid sequenceOid, Oid relationId,
+												  char *colname, bool missingTableOk);
 
 /* text_search.c - forward declarations */
 extern List * GetCreateTextSearchConfigStatements(const ObjectAddress *address);
@@ -691,6 +699,7 @@ extern void AlterTriggerDependsEventExtendNames(
 	AlterObjectDependsStmt *alterTriggerDependsStmt,
 	char *schemaName, uint64 shardId);
 extern void ErrorOutForTriggerIfNotSupported(Oid relationId);
+extern void ErrorIfRelationHasUnsupportedTrigger(Oid relationId);
 extern List * PreprocessDropTriggerStmt(Node *node, const char *queryString,
 										ProcessUtilityContext processUtilityContext);
 extern void DropTriggerEventExtendNames(DropStmt *dropTriggerStmt, char *schemaName,

@@ -29,7 +29,27 @@ Take a look at the makefile for a list of all the testing targets.
 ### Running a specific test
 
 Often you want to run a specific test and don't want to run everything. You can
-use one of the following commands to do so:
+simply use `run_test.py [test_name]` script like below in that case. It detects the test schedule
+and make target to run the given test.
+
+```bash
+src/test/regress/citus_tests/run_test.py multi_utility_warnings
+```
+You can pass `--repeat` or `r` parameter to run the given test for multiple times.
+
+```bash
+src/test/regress/citus_tests/run_test.py multi_utility_warnings -r 1000
+```
+
+To force the script to use base schedules rather than minimal ones, you can
+pass `-b` or `--use-base-schedule`.
+
+```bash
+src/test/regress/citus_tests/run_test.py coordinator_shouldhaveshards -r 1000 --use-base-schedule
+```
+
+If you would like to run a specific test on a certain target you can use one
+of the following commands to do so:
 
 ```bash
 # If your tests needs almost no setup you can use check-minimal
@@ -41,6 +61,7 @@ make install -j9 && make -C src/test/regress/ check-base EXTRA_TESTS='with_prepa
 # the test you want to run. You can do so by adding it to EXTRA_TESTS too.
 make install -j9 && make -C src/test/regress/ check-base EXTRA_TESTS='add_coordinator coordinator_shouldhaveshards'
 ```
+
 
 ## Normalization
 
@@ -100,7 +121,39 @@ To automatically setup a citus cluster in tests we use our
 then starts the standard postgres test tooling. You almost never have to change
 this file.
 
+## Handling different test outputs
+
+Sometimes the test output changes because we run tests in different configurations.
+The most common example is an output that changes in different Postgres versions.
+We highly encourage to find a way to avoid these test outputs.
+You can try the following, if applicable to the changing output:
+- Change the test such that you still test what you want, but you avoid the different test outputs.
+- Reduce the test verbosity via: `\set VERBOSITY terse`, `SET client_min_messages TO error`, etc
+- Drop the specific test lines altogether, if the test is not critical.
+- Use utility functions that modify the output to your preference,
+like [coordinator_plan](https://github.com/citusdata/citus/blob/main/src/test/regress/sql/multi_test_helpers.sql#L23),
+which modifies EXPLAIN output
+- Add [a normalization rule](https://github.com/citusdata/citus/blob/main/ci/README.md#normalize_expectedsh)
+
+Alternative test output files are highly discouraged, so only add one when strictly necessary.
+In order to maintain a clean test suite, make sure to explain why it has an alternative
+output in the test header, and when we can drop the alternative output file in the future.
+
+For example:
+
+```sql
+--
+-- MULTI_INSERT_SELECT
+--
+-- This test file has an alternative output because of the change in the
+-- display of SQL-standard function's arguments in INSERT/SELECT in PG15.
+-- The alternative output can be deleted when we drop support for PG14
+--
+```
+Including important keywords, like "PG14", "PG15", "alternative output" will
+help cleaning up in the future.
+
 ## Randomly failing tests
 
 In CI sometimes a test fails randomly, we call these tests "flaky". To fix these
-flaky tests see [`src/test/regress/flaky_tests.md`](https://github.com/citusdata/citus/blob/master/src/test/regress/mitmscripts/README.md)
+flaky tests see [`src/test/regress/flaky_tests.md`](https://github.com/citusdata/citus/blob/main/src/test/regress/flaky_tests.md)

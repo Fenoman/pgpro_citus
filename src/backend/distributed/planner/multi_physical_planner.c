@@ -316,11 +316,6 @@ BuildJobTree(MultiTreeRoot *multiTree)
 				boundaryNodeJobType = JOIN_MAP_MERGE_JOB;
 			}
 		}
-		else if (currentNodeType == T_MultiPartition &&
-				 parentNodeType == T_MultiExtendedOp)
-		{
-			boundaryNodeJobType = SUBQUERY_MAP_MERGE_JOB;
-		}
 		else if (currentNodeType == T_MultiCollect &&
 				 parentNodeType != T_MultiPartition)
 		{
@@ -1954,10 +1949,7 @@ BuildMapMergeJob(Query *jobQuery, List *dependentJobList, Var *partitionKey,
 	Var *partitionColumn = copyObject(partitionKey);
 
 	/* update the logical partition key's table and column identifiers */
-	if (boundaryNodeJobType != SUBQUERY_MAP_MERGE_JOB)
-	{
-		UpdateColumnAttributes(partitionColumn, rangeTableList, dependentJobList);
-	}
+	UpdateColumnAttributes(partitionColumn, rangeTableList, dependentJobList);
 
 	MapMergeJob *mapMergeJob = CitusMakeNode(MapMergeJob);
 	mapMergeJob->job.jobId = UniqueJobId();
@@ -2472,7 +2464,7 @@ QueryPushdownTaskCreate(Query *originalQuery, int shardIndex,
 	 * If it is a modify query with sub-select, we need to set result relation shard's id
 	 * as anchor shard id.
 	 */
-	if (UpdateOrDeleteQuery(originalQuery))
+	if (UpdateOrDeleteOrMergeQuery(originalQuery))
 	{
 		resultRangeTable = rt_fetch(originalQuery->resultRelation, originalQuery->rtable);
 		resultRelationOid = resultRangeTable->relid;
@@ -2501,7 +2493,7 @@ QueryPushdownTaskCreate(Query *originalQuery, int shardIndex,
 				anchorShardId = shardInterval->shardId;
 			}
 		}
-		else if (UpdateOrDeleteQuery(originalQuery))
+		else if (UpdateOrDeleteOrMergeQuery(originalQuery))
 		{
 			shardInterval = cacheEntry->sortedShardIntervalArray[shardIndex];
 			if (!modifyWithSubselect || relationId == resultRelationOid)

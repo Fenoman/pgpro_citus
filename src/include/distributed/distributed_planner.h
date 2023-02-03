@@ -29,6 +29,11 @@
 
 #define CURSOR_OPT_FORCE_DISTRIBUTED 0x080000
 
+/* Hack to compile Citus on pre-MERGE Postgres versions */
+#if PG_VERSION_NUM < PG_VERSION_15
+#define CMD_MERGE CMD_UNKNOWN
+#endif
+
 
 /* level of planner calls */
 extern int PlannerLevel;
@@ -72,6 +77,7 @@ typedef struct JoinRestrictionContext
 {
 	List *joinRestrictionList;
 	bool hasSemiJoin;
+	bool hasOuterJoin;
 } JoinRestrictionContext;
 
 typedef struct JoinRestriction
@@ -240,11 +246,15 @@ extern PlannedStmt * FinalizePlan(PlannedStmt *localPlan,
 extern RTEListProperties * GetRTEListPropertiesForQuery(Query *query);
 
 
-extern struct DistributedPlan * CreateDistributedPlan(uint64 planId, Query *originalQuery,
-													  Query *query, ParamListInfo
-													  boundParams, bool
-													  hasUnresolvedParams,
+extern struct DistributedPlan * CreateDistributedPlan(uint64 planId,
+													  bool allowRecursivePlanning,
+													  Query *originalQuery,
+													  Query *query,
+													  ParamListInfo boundParams,
+													  bool hasUnresolvedParams,
 													  PlannerRestrictionContext *
 													  plannerRestrictionContext);
+
+extern bool IsMergeAllowedOnRelation(Query *parse, RangeTblEntry *rte);
 
 #endif /* DISTRIBUTED_PLANNER_H */

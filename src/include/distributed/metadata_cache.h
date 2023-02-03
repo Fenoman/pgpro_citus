@@ -174,7 +174,7 @@ extern int32 GetLocalGroupId(void);
 extern int32 GetLocalNodeId(void);
 extern void CitusTableCacheFlushInvalidatedEntries(void);
 extern Oid LookupShardRelationFromCatalog(int64 shardId, bool missing_ok);
-extern List * ShardPlacementListIncludingOrphanedPlacements(uint64 shardId);
+extern List * ShardPlacementList(uint64 shardId);
 extern void CitusInvalidateRelcacheByRelid(Oid relationId);
 extern void CitusInvalidateRelcacheByShardId(int64 shardId);
 extern void InvalidateForeignKeyGraph(void);
@@ -262,6 +262,7 @@ extern Oid DistCleanupPrimaryKeyIndexId(void);
 /* sequence oids */
 extern Oid DistBackgroundJobJobIdSequenceId(void);
 extern Oid DistBackgroundTaskTaskIdSequenceId(void);
+extern Oid DistClockLogicalSequenceId(void);
 
 /* type oids */
 extern Oid LookupTypeOid(char *schemaNameSting, char *typeNameString);

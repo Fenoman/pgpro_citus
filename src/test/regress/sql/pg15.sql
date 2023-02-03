@@ -160,7 +160,7 @@ SELECT undistribute_table('generated_stored_ref');
 
 --
 -- In PG15, there is a new command called MERGE
--- It is currently not supported for Citus tables
+-- It is currently not supported for Citus non-local tables
 -- Test the behavior with various commands with Citus table types
 -- Relevant PG Commit: 7103ebb7aae8ab8076b7e85f335ceb8fe799097c
 --
@@ -309,6 +309,47 @@ INSERT INTO numeric_scale_gt_precision SELECT x FROM generate_series(0.01234, 0.
 SELECT * FROM numeric_scale_gt_precision ORDER BY 1;
 -- verify we can route queries to the right shards
 SELECT * FROM numeric_scale_gt_precision WHERE numeric_column=0.027;
+
+-- test repartition joins on tables distributed on numeric types with negative scale
+CREATE TABLE numeric_repartition_first(id int, data int, numeric_column numeric(3,-1));
+CREATE TABLE numeric_repartition_second(id int, data int, numeric_column numeric(3,-1));
+
+-- populate tables
+INSERT INTO numeric_repartition_first SELECT x, x, x FROM generate_series (100, 115) x;
+INSERT INTO numeric_repartition_second SELECT x, x, x FROM generate_series (100, 115) x;
+
+-- Run some queries before distributing the tables to see results in vanilla PG
+SELECT count(*)
+FROM numeric_repartition_first f,
+     numeric_repartition_second s
+WHERE f.id = s.numeric_column;
+
+SELECT count(*)
+FROM numeric_repartition_first f,
+     numeric_repartition_second s
+WHERE f.numeric_column = s.numeric_column;
+
+-- distribute tables and re-run the same queries
+SELECT * FROM create_distributed_table('numeric_repartition_first','id');
+SELECT * FROM create_distributed_table('numeric_repartition_second','id');
+
+SET citus.enable_repartition_joins TO 1;
+
+SELECT count(*)
+FROM numeric_repartition_first f,
+     numeric_repartition_second s
+WHERE f.id = s.numeric_column;
+
+-- show that the same query works if we use an int column instead of a numeric on the filter clause
+SELECT count(*)
+FROM numeric_repartition_first f,
+     numeric_repartition_second s
+WHERE f.id = s.data;
+
+SELECT count(*)
+FROM numeric_repartition_first f,
+     numeric_repartition_second s
+WHERE f.numeric_column = s.numeric_column;
 
 -- test new regex functions
 -- print order comments that contain the word `fluffily` at least twice
@@ -513,7 +554,7 @@ SET search_path TO pg15;
 
 -- test NULL NOT DISTINCT clauses
 -- set the next shard id so that the error messages are easier to maintain
-SET citus.next_shard_id TO 960050;
+SET citus.next_shard_id TO 960150;
 CREATE TABLE null_distinct_test(id INT, c1 INT, c2 INT, c3 VARCHAR(10)) ;
 SELECT create_distributed_table('null_distinct_test', 'id');
 
@@ -798,6 +839,11 @@ SET client_min_messages to ERROR;
 SELECT 1 FROM citus_add_node('localhost', :master_port, groupId => 0);
 RESET client_min_messages;
 
+-- this works around bug #6476: the CREATE TABLE below will
+-- self-deadlock on PG15 if it also replicates reference
+-- tables to the coordinator.
+SELECT replicate_reference_tables(shard_transfer_mode := 'block_writes');
+
 -- should error since col_3 defaults to a sequence
 CREATE TABLE set_on_default_test_referencing(
     col_1 int, col_2 int, col_3 serial, col_4 int,
@@ -878,7 +924,24 @@ DROP SERVER foreign_server CASCADE;
 CREATE DATABASE db_with_oid OID 987654;
 DROP DATABASE db_with_oid;
 
+-- SET ACCESS METHOD
+-- Create a heap2 table am handler with heapam handler
+CREATE ACCESS METHOD heap2 TYPE TABLE HANDLER heap_tableam_handler;
+SELECT run_command_on_workers($$CREATE ACCESS METHOD heap2 TYPE TABLE HANDLER heap_tableam_handler$$);
+CREATE TABLE mx_ddl_table2 (
+    key int primary key,
+    value int
+);
+SELECT create_distributed_table('mx_ddl_table2', 'key', 'hash', shard_count=> 4);
+ALTER TABLE mx_ddl_table2 SET ACCESS METHOD heap2;
+
+DROP TABLE mx_ddl_table2;
+DROP ACCESS METHOD heap2;
+SELECT run_command_on_workers($$DROP ACCESS METHOD heap2$$);
+
 -- Clean up
 \set VERBOSITY terse
 SET client_min_messages TO ERROR;
 DROP SCHEMA pg15 CASCADE;
+DROP ROLE rls_tenant_1;
+DROP ROLE rls_tenant_2;

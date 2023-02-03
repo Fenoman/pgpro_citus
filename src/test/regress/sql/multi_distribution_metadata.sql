@@ -84,7 +84,7 @@ CREATE TABLE events_range (
 	id bigint,
 	name text
 );
-SELECT master_create_distributed_table('events_range', 'name', 'range');
+SELECT create_distributed_table('events_range', 'name', 'range');
 
 -- create empty shard
 SELECT master_create_empty_shard('events_range');
@@ -101,9 +101,6 @@ SELECT load_shard_interval_array(540005, 0);
 
 -- should see two placements
 SELECT load_shard_placement_array(540001, false);
-
--- only one of which is active
-SELECT load_shard_placement_array(540001, true);
 
 -- should see error for non-existent shard
 SELECT load_shard_placement_array(540001, false);

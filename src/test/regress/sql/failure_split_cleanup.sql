@@ -16,6 +16,9 @@ SET citus.shard_count TO 2;
 SET citus.shard_replication_factor TO 1;
 SELECT pg_backend_pid() as pid \gset
 
+-- cleanup any leftovers from previous tests so we get consistent output
+SELECT public.wait_for_resource_cleanup();
+
 -- Disable defer shard delete to stop auto cleanup.
 ALTER SYSTEM SET citus.defer_shard_delete_interval TO -1;
 SELECT pg_reload_conf();
@@ -35,7 +38,7 @@ SELECT create_distributed_table('table_to_split', 'id');
         ARRAY[:worker_1_node, :worker_2_node],
         'force_logical');
     SELECT operation_id, object_type, object_name, node_group_id, policy_type
-    FROM pg_dist_cleanup where operation_id = 777;
+    FROM pg_dist_cleanup where operation_id = 777 ORDER BY object_name;
 
     -- we need to allow connection so that we can connect to proxy
     SELECT citus.mitmproxy('conn.allow()');
@@ -53,9 +56,9 @@ SELECT create_distributed_table('table_to_split', 'id');
     SELECT subname FROM pg_subscription;
 
     \c - postgres - :master_port
-    CALL pg_catalog.citus_cleanup_orphaned_resources();
+    SELECT public.wait_for_resource_cleanup();
     SELECT operation_id, object_type, object_name, node_group_id, policy_type
-    FROM pg_dist_cleanup where operation_id = 777;
+    FROM pg_dist_cleanup where operation_id = 777 ORDER BY object_name;
 
     \c - - - :worker_2_proxy_port
     SET search_path TO "citus_failure_split_cleanup_schema", public, pg_catalog;
@@ -76,13 +79,18 @@ SELECT create_distributed_table('table_to_split', 'id');
     SET citus.next_cleanup_record_id TO 11;
 
     SELECT citus.mitmproxy('conn.onQuery(query="SELECT \* FROM pg_catalog.worker_split_shard_replication_setup\(.*").killall()');
+
+    -- set log level to prevent flakiness
+    SET client_min_messages TO ERROR;
     SELECT pg_catalog.citus_split_shard_by_split_points(
         8981000,
         ARRAY['-100000'],
         ARRAY[:worker_1_node, :worker_2_node],
         'force_logical');
+    RESET client_min_messages;
+
     SELECT operation_id, object_type, object_name, node_group_id, policy_type
-    FROM pg_dist_cleanup where operation_id = 777;
+    FROM pg_dist_cleanup where operation_id = 777 ORDER BY object_name;
     -- we need to allow connection so that we can connect to proxy
     SELECT citus.mitmproxy('conn.allow()');
 
@@ -99,9 +107,9 @@ SELECT create_distributed_table('table_to_split', 'id');
     SELECT subname FROM pg_subscription;
 
     \c - postgres - :master_port
-    CALL pg_catalog.citus_cleanup_orphaned_resources();
+    SELECT public.wait_for_resource_cleanup();
     SELECT operation_id, object_type, object_name, node_group_id, policy_type
-    FROM pg_dist_cleanup where operation_id = 777;
+    FROM pg_dist_cleanup where operation_id = 777 ORDER BY object_name;
 
     \c - - - :worker_2_proxy_port
     SET search_path TO "citus_failure_split_cleanup_schema", public, pg_catalog;
@@ -128,7 +136,7 @@ SELECT create_distributed_table('table_to_split', 'id');
         ARRAY[:worker_1_node, :worker_2_node],
         'force_logical');
     SELECT operation_id, object_type, object_name, node_group_id, policy_type
-    FROM pg_dist_cleanup where operation_id = 777;
+    FROM pg_dist_cleanup where operation_id = 777 ORDER BY object_name;
     -- we need to allow connection so that we can connect to proxy
     SELECT citus.mitmproxy('conn.allow()');
 
@@ -145,9 +153,9 @@ SELECT create_distributed_table('table_to_split', 'id');
     SELECT subname FROM pg_subscription;
 
     \c - postgres - :master_port
-    CALL pg_catalog.citus_cleanup_orphaned_resources();
+    SELECT public.wait_for_resource_cleanup();
     SELECT operation_id, object_type, object_name, node_group_id, policy_type
-    FROM pg_dist_cleanup where operation_id = 777;
+    FROM pg_dist_cleanup where operation_id = 777 ORDER BY object_name;
 
     \c - - - :worker_2_proxy_port
     SET search_path TO "citus_failure_split_cleanup_schema", public, pg_catalog;
@@ -174,7 +182,7 @@ SELECT create_distributed_table('table_to_split', 'id');
         ARRAY[:worker_1_node, :worker_2_node],
         'force_logical');
     SELECT operation_id, object_type, object_name, node_group_id, policy_type
-    FROM pg_dist_cleanup where operation_id = 777;
+    FROM pg_dist_cleanup where operation_id = 777 ORDER BY object_name;
     -- we need to allow connection so that we can connect to proxy
     SELECT citus.mitmproxy('conn.allow()');
 
@@ -191,9 +199,9 @@ SELECT create_distributed_table('table_to_split', 'id');
     SELECT subname FROM pg_subscription;
 
     \c - postgres - :master_port
-    CALL pg_catalog.citus_cleanup_orphaned_resources();
+    SELECT public.wait_for_resource_cleanup();
     SELECT operation_id, object_type, object_name, node_group_id, policy_type
-    FROM pg_dist_cleanup where operation_id = 777;
+    FROM pg_dist_cleanup where operation_id = 777 ORDER BY object_name;
 
     \c - - - :worker_2_proxy_port
     SET search_path TO "citus_failure_split_cleanup_schema", public, pg_catalog;
@@ -220,7 +228,7 @@ SELECT create_distributed_table('table_to_split', 'id');
         ARRAY[:worker_1_node, :worker_2_node],
         'force_logical');
     SELECT operation_id, object_type, object_name, node_group_id, policy_type
-    FROM pg_dist_cleanup where operation_id = 777;
+    FROM pg_dist_cleanup where operation_id = 777 ORDER BY object_name;
     -- we need to allow connection so that we can connect to proxy
     SELECT citus.mitmproxy('conn.allow()');
 
@@ -237,9 +245,9 @@ SELECT create_distributed_table('table_to_split', 'id');
     SELECT subname FROM pg_subscription;
 
     \c - postgres - :master_port
-    CALL pg_catalog.citus_cleanup_orphaned_resources();
+    SELECT public.wait_for_resource_cleanup();
     SELECT operation_id, object_type, object_name, node_group_id, policy_type
-    FROM pg_dist_cleanup where operation_id = 777;
+    FROM pg_dist_cleanup where operation_id = 777 ORDER BY object_name;
 
     \c - - - :worker_2_proxy_port
     SET search_path TO "citus_failure_split_cleanup_schema", public, pg_catalog;
@@ -265,10 +273,9 @@ SELECT create_distributed_table('table_to_split', 'id');
         ARRAY['-100000'],
         ARRAY[:worker_1_node, :worker_2_node],
         'force_logical');
-    -- NO records expected as we fail at 'DropAllLogicalReplicationLeftovers' before creating
-    -- any resources.
+
     SELECT operation_id, object_type, object_name, node_group_id, policy_type
-    FROM pg_dist_cleanup where operation_id = 777;
+    FROM pg_dist_cleanup where operation_id = 777 ORDER BY object_name;
     SELECT relname FROM pg_class where relname LIKE '%table_to_split_%' AND relkind = 'r' order by relname;
     -- we need to allow connection so that we can connect to proxy
     SELECT citus.mitmproxy('conn.allow()');
@@ -286,9 +293,9 @@ SELECT create_distributed_table('table_to_split', 'id');
     SELECT subname FROM pg_subscription;
 
     \c - postgres - :master_port
-    CALL pg_catalog.citus_cleanup_orphaned_resources();
+    SELECT public.wait_for_resource_cleanup();
     SELECT operation_id, object_type, object_name, node_group_id, policy_type
-    FROM pg_dist_cleanup where operation_id = 777;
+    FROM pg_dist_cleanup where operation_id = 777 ORDER BY object_name;
 
     \c - - - :worker_2_proxy_port
     SET search_path TO "citus_failure_split_cleanup_schema", public, pg_catalog;
@@ -304,5 +311,7 @@ SELECT create_distributed_table('table_to_split', 'id');
 
 -- Cleanup
 \c - postgres - :master_port
+
+SET client_min_messages TO WARNING;
 DROP SCHEMA "citus_failure_split_cleanup_schema" CASCADE;
 -- Cleanup

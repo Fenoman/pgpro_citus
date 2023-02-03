@@ -1020,7 +1020,8 @@ SELECT
 FROM
 	reference_table_test, colocated_table_test
 WHERE
-	colocated_table_test.value_1 = reference_table_test.value_1;
+	colocated_table_test.value_1 = reference_table_test.value_1
+ORDER BY 1;
 LOG:  join order: [ "colocated_table_test" ][ reference join "reference_table_test" ]
  value_1
 ---------------------------------------------------------------------
@@ -1033,7 +1034,8 @@ SELECT
 FROM
 	reference_table_test, colocated_table_test
 WHERE
-	colocated_table_test.value_2 = reference_table_test.value_2;
+	colocated_table_test.value_2 = reference_table_test.value_2
+ORDER BY 1;
 LOG:  join order: [ "colocated_table_test" ][ reference join "reference_table_test" ]
  value_2
 ---------------------------------------------------------------------
@@ -1046,7 +1048,8 @@ SELECT
 FROM
 	colocated_table_test, reference_table_test
 WHERE
-	reference_table_test.value_1 = colocated_table_test.value_1;
+	reference_table_test.value_1 = colocated_table_test.value_1
+ORDER BY 1;
 LOG:  join order: [ "colocated_table_test" ][ reference join "reference_table_test" ]
  value_2
 ---------------------------------------------------------------------
@@ -1150,6 +1153,7 @@ FROM
 	colocated_table_test_2, reference_table_test
 WHERE
 	colocated_table_test_2.value_4 = reference_table_test.value_4
+ORDER BY 1
 RETURNING value_1, value_2;
  value_1 | value_2
 ---------------------------------------------------------------------
@@ -1417,7 +1421,7 @@ SELECT master_update_shard_statistics(:a_shard_id);
 SELECT master_get_table_ddl_events('reference_schema.reference_table_ddl');
                                                                                 master_get_table_ddl_events
 ---------------------------------------------------------------------
- CREATE TABLE reference_schema.reference_table_ddl (value_2 double precision DEFAULT 25.0, value_3 text NOT NULL, value_4 timestamp without time zone, value_5 double precision)
+ CREATE TABLE reference_schema.reference_table_ddl (value_2 double precision DEFAULT 25.0, value_3 text NOT NULL, value_4 timestamp without time zone, value_5 double precision) USING heap
  ALTER TABLE reference_schema.reference_table_ddl OWNER TO postgres
 (2 rows)
 

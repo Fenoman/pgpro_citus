@@ -376,13 +376,6 @@ SELECT create_distributed_table('products', 'product_no');
 -- Should error out since add constraint is not the single subcommand
 ALTER TABLE products ADD CONSTRAINT unn_1 UNIQUE(product_no, price), ADD CONSTRAINT unn_2 UNIQUE(product_no, name);
 
--- Tests for constraints without name
--- Commands below should error out since constraints do not have the name
-ALTER TABLE products ADD UNIQUE(product_no);
-ALTER TABLE products ADD PRIMARY KEY(product_no);
-ALTER TABLE products ADD CHECK(product_no <> 0);
-ALTER TABLE products ADD EXCLUDE USING btree (product_no with =);
-
 -- ... with names, we can add/drop the constraints just fine
 ALTER TABLE products ADD CONSTRAINT nonzero_product_no CHECK(product_no <> 0);
 ALTER TABLE products ADD CONSTRAINT uniq_product_no EXCLUDE USING btree (product_no with =);
@@ -575,3 +568,35 @@ SET search_path TO 'public';
 DROP SCHEMA sc1 CASCADE;
 DROP SCHEMA sc2 CASCADE;
 DROP SCHEMA sc3 CASCADE;
+
+CREATE SCHEMA test_auto_explain;
+SET search_path TO 'test_auto_explain';
+
+-- Test ALTER TABLE ... ADD CONSTRAINT ... does not cause a crash when auto_explain module is loaded
+CREATE TABLE target_table(col_1 int primary key, col_2 int);
+SELECT create_distributed_table('target_table','col_1');
+INSERT INTO target_table VALUES(1,2),(2,3),(3,4),(4,5),(5,6);
+
+CREATE TABLE test_ref_table (key int PRIMARY KEY);
+SELECT create_reference_table('test_ref_table');
+INSERT INTO test_ref_table VALUES (1),(2),(3),(4),(5),(6),(7),(8),(9),(10);
+
+LOAD 'auto_explain';
+SET auto_explain.log_min_duration = 0;
+SET auto_explain.log_level = LOG;
+SET client_min_messages to LOG;
+SET auto_explain.log_timing TO off;
+SET auto_explain.log_format = JSON;
+BEGIN;
+-- simulate being a worker session/backend
+SET LOCAL application_name to 'citus_internal gpid=10000000001';
+SET citus.enable_ddl_propagation TO OFF;
+-- alter table triggers SELECT, and auto_explain catches that
+ALTER TABLE target_table ADD CONSTRAINT fkey_167 FOREIGN KEY (col_1) REFERENCES test_ref_table(key) ON DELETE CASCADE;
+END;
+
+RESET citus.enable_ddl_propagation;
+SET client_min_messages to ERROR;
+SET search_path TO 'public';
+
+DROP SCHEMA test_auto_explain CASCADE;

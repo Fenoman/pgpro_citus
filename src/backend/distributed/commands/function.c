@@ -752,6 +752,8 @@ UpdateFunctionDistributionInfo(const ObjectAddress *distAddress,
 							   distAddress->objectId, distAddress->objectSubId)));
 	}
 
+	memset(values, 0, sizeof(values));
+	memset(isnull, 0, sizeof(isnull));
 	memset(replace, 0, sizeof(replace));
 
 	replace[Anum_pg_dist_object_distribution_argument_index - 1] = true;
@@ -1932,7 +1934,7 @@ EnsureExtensionFunctionCanBeDistributed(const ObjectAddress functionAddress,
 		/*
 		 * Citus extension is a special case. It's the extension that
 		 * provides the 'distributed capabilities' in the first place.
-		 * Trying to distribute it's own function(s) doesn't make sense.
+		 * Trying to distribute its own function(s) doesn't make sense.
 		 */
 		ereport(ERROR, (errmsg("Citus extension functions(%s) "
 							   "cannot be distributed.",

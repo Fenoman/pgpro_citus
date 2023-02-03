@@ -25,6 +25,7 @@
 #include "distributed/citus_nodefuncs.h"
 #include "distributed/citus_nodes.h"
 #include "distributed/citus_ruleutils.h"
+#include "distributed/colocation_utils.h"
 #include "distributed/commands.h"
 #include "distributed/cte_inline.h"
 #include "distributed/function_call_delegation.h"
@@ -74,7 +75,8 @@ static uint64 NextPlanId = 1;
 /* keep track of planner call stack levels */
 int PlannerLevel = 0;
 
-static void ErrorIfQueryHasMergeCommand(Query *queryTree);
+static void ErrorIfQueryHasUnsupportedMergeCommand(Query *queryTree,
+												   List *rangeTableList);
 static bool ContainsMergeCommandWalker(Node *node);
 static bool ListContainsDistributedTableRTE(List *rangeTableList,
 											bool *maybeHasForeignDistributedTable);
@@ -130,7 +132,7 @@ static PlannedStmt * PlanDistributedStmt(DistributedPlanningContext *planContext
 static RTEListProperties * GetRTEListProperties(List *rangeTableList);
 static List * TranslatedVars(PlannerInfo *root, int relationIndex);
 static void WarnIfListHasForeignDistributedTable(List *rangeTableList);
-
+static void ErrorIfMergeHasUnsupportedTables(Query *parse, List *rangeTableList);
 
 /* Distributed planner hook */
 PlannedStmt *
@@ -186,7 +188,7 @@ distributed_planner(Query *parse,
 	if (needsDistributedPlanning)
 	{
 		/*
-		 * standard_planner scribbles on it's input, but for deparsing we need the
+		 * standard_planner scribbles on its input, but for deparsing we need the
 		 * unmodified form. Before copying we call AssignRTEIdentities to be able
 		 * to match RTEs in the rewritten query tree with those in the original
 		 * tree.
@@ -202,7 +204,7 @@ distributed_planner(Query *parse,
 			 * Fast path queries cannot have merge command, and we
 			 * prevent the remaining here.
 			 */
-			ErrorIfQueryHasMergeCommand(parse);
+			ErrorIfQueryHasUnsupportedMergeCommand(parse, rangeTableList);
 
 			/*
 			 * When there are partitioned tables (not applicable to fast path),
@@ -303,11 +305,13 @@ distributed_planner(Query *parse,
 
 
 /*
- * ErrorIfQueryHasMergeCommand walks over the query tree and throws error
- * if there are any Merge command (e.g., CMD_MERGE) in the query tree.
+ * ErrorIfQueryHasUnsupportedMergeCommand walks over the query tree and bails out
+ * if there is no Merge command (e.g., CMD_MERGE) in the query tree. For merge,
+ * looks for all supported combinations, throws an exception if any violations
+ * are seen.
  */
 static void
-ErrorIfQueryHasMergeCommand(Query *queryTree)
+ErrorIfQueryHasUnsupportedMergeCommand(Query *queryTree, List *rangeTableList)
 {
 	/*
 	 * Postgres currently doesn't support Merge queries inside subqueries and
@@ -316,11 +320,20 @@ ErrorIfQueryHasMergeCommand(Query *queryTree)
 	 * We do not call this path for fast-path queries to avoid this additional
 	 * overhead.
 	 */
-	if (ContainsMergeCommandWalker((Node *) queryTree))
+	if (!ContainsMergeCommandWalker((Node *) queryTree))
 	{
-		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						errmsg("MERGE command is not supported on Citus tables yet")));
+		/* No MERGE found */
+		return;
 	}
+
+
+	/*
+	 * In Citus we have limited support for MERGE, it's allowed
+	 * only if all the tables(target, source or any CTE) tables
+	 * are are local i.e. a combination of Citus local and Non-Citus
+	 * tables (regular Postgres tables).
+	 */
+	ErrorIfMergeHasUnsupportedTables(queryTree, rangeTableList);
 }
 
 
@@ -331,7 +344,10 @@ ErrorIfQueryHasMergeCommand(Query *queryTree)
 static bool
 ContainsMergeCommandWalker(Node *node)
 {
-#if PG_VERSION_NUM >= PG_VERSION_15
+	#if PG_VERSION_NUM < PG_VERSION_15
+	return false;
+	#endif
+
 	if (node == NULL)
 	{
 		return false;
@@ -340,7 +356,7 @@ ContainsMergeCommandWalker(Node *node)
 	if (IsA(node, Query))
 	{
 		Query *query = (Query *) node;
-		if (query->commandType == CMD_MERGE)
+		if (IsMergeQuery(query))
 		{
 			return true;
 		}
@@ -349,7 +365,6 @@ ContainsMergeCommandWalker(Node *node)
 	}
 
 	return expression_tree_walker(node, ContainsMergeCommandWalker, NULL);
-#endif
 
 	return false;
 }
@@ -628,7 +643,7 @@ IsModifyCommand(Query *query)
 	CmdType commandType = query->commandType;
 
 	if (commandType == CMD_INSERT || commandType == CMD_UPDATE ||
-		commandType == CMD_DELETE)
+		commandType == CMD_DELETE || commandType == CMD_MERGE)
 	{
 		return true;
 	}
@@ -775,8 +790,11 @@ CreateDistributedPlannedStmt(DistributedPlanningContext *planContext)
 		hasUnresolvedParams = true;
 	}
 
+	bool allowRecursivePlanning = true;
 	DistributedPlan *distributedPlan =
-		CreateDistributedPlan(planId, planContext->originalQuery, planContext->query,
+		CreateDistributedPlan(planId, allowRecursivePlanning,
+							  planContext->originalQuery,
+							  planContext->query,
 							  planContext->boundParams,
 							  hasUnresolvedParams,
 							  planContext->plannerRestrictionContext);
@@ -947,8 +965,8 @@ TryCreateDistributedPlannedStmt(PlannedStmt *localPlan,
  * 3. Logical planner
  */
 DistributedPlan *
-CreateDistributedPlan(uint64 planId, Query *originalQuery, Query *query, ParamListInfo
-					  boundParams, bool hasUnresolvedParams,
+CreateDistributedPlan(uint64 planId, bool allowRecursivePlanning, Query *originalQuery,
+					  Query *query, ParamListInfo boundParams, bool hasUnresolvedParams,
 					  PlannerRestrictionContext *plannerRestrictionContext)
 {
 	DistributedPlan *distributedPlan = NULL;
@@ -1086,6 +1104,21 @@ CreateDistributedPlan(uint64 planId, Query *originalQuery, Query *query, ParamLi
 	 */
 	if (list_length(subPlanList) > 0 || hasCtes)
 	{
+		/*
+		 * recursive planner should handle all the tree from bottom to
+		 * top at single pass. i.e. It should have already recursively planned all
+		 * required parts in its first pass. Hence, we expect allowRecursivePlanning
+		 * to be true. Otherwise, this means we have bug at recursive planner,
+		 * which needs to be handled. We add a check here and return error.
+		 */
+		if (!allowRecursivePlanning)
+		{
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							errmsg("recursive complex joins are only supported "
+								   "when all distributed tables are co-located and "
+								   "joined on their distribution columns")));
+		}
+
 		Query *newQuery = copyObject(originalQuery);
 		bool setPartitionedTablesInherited = false;
 		PlannerRestrictionContext *currentPlannerRestrictionContext =
@@ -1114,8 +1147,14 @@ CreateDistributedPlan(uint64 planId, Query *originalQuery, Query *query, ParamLi
 		/* overwrite the old transformed query with the new transformed query */
 		*query = *newQuery;
 
-		/* recurse into CreateDistributedPlan with subqueries/CTEs replaced */
-		distributedPlan = CreateDistributedPlan(planId, originalQuery, query, NULL, false,
+		/*
+		 * recurse into CreateDistributedPlan with subqueries/CTEs replaced.
+		 * We only allow recursive planning once, which should have already done all
+		 * the necessary transformations. So, we do not allow recursive planning once again.
+		 */
+		allowRecursivePlanning = false;
+		distributedPlan = CreateDistributedPlan(planId, allowRecursivePlanning,
+												originalQuery, query, NULL, false,
 												plannerRestrictionContext);
 
 		/* distributedPlan cannot be null since hasUnresolvedParams argument was false */
@@ -1845,6 +1884,8 @@ multi_join_restriction_hook(PlannerInfo *root,
 	 */
 	joinRestrictionContext->hasSemiJoin = joinRestrictionContext->hasSemiJoin ||
 										  extra->sjinfo->jointype == JOIN_SEMI;
+	joinRestrictionContext->hasOuterJoin = joinRestrictionContext->hasOuterJoin ||
+										   IS_OUTER_JOIN(extra->sjinfo->jointype);
 
 	MemoryContextSwitchTo(oldMemoryContext);
 }
@@ -1923,37 +1964,17 @@ multi_relation_restriction_hook(PlannerInfo *root, RelOptInfo *relOptInfo,
 	{
 		cacheEntry = GetCitusTableCacheEntry(rte->relid);
 
+#if PG_VERSION_NUM == PG_VERSION_15
+
 		/*
-		 * The statistics objects of the distributed table are not relevant
-		 * for the distributed planning, so we can override it.
+		 * Postgres 15.0 had a bug regarding inherited statistics expressions,
+		 * which is fixed in 15.1 via Postgres commit
+		 * 1f1865e9083625239769c26f68b9c2861b8d4b1c.
 		 *
-		 * Normally, we should not need this. However, the combination of
-		 * Postgres commit 269b532aef55a579ae02a3e8e8df14101570dfd9 and
-		 * Citus function AdjustPartitioningForDistributedPlanning()
-		 * forces us to do this. The commit expects statistics objects
-		 * of partitions to have "inh" flag set properly. Whereas, the
-		 * function overrides "inh" flag. To avoid Postgres to throw error,
-		 * we override statlist such that Postgres does not try to process
-		 * any statistics objects during the standard_planner() on the
-		 * coordinator. In the end, we do not need the standard_planner()
-		 * on the coordinator to generate an optimized plan. We call
-		 * into standard_planner() for other purposes, such as generating the
-		 * relationRestrictionContext here.
-		 *
-		 * AdjustPartitioningForDistributedPlanning() is a hack that we use
-		 * to prevent Postgres' standard_planner() to expand all the partitions
-		 * for the distributed planning when a distributed partitioned table
-		 * is queried. It is required for both correctness and performance
-		 * reasons. Although we can eliminate the use of the function for
-		 * the correctness (e.g., make sure that rest of the planner can handle
-		 * partitions), it's performance implication is hard to avoid. Certain
-		 * planning logic of Citus (such as router or query pushdown) relies
-		 * heavily on the relationRestrictionList. If
-		 * AdjustPartitioningForDistributedPlanning() is removed, all the
-		 * partitions show up in the, causing high planning times for
-		 * such queries.
+		 * Hence, we only set this value on exactly PG15.0
 		 */
 		relOptInfo->statlist = NIL;
+#endif
 
 		relationRestrictionContext->allReferenceTables &=
 			IsCitusTableTypeCacheEntry(cacheEntry, REFERENCE_TABLE);
@@ -2589,4 +2610,149 @@ WarnIfListHasForeignDistributedTable(List *rangeTableList)
 								   "citus_add_local_table_to_metadata()"))));
 		}
 	}
+}
+
+
+/*
+ * IsMergeAllowedOnRelation takes a relation entry and checks if MERGE command is
+ * permitted on special relations, such as materialized view, returns true only if
+ * it's a "source" relation.
+ */
+bool
+IsMergeAllowedOnRelation(Query *parse, RangeTblEntry *rte)
+{
+	if (!IsMergeQuery(parse))
+	{
+		return false;
+	}
+
+	RangeTblEntry *targetRte = rt_fetch(parse->resultRelation, parse->rtable);
+
+	/* Is it a target relation? */
+	if (targetRte->relid == rte->relid)
+	{
+		return false;
+	}
+
+	return true;
+}
+
+
+/*
+ * ErrorIfMergeHasUnsupportedTables checks if all the tables(target, source or any CTE
+ * present) in the MERGE command are local i.e. a combination of Citus local and Non-Citus
+ * tables (regular Postgres tables), raises an exception for all other combinations.
+ */
+static void
+ErrorIfMergeHasUnsupportedTables(Query *parse, List *rangeTableList)
+{
+	ListCell *tableCell = NULL;
+
+	foreach(tableCell, rangeTableList)
+	{
+		RangeTblEntry *rangeTableEntry = (RangeTblEntry *) lfirst(tableCell);
+		Oid relationId = rangeTableEntry->relid;
+
+		switch (rangeTableEntry->rtekind)
+		{
+			case RTE_RELATION:
+			{
+				/* Check the relation type */
+				break;
+			}
+
+			case RTE_SUBQUERY:
+			case RTE_FUNCTION:
+			case RTE_TABLEFUNC:
+			case RTE_VALUES:
+			case RTE_JOIN:
+			case RTE_CTE:
+			{
+				/* Skip them as base table(s) will be checked */
+				continue;
+			}
+
+			/*
+			 * RTE_NAMEDTUPLESTORE is typically used in ephmeral named relations,
+			 * such as, trigger data; until we find a genuine use case, raise an
+			 * exception.
+			 * RTE_RESULT is a node added by the planner and we shouldn't
+			 * encounter it in the parse tree.
+			 */
+			case RTE_NAMEDTUPLESTORE:
+			case RTE_RESULT:
+			{
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("MERGE command is not supported with "
+								"Tuplestores and results")));
+				break;
+			}
+
+			default:
+			{
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("MERGE command: Unrecognized range table entry.")));
+			}
+		}
+
+		/* RTE Relation can be of various types, check them now */
+
+		/* skip the regular views as they are replaced with subqueries */
+		if (rangeTableEntry->relkind == RELKIND_VIEW)
+		{
+			continue;
+		}
+
+		if (rangeTableEntry->relkind == RELKIND_MATVIEW ||
+			rangeTableEntry->relkind == RELKIND_FOREIGN_TABLE)
+		{
+			/* Materialized view or Foreign table as target is not allowed */
+			if (IsMergeAllowedOnRelation(parse, rangeTableEntry))
+			{
+				/* Non target relation is ok */
+				continue;
+			}
+			else
+			{
+				ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								errmsg("MERGE command is not allowed "
+									   "on materialized view")));
+			}
+		}
+
+		if (rangeTableEntry->relkind != RELKIND_RELATION &&
+			rangeTableEntry->relkind != RELKIND_PARTITIONED_TABLE)
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("Unexpected relation type(relkind:%c) in MERGE command",
+							rangeTableEntry->relkind)));
+		}
+
+		Assert(rangeTableEntry->relid != 0);
+
+		/* Distributed tables and Reference tables are not supported yet */
+		if (IsCitusTableType(relationId, REFERENCE_TABLE) ||
+			IsCitusTableType(relationId, DISTRIBUTED_TABLE))
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("MERGE command is not supported on "
+							"distributed/reference tables yet")));
+		}
+
+		/* Regular Postgres tables and Citus local tables are allowed */
+		if (!IsCitusTable(relationId) ||
+			IsCitusTableType(relationId, CITUS_LOCAL_TABLE))
+		{
+			continue;
+		}
+
+
+		/* Any other Citus table type missing ? */
+	}
+
+	/* All the tables are local, supported */
 }

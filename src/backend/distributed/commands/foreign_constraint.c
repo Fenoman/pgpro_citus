@@ -1030,7 +1030,7 @@ ConstraintIsAForeignKey(char *inputConstaintName, Oid relationId)
 /*
  * ConstraintWithNameIsOfType is a wrapper around get_relation_constraint_oid that
  * returns true if given constraint name identifies a valid constraint defined
- * on relation with relationId and it's type matches the input constraint type.
+ * on relation with relationId and its type matches the input constraint type.
  */
 bool
 ConstraintWithNameIsOfType(char *inputConstaintName, Oid relationId,
@@ -1308,19 +1308,6 @@ IsTableTypeIncluded(Oid relationId, int flags)
 		return (flags & INCLUDE_CITUS_LOCAL_TABLES) != 0;
 	}
 	return false;
-}
-
-
-/*
- * EnableSkippingConstraintValidation is simply a C interface for setting the following:
- *      SET LOCAL citus.skip_constraint_validation TO on;
- */
-void
-EnableSkippingConstraintValidation()
-{
-	set_config_option("citus.skip_constraint_validation", "true",
-					  PGC_SUSET, PGC_S_SESSION,
-					  GUC_ACTION_LOCAL, true, 0, false);
 }
 
 

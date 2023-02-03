@@ -6,7 +6,6 @@ SET citus.next_shard_id TO 20000000;
 
 SET citus.shard_count TO 6;
 SET citus.shard_replication_factor TO 1;
-SET citus.defer_drop_after_shard_move TO on;
 
 CREATE SCHEMA shard_move_deferred_delete;
 SET search_path TO shard_move_deferred_delete;
@@ -33,11 +32,14 @@ $cmd$);
 
 -- Make sure this cannot be run in a transaction
 BEGIN;
-CALL citus_cleanup_orphaned_shards();
+CALL citus_cleanup_orphaned_resources();
 COMMIT;
 
--- execute delayed removal
+-- citus_cleanup_orphaned_shards is deprecated
 CALL citus_cleanup_orphaned_shards();
+
+-- execute delayed removal
+CALL citus_cleanup_orphaned_resources();
 
 -- we expect the shard to be on only the second worker
 SELECT run_command_on_workers($cmd$
@@ -57,6 +59,7 @@ SELECT pg_reload_conf();
 
 -- Sleep 1 second to give Valgrind enough time to clear transactions
 SELECT pg_sleep(1);
+SELECT public.wait_for_resource_cleanup();
 
 -- we expect the shard to be on only the first worker
 SELECT run_command_on_workers($cmd$
@@ -79,6 +82,27 @@ $cmd$);
 -- needed.
 SELECT master_move_shard_placement(20000000, 'localhost', :worker_2_port, 'localhost', :worker_1_port);
 
+-- when a move tx is aborted, there remains a shard on the target node
+BEGIN;
+SELECT master_move_shard_placement(20000000, 'localhost', :worker_1_port, 'localhost', :worker_2_port);
+ROLLBACK;
+
+-- see the cleanup record for the shard on the target node
+-- https://github.com/citusdata/citus/issues/6580
+select object_name, object_type from pg_dist_cleanup where object_type = 1;
+
+-- see the shard on both workers
+SELECT run_command_on_workers($cmd$
+    SELECT count(*) FROM pg_class WHERE relname = 't1_20000000';
+$cmd$);
+
+-- clean it up
+SELECT public.wait_for_resource_cleanup();
+
+-- verify the shard is cleaned up
+SELECT run_command_on_workers($cmd$
+    SELECT count(*) FROM pg_class WHERE relname = 't1_20000000';
+$cmd$);
 
 -- override the function for testing purpose
 -- since it is extension owned function, propagate it to workers manually

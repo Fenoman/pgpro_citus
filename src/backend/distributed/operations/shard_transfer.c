@@ -84,7 +84,8 @@ static void ReplicateColocatedShardPlacement(int64 shardId, char *sourceNodeName
 											 char shardReplicationMode);
 static void CopyShardTables(List *shardIntervalList, char *sourceNodeName,
 							int32 sourceNodePort, char *targetNodeName,
-							int32 targetNodePort, bool useLogicalReplication);
+							int32 targetNodePort, bool useLogicalReplication,
+							char *operationName);
 static void CopyShardTablesViaLogicalReplication(List *shardIntervalList,
 												 char *sourceNodeName,
 												 int32 sourceNodePort,
@@ -101,10 +102,9 @@ static List * RecreateTableDDLCommandList(Oid relationId);
 static void EnsureTableListOwner(List *tableIdList);
 static void EnsureTableListSuitableForReplication(List *tableIdList);
 
-static void DropColocatedShardPlacement(ShardInterval *shardInterval, char *nodeName,
-										int32 nodePort);
-static void MarkForDropColocatedShardPlacement(ShardInterval *shardInterval,
-											   char *nodeName, int32 nodePort);
+static void DropShardPlacementsFromMetadata(List *shardList,
+											char *nodeName,
+											int32 nodePort);
 static void UpdateColocatedShardPlacementMetadataOnWorkers(int64 shardId,
 														   char *sourceNodeName,
 														   int32 sourceNodePort,
@@ -121,9 +121,6 @@ static void EnsureEnoughDiskSpaceForShardMove(List *colocatedShardList,
 static List * RecreateShardDDLCommandList(ShardInterval *shardInterval,
 										  const char *sourceNodeName,
 										  int32 sourceNodePort);
-static List * CopyShardContentsCommandList(ShardInterval *shardInterval,
-										   const char *sourceNodeName,
-										   int32 sourceNodePort);
 static List * PostLoadShardCreationCommandList(ShardInterval *shardInterval,
 											   const char *sourceNodeName,
 											   int32 sourceNodePort);
@@ -134,11 +131,11 @@ static char * CreateShardCopyCommand(ShardInterval *shard, WorkerNode *targetNod
 
 /* declarations for dynamic loading */
 PG_FUNCTION_INFO_V1(citus_copy_shard_placement);
+PG_FUNCTION_INFO_V1(citus_copy_shard_placement_with_nodeid);
 PG_FUNCTION_INFO_V1(master_copy_shard_placement);
 PG_FUNCTION_INFO_V1(citus_move_shard_placement);
+PG_FUNCTION_INFO_V1(citus_move_shard_placement_with_nodeid);
 PG_FUNCTION_INFO_V1(master_move_shard_placement);
-
-bool DeferShardDeleteOnMove = true;
 
 double DesiredPercentFreeAfterMove = 10;
 bool CheckAvailableSpaceBeforeMove = true;
@@ -168,6 +165,36 @@ citus_copy_shard_placement(PG_FUNCTION_ARGS)
 
 	ReplicateColocatedShardPlacement(shardId, sourceNodeName, sourceNodePort,
 									 targetNodeName, targetNodePort,
+									 shardReplicationMode);
+
+	PG_RETURN_VOID();
+}
+
+
+/*
+ * citus_copy_shard_placement_with_nodeid implements a user-facing UDF to copy a placement
+ * from a source node to a target node, including all co-located placements.
+ */
+Datum
+citus_copy_shard_placement_with_nodeid(PG_FUNCTION_ARGS)
+{
+	CheckCitusVersion(ERROR);
+	EnsureCoordinator();
+
+	int64 shardId = PG_GETARG_INT64(0);
+	uint32 sourceNodeId = PG_GETARG_INT32(1);
+	uint32 targetNodeId = PG_GETARG_INT32(2);
+	Oid shardReplicationModeOid = PG_GETARG_OID(3);
+
+	bool missingOk = false;
+	WorkerNode *sourceNode = FindNodeWithNodeId(sourceNodeId, missingOk);
+	WorkerNode *targetNode = FindNodeWithNodeId(targetNodeId, missingOk);
+
+	char shardReplicationMode = LookupShardTransferMode(shardReplicationModeOid);
+
+	ReplicateColocatedShardPlacement(shardId,
+									 sourceNode->workerName, sourceNode->workerPort,
+									 targetNode->workerName, targetNode->workerPort,
 									 shardReplicationMode);
 
 	PG_RETURN_VOID();
@@ -237,7 +264,50 @@ citus_move_shard_placement(PG_FUNCTION_ARGS)
 	int32 targetNodePort = PG_GETARG_INT32(4);
 	Oid shardReplicationModeOid = PG_GETARG_OID(5);
 
+	citus_move_shard_placement_internal(shardId, sourceNodeName, sourceNodePort,
+										targetNodeName, targetNodePort,
+										shardReplicationModeOid);
 
+	PG_RETURN_VOID();
+}
+
+
+/*
+ * citus_move_shard_placement_with_nodeid does the same as citus_move_shard_placement,
+ * but accepts node ids as parameters, instead of hostname and port.
+ */
+Datum
+citus_move_shard_placement_with_nodeid(PG_FUNCTION_ARGS)
+{
+	CheckCitusVersion(ERROR);
+	EnsureCoordinator();
+
+	int64 shardId = PG_GETARG_INT64(0);
+	uint32 sourceNodeId = PG_GETARG_INT32(1);
+	uint32 targetNodeId = PG_GETARG_INT32(2);
+	Oid shardReplicationModeOid = PG_GETARG_OID(3);
+
+	bool missingOk = false;
+	WorkerNode *sourceNode = FindNodeWithNodeId(sourceNodeId, missingOk);
+	WorkerNode *targetNode = FindNodeWithNodeId(targetNodeId, missingOk);
+
+	citus_move_shard_placement_internal(shardId, sourceNode->workerName,
+										sourceNode->workerPort, targetNode->workerName,
+										targetNode->workerPort,
+										shardReplicationModeOid);
+
+	PG_RETURN_VOID();
+}
+
+
+/*
+ * citus_move_shard_placement_internal is the internal function for shard moves.
+ */
+void
+citus_move_shard_placement_internal(int64 shardId, char *sourceNodeName,
+									int32 sourceNodePort, char *targetNodeName,
+									int32 targetNodePort, Oid shardReplicationModeOid)
+{
 	ListCell *colocatedTableCell = NULL;
 	ListCell *colocatedShardCell = NULL;
 
@@ -296,7 +366,7 @@ citus_move_shard_placement(PG_FUNCTION_ARGS)
 		ereport(WARNING, (errmsg("shard is already present on node %s:%d",
 								 targetNodeName, targetNodePort),
 						  errdetail("Move may have already completed.")));
-		PG_RETURN_VOID();
+		return;
 	}
 
 	foreach(colocatedShardCell, colocatedShardList)
@@ -382,14 +452,33 @@ citus_move_shard_placement(PG_FUNCTION_ARGS)
 		PlacementMovedUsingLogicalReplicationInTX = true;
 	}
 
+	DropOrphanedResourcesInSeparateTransaction();
+
+	ShardInterval *colocatedShard = NULL;
+	foreach_ptr(colocatedShard, colocatedShardList)
+	{
+		/*
+		 * This is to prevent any race condition possibility among the shard moves.
+		 * We don't allow the move to happen if the shard we are going to move has an
+		 * orphaned placement somewhere that is not cleanup up yet.
+		 */
+		char *qualifiedShardName = ConstructQualifiedShardName(colocatedShard);
+		ErrorIfCleanupRecordForShardExists(qualifiedShardName);
+	}
+
 	/*
 	 * CopyColocatedShardPlacement function copies given shard with its co-located
 	 * shards.
 	 */
 	CopyShardTables(colocatedShardList, sourceNodeName, sourceNodePort, targetNodeName,
-					targetNodePort, useLogicalReplication);
+					targetNodePort, useLogicalReplication, "citus_move_shard_placement");
 
-	ShardInterval *colocatedShard = NULL;
+	/* delete old shards metadata and mark the shards as to be deferred drop */
+	int32 sourceGroupId = GroupForNode(sourceNodeName, sourceNodePort);
+	InsertCleanupRecordsForShardPlacementsOnNode(colocatedShardList,
+												 sourceGroupId);
+
+	colocatedShard = NULL;
 	foreach_ptr(colocatedShard, colocatedShardList)
 	{
 		uint64 colocatedShardId = colocatedShard->shardId;
@@ -397,19 +486,15 @@ citus_move_shard_placement(PG_FUNCTION_ARGS)
 		uint64 placementId = GetNextPlacementId();
 
 		InsertShardPlacementRow(colocatedShardId, placementId,
-								SHARD_STATE_ACTIVE, ShardLength(colocatedShardId),
+								ShardLength(colocatedShardId),
 								groupId);
 	}
 
-	/* since this is move operation, we remove shards from source node after copy */
-	if (DeferShardDeleteOnMove)
-	{
-		MarkForDropColocatedShardPlacement(shardInterval, sourceNodeName, sourceNodePort);
-	}
-	else
-	{
-		DropColocatedShardPlacement(shardInterval, sourceNodeName, sourceNodePort);
-	}
+	/*
+	 * Since this is move operation, we remove the placements from the metadata
+	 * for the source node after copy.
+	 */
+	DropShardPlacementsFromMetadata(colocatedShardList, sourceNodeName, sourceNodePort);
 
 	UpdateColocatedShardPlacementMetadataOnWorkers(shardId, sourceNodeName,
 												   sourceNodePort, targetNodeName,
@@ -422,7 +507,74 @@ citus_move_shard_placement(PG_FUNCTION_ARGS)
 		PLACEMENT_UPDATE_STATUS_COMPLETED);
 
 	FinalizeCurrentProgressMonitor();
-	PG_RETURN_VOID();
+}
+
+
+/*
+ * Insert deferred cleanup records.
+ * The shards will be dropped by background cleaner later.
+ */
+void
+InsertDeferredDropCleanupRecordsForShards(List *shardIntervalList)
+{
+	ListCell *shardIntervalCell = NULL;
+
+	foreach(shardIntervalCell, shardIntervalList)
+	{
+		ShardInterval *shardInterval = (ShardInterval *) lfirst(shardIntervalCell);
+		ListCell *shardPlacementCell = NULL;
+		uint64 oldShardId = shardInterval->shardId;
+
+		/* mark for deferred drop */
+		List *shardPlacementList = ActiveShardPlacementList(oldShardId);
+		foreach(shardPlacementCell, shardPlacementList)
+		{
+			ShardPlacement *placement = (ShardPlacement *) lfirst(shardPlacementCell);
+
+			/* get shard name */
+			char *qualifiedShardName = ConstructQualifiedShardName(shardInterval);
+
+			/* Log shard in pg_dist_cleanup.
+			 * Parent shards are to be dropped only on sucess after split workflow is complete,
+			 * so mark the policy as 'CLEANUP_DEFERRED_ON_SUCCESS'.
+			 * We also log cleanup record in the current transaction. If the current transaction rolls back,
+			 * we do not generate a record at all.
+			 */
+			InsertCleanupRecordInCurrentTransaction(CLEANUP_OBJECT_SHARD_PLACEMENT,
+													qualifiedShardName,
+													placement->groupId,
+													CLEANUP_DEFERRED_ON_SUCCESS);
+		}
+	}
+}
+
+
+/*
+ * InsertCleanupRecordsForShardPlacementsOnNode inserts deferred cleanup records.
+ * The shards will be dropped by background cleaner later.
+ * This function does this only for the placements on the given node.
+ */
+void
+InsertCleanupRecordsForShardPlacementsOnNode(List *shardIntervalList,
+											 int32 groupId)
+{
+	ShardInterval *shardInterval = NULL;
+	foreach_ptr(shardInterval, shardIntervalList)
+	{
+		/* get shard name */
+		char *qualifiedShardName = ConstructQualifiedShardName(shardInterval);
+
+		/* Log shard in pg_dist_cleanup.
+		 * Parent shards are to be dropped only on sucess after split workflow is complete,
+		 * so mark the policy as 'CLEANUP_DEFERRED_ON_SUCCESS'.
+		 * We also log cleanup record in the current transaction. If the current transaction rolls back,
+		 * we do not generate a record at all.
+		 */
+		InsertCleanupRecordInCurrentTransaction(CLEANUP_OBJECT_SHARD_PLACEMENT,
+												qualifiedShardName,
+												groupId,
+												CLEANUP_DEFERRED_ON_SUCCESS);
+	}
 }
 
 
@@ -566,7 +718,7 @@ CheckSpaceConstraints(MultiConnection *connection, uint64 colocationSizeInBytes)
 	{
 		ereport(ERROR, (errmsg("not enough empty space on node if the shard is moved, "
 							   "actual available space after move will be %ld bytes, "
-							   "desired available space after move is %ld bytes,"
+							   "desired available space after move is %ld bytes, "
 							   "estimated size increase on node after move is %ld bytes.",
 							   diskAvailableInBytesAfterShardMove,
 							   desiredNewDiskAvailableInBytes, colocationSizeInBytes),
@@ -1071,8 +1223,11 @@ ReplicateColocatedShardPlacement(int64 shardId, char *sourceNodeName,
 		EnsureReferenceTablesExistOnAllNodesExtended(shardReplicationMode);
 	}
 
+	DropOrphanedResourcesInSeparateTransaction();
+
 	CopyShardTables(colocatedShardList, sourceNodeName, sourceNodePort,
-					targetNodeName, targetNodePort, useLogicalReplication);
+					targetNodeName, targetNodePort, useLogicalReplication,
+					"citus_copy_shard_placement");
 
 	/*
 	 * Finally insert the placements to pg_dist_placement and sync it to the
@@ -1085,14 +1240,13 @@ ReplicateColocatedShardPlacement(int64 shardId, char *sourceNodeName,
 		uint64 placementId = GetNextPlacementId();
 
 		InsertShardPlacementRow(colocatedShardId, placementId,
-								SHARD_STATE_ACTIVE, ShardLength(colocatedShardId),
+								ShardLength(colocatedShardId),
 								groupId);
 
 		if (ShouldSyncTableMetadata(colocatedShard->relationId))
 		{
 			char *placementCommand = PlacementUpsertCommand(colocatedShardId, placementId,
-															SHARD_STATE_ACTIVE, 0,
-															groupId);
+															0, groupId);
 
 			SendCommandToWorkersWithMetadata(placementCommand);
 		}
@@ -1163,12 +1317,16 @@ EnsureTableListSuitableForReplication(List *tableIdList)
  */
 static void
 CopyShardTables(List *shardIntervalList, char *sourceNodeName, int32 sourceNodePort,
-				char *targetNodeName, int32 targetNodePort, bool useLogicalReplication)
+				char *targetNodeName, int32 targetNodePort, bool useLogicalReplication,
+				char *operationName)
 {
 	if (list_length(shardIntervalList) < 1)
 	{
 		return;
 	}
+
+	/* Start operation to prepare for generating cleanup records */
+	RegisterOperationNeedingCleanup();
 
 	if (useLogicalReplication)
 	{
@@ -1181,6 +1339,11 @@ CopyShardTables(List *shardIntervalList, char *sourceNodeName, int32 sourceNodeP
 		CopyShardTablesViaBlockWrites(shardIntervalList, sourceNodeName, sourceNodePort,
 									  targetNodeName, targetNodePort);
 	}
+
+	/*
+	 * Drop temporary objects that were marked as CLEANUP_ALWAYS.
+	 */
+	FinalizeOperationNeedingCleanupOnSuccess(operationName);
 }
 
 
@@ -1212,6 +1375,12 @@ CopyShardTablesViaLogicalReplication(List *shardIntervalList, char *sourceNodeNa
 			WorkerApplyShardDDLCommandList(tableRecreationCommandList, shardId);
 
 		char *tableOwner = TableOwner(shardInterval->relationId);
+
+		/* drop the shard we created on the target, in case of failure */
+		InsertCleanupRecordInSubtransaction(CLEANUP_OBJECT_SHARD_PLACEMENT,
+											ConstructQualifiedShardName(shardInterval),
+											GroupForNode(targetNodeName, targetNodePort),
+											CLEANUP_ON_FAILURE);
 
 		SendCommandListToWorkerOutsideTransaction(targetNodeName, targetNodePort,
 												  tableOwner,
@@ -1279,6 +1448,13 @@ CopyShardTablesViaBlockWrites(List *shardIntervalList, char *sourceNodeName,
 		List *ddlCommandList = RecreateShardDDLCommandList(shardInterval, sourceNodeName,
 														   sourceNodePort);
 		char *tableOwner = TableOwner(shardInterval->relationId);
+
+		/* drop the shard we created on the target, in case of failure */
+		InsertCleanupRecordInSubtransaction(CLEANUP_OBJECT_SHARD_PLACEMENT,
+											ConstructQualifiedShardName(shardInterval),
+											GroupForNode(targetNodeName, targetNodePort),
+											CLEANUP_ON_FAILURE);
+
 		SendCommandListToWorkerOutsideTransaction(targetNodeName, targetNodePort,
 												  tableOwner, ddlCommandList);
 	}
@@ -1485,17 +1661,10 @@ static void
 EnsureShardCanBeCopied(int64 shardId, const char *sourceNodeName, int32 sourceNodePort,
 					   const char *targetNodeName, int32 targetNodePort)
 {
-	List *shardPlacementList = ShardPlacementListIncludingOrphanedPlacements(shardId);
+	List *shardPlacementList = ShardPlacementList(shardId);
 
-	ShardPlacement *sourcePlacement = SearchShardPlacementInListOrError(
-		shardPlacementList,
-		sourceNodeName,
-		sourceNodePort);
-	if (sourcePlacement->shardState != SHARD_STATE_ACTIVE)
-	{
-		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						errmsg("source placement must be in active state")));
-	}
+	/* error if the source shard placement does not exist */
+	SearchShardPlacementInListOrError(shardPlacementList, sourceNodeName, sourceNodePort);
 
 	ShardPlacement *targetPlacement = SearchShardPlacementInList(shardPlacementList,
 																 targetNodeName,
@@ -1503,40 +1672,20 @@ EnsureShardCanBeCopied(int64 shardId, const char *sourceNodeName, int32 sourceNo
 
 	if (targetPlacement != NULL)
 	{
-		if (targetPlacement->shardState == SHARD_STATE_TO_DELETE)
-		{
-			/*
-			 * Trigger deletion of orphaned shards and hope that this removes
-			 * the shard.
-			 */
-			DropOrphanedShardsInSeparateTransaction();
-			shardPlacementList = ShardPlacementListIncludingOrphanedPlacements(shardId);
-			targetPlacement = SearchShardPlacementInList(shardPlacementList,
-														 targetNodeName,
-														 targetNodePort);
-
-			/*
-			 * If it still doesn't remove the shard, then we error.
-			 */
-			if (targetPlacement != NULL)
-			{
-				ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-								errmsg(
-									"shard " INT64_FORMAT
-									" still exists on the target node as an orphaned shard",
-									shardId),
-								errdetail(
-									"The existing shard is orphaned, but could not be deleted because there are still active queries on it")));
-			}
-		}
-		else
-		{
-			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-							errmsg(
-								"shard " INT64_FORMAT " already exists in the target node",
-								shardId)));
-		}
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg(
+							"shard " INT64_FORMAT " already exists in the target node",
+							shardId)));
 	}
+
+	/*
+	 * Make sure the relation exists. In some cases the relation is actually dropped but
+	 * the metadata remains, such as dropping table while citus.enable_ddl_propagation
+	 * is set to off.
+	 */
+	ShardInterval *shardInterval = LoadShardInterval(shardId);
+	Oid distributedTableId = shardInterval->relationId;
+	EnsureRelationExists(distributedTableId);
 }
 
 
@@ -1588,31 +1737,6 @@ SearchShardPlacementInListOrError(List *shardPlacementList, const char *nodeName
 
 
 /*
- * CopyShardCommandList generates command list to copy the given shard placement
- * from the source node to the target node. To do this it recreates the shard
- * on the target, and then copies the data. Caller could optionally skip
- * copying the data by the flag includeDataCopy.
- */
-List *
-CopyShardCommandList(ShardInterval *shardInterval, const char *sourceNodeName,
-					 int32 sourceNodePort, bool includeDataCopy)
-{
-	List *copyShardToNodeCommandsList = RecreateShardDDLCommandList(
-		shardInterval, sourceNodeName, sourceNodePort);
-	if (includeDataCopy)
-	{
-		copyShardToNodeCommandsList = list_concat(
-			copyShardToNodeCommandsList,
-			CopyShardContentsCommandList(shardInterval, sourceNodeName,
-										 sourceNodePort));
-	}
-	return list_concat(copyShardToNodeCommandsList,
-					   PostLoadShardCreationCommandList(shardInterval, sourceNodeName,
-														sourceNodePort));
-}
-
-
-/*
  * RecreateShardDDLCommandList generates a command list to recreate a shard,
  * but without any data init and without the post-load table creation commands.
  */
@@ -1625,28 +1749,6 @@ RecreateShardDDLCommandList(ShardInterval *shardInterval, const char *sourceNode
 
 	List *tableRecreationCommandList = RecreateTableDDLCommandList(relationId);
 	return WorkerApplyShardDDLCommandList(tableRecreationCommandList, shardId);
-}
-
-
-/*
- * CopyShardContentsCommandList generates a command list to copy the data of the
- * given shard placement from the source node to the target node. This copying
- * requires a precreated table for the shard on the target node to have been
- * created already (using RecreateShardDDLCommandList).
- */
-static List *
-CopyShardContentsCommandList(ShardInterval *shardInterval, const char *sourceNodeName,
-							 int32 sourceNodePort)
-{
-	char *shardName = ConstructQualifiedShardName(shardInterval);
-	StringInfo copyShardDataCommand = makeStringInfo();
-	appendStringInfo(copyShardDataCommand, WORKER_APPEND_TABLE_TO_SHARD,
-					 quote_literal_cstr(shardName), /* table to append */
-					 quote_literal_cstr(shardName), /* remote table name */
-					 quote_literal_cstr(sourceNodeName), /* remote host */
-					 sourceNodePort); /* remote port */
-
-	return list_make1(copyShardDataCommand->data);
 }
 
 
@@ -1843,6 +1945,7 @@ RecreateTableDDLCommandList(Oid relationId)
 	StringInfo dropCommand = makeStringInfo();
 
 	IncludeSequenceDefaults includeSequenceDefaults = NO_SEQUENCE_DEFAULTS;
+	IncludeIdentities includeIdentityDefaults = NO_IDENTITY;
 
 	/* build appropriate DROP command based on relation kind */
 	if (RegularTable(relationId))
@@ -1865,6 +1968,7 @@ RecreateTableDDLCommandList(Oid relationId)
 	List *dropCommandList = list_make1(makeTableDDLCommandString(dropCommand->data));
 	List *createCommandList = GetPreLoadTableCreationCommands(relationId,
 															  includeSequenceDefaults,
+															  includeIdentityDefaults,
 															  NULL);
 	List *recreateCommandList = list_concat(dropCommandList, createCommandList);
 
@@ -1873,57 +1977,22 @@ RecreateTableDDLCommandList(Oid relationId)
 
 
 /*
- * DropColocatedShardPlacement deletes the shard placement metadata for the given shard
- * placement from the pg_dist_placement, and then it drops the shard table
- * from the given node. The function does this for all colocated placements.
+ * DropShardPlacementsFromMetadata drops the shard placement metadata for
+ * the shard placements of given shard interval list from pg_dist_placement.
  */
 static void
-DropColocatedShardPlacement(ShardInterval *shardInterval, char *nodeName, int32 nodePort)
+DropShardPlacementsFromMetadata(List *shardList,
+								char *nodeName, int32 nodePort)
 {
-	List *colocatedShardList = ColocatedShardIntervalList(shardInterval);
-	ListCell *colocatedShardCell = NULL;
-
-	foreach(colocatedShardCell, colocatedShardList)
+	ShardInterval *shardInverval = NULL;
+	foreach_ptr(shardInverval, shardList)
 	{
-		ShardInterval *colocatedShard = (ShardInterval *) lfirst(colocatedShardCell);
-		char *qualifiedTableName = ConstructQualifiedShardName(colocatedShard);
-		StringInfo dropQuery = makeStringInfo();
-		uint64 shardId = colocatedShard->shardId;
-		List *shardPlacementList =
-			ShardPlacementListIncludingOrphanedPlacements(shardId);
+		uint64 shardId = shardInverval->shardId;
+		List *shardPlacementList = ShardPlacementList(shardId);
 		ShardPlacement *placement =
 			SearchShardPlacementInListOrError(shardPlacementList, nodeName, nodePort);
-
-		appendStringInfo(dropQuery, DROP_REGULAR_TABLE_COMMAND, qualifiedTableName);
 
 		DeleteShardPlacementRow(placement->placementId);
-		SendCommandToWorker(nodeName, nodePort, dropQuery->data);
-	}
-}
-
-
-/*
- * MarkForDropColocatedShardPlacement marks the shard placement metadata for
- * the given shard placement to be deleted in pg_dist_placement. The function
- * does this for all colocated placements.
- */
-static void
-MarkForDropColocatedShardPlacement(ShardInterval *shardInterval, char *nodeName, int32
-								   nodePort)
-{
-	List *colocatedShardList = ColocatedShardIntervalList(shardInterval);
-	ListCell *colocatedShardCell = NULL;
-
-	foreach(colocatedShardCell, colocatedShardList)
-	{
-		ShardInterval *colocatedShard = (ShardInterval *) lfirst(colocatedShardCell);
-		uint64 shardId = colocatedShard->shardId;
-		List *shardPlacementList =
-			ShardPlacementListIncludingOrphanedPlacements(shardId);
-		ShardPlacement *placement =
-			SearchShardPlacementInListOrError(shardPlacementList, nodeName, nodePort);
-
-		UpdateShardPlacementState(placement->placementId, SHARD_STATE_TO_DELETE);
 	}
 }
 

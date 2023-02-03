@@ -179,24 +179,10 @@ SELECT shardid, shardstate, nodename, nodeport FROM pg_dist_shard_placement WHER
 SELECT master_remove_node('localhost', :worker_2_port);
 SELECT master_get_active_worker_nodes();
 
--- mark all placements in the candidate node as to be deleted
-UPDATE pg_dist_placement SET shardstate=4 WHERE groupid=:worker_2_group;
-SELECT run_command_on_workers('UPDATE pg_dist_placement SET shardstate=4 WHERE groupid=' || :'worker_2_group');
-SELECT shardid, shardstate, nodename, nodeport FROM pg_dist_shard_placement WHERE nodeport=:worker_2_port;
-CREATE TABLE cluster_management_test_colocated (col_1 text, col_2 int);
--- Check that we warn the user about colocated shards that will not get created for shards that do not have active placements
-SELECT create_distributed_table('cluster_management_test_colocated', 'col_1', 'hash', colocate_with => 'cluster_management_test');
-
--- Check that colocated shards don't get created for shards that are to be deleted
-SELECT logicalrelid, shardid, shardstate, nodename, nodeport FROM pg_dist_shard_placement NATURAL JOIN pg_dist_shard ORDER BY shardstate, shardid;
-
 -- clean-up
 SELECT 1 FROM master_add_node('localhost', :worker_2_port);
 UPDATE pg_dist_placement SET shardstate=1 WHERE groupid=:worker_2_group;
 SELECT run_command_on_workers('UPDATE pg_dist_placement SET shardstate=1 WHERE groupid=' || :'worker_2_group');
-SET client_min_messages TO ERROR;
-DROP TABLE cluster_management_test_colocated;
-RESET client_min_messages;
 
 -- when there is no primary we should get a pretty error
 UPDATE pg_dist_node SET noderole = 'secondary' WHERE nodeport=:worker_2_port;
@@ -371,6 +357,17 @@ SELECT master_add_secondary_node('localhost', 9995, 'localhost', :worker_1_port)
 SELECT master_add_secondary_node('localhost', 9994, primaryname => 'localhost', primaryport => :worker_2_port);
 SELECT master_add_secondary_node('localhost', 9993, 'localhost', 2000);
 SELECT master_add_secondary_node('localhost', 9992, 'localhost', :worker_1_port, nodecluster => 'second-cluster');
+
+SELECT nodeid AS worker_1_node FROM pg_dist_node WHERE nodeport=9992 \gset
+
+-- citus_update_node allows updating a node from the non-default cluster
+SELECT citus_update_node(:worker_1_node, 'localhost', 9991);
+SELECT citus_nodename_for_nodeid(:worker_1_node);
+SELECT citus_nodeport_for_nodeid(:worker_1_node);
+SELECT citus_update_node(:worker_1_node, 'localhost', 9992);
+SELECT citus_nodename_for_nodeid(:worker_1_node);
+SELECT citus_nodeport_for_nodeid(:worker_1_node);
+
 
 SELECT nodeid AS worker_1_node FROM pg_dist_node WHERE nodeport=:worker_1_port \gset
 

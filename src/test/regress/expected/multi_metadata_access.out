@@ -15,11 +15,13 @@ WHERE
     AND classid ='pg_class'::regclass
     AND ext.extname = 'citus'
     AND nsp.nspname = 'pg_catalog'
-    AND NOT has_table_privilege(pg_class.oid, 'select');
-       oid
+    AND NOT has_table_privilege(pg_class.oid, 'select')
+ORDER BY 1;
+            oid
 ---------------------------------------------------------------------
  pg_dist_authinfo
-(1 row)
+ pg_dist_clock_logical_seq
+(2 rows)
 
 RESET role;
 DROP USER no_access;

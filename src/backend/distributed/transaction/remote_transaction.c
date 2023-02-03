@@ -3,6 +3,11 @@
  * remote_transaction.c
  *   Management of transaction spanning more than one node.
  *
+ *   Since the functions defined in this file mostly allocate in
+ *   CitusXactCallbackContext, we mostly try doing allocations on stack.
+ *   And when it's hard to do so, we at least try freeing the heap memory
+ *   immediately after an object becomes useless.
+ *
  * Copyright (c) Citus Data, Inc.
  *
  *-------------------------------------------------------------------------
@@ -34,6 +39,7 @@
 #define PREPARED_TRANSACTION_NAME_FORMAT "citus_%u_%u_"UINT64_FORMAT "_%u"
 
 
+static char * BeginTransactionCommand(void);
 static char * AssignDistributedTransactionIdCommand(void);
 static void StartRemoteTransactionSavepointBegin(MultiConnection *connection,
 												 SubTransactionId subId);
@@ -51,6 +57,14 @@ static void FinishRemoteTransactionSavepointRollback(MultiConnection *connection
 static void Assign2PCIdentifier(MultiConnection *connection);
 
 
+static char *IsolationLevelName[] = {
+	"READ UNCOMMITTED",
+	"READ COMMITTED",
+	"REPEATABLE READ",
+	"SERIALIZABLE"
+};
+
+
 /*
  * StartRemoteTransactionBegin initiates beginning the remote transaction in
  * a non-blocking manner. The function sends "BEGIN" followed by
@@ -66,6 +80,7 @@ StartRemoteTransactionBegin(struct MultiConnection *connection)
 
 	/* remember transaction as being in-progress */
 	dlist_push_tail(&InProgressTransactions, &connection->transactionNode);
+	connection->transactionInProgress = true;
 
 	transaction->transactionState = REMOTE_TRANS_STARTING;
 
@@ -77,7 +92,7 @@ StartRemoteTransactionBegin(struct MultiConnection *connection)
 	 * behaviour.
 	 */
 	appendStringInfoString(beginAndSetDistributedTransactionId,
-						   "BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED;");
+						   BeginTransactionCommand());
 
 	/* append context for in-progress SAVEPOINTs for this transaction */
 	List *activeSubXacts = ActiveSubXactContexts();
@@ -106,11 +121,21 @@ StartRemoteTransactionBegin(struct MultiConnection *connection)
 		appendStringInfoString(beginAndSetDistributedTransactionId, activeSetStmts->data);
 	}
 
+	char *assignDistributedTransactionIdCommand = AssignDistributedTransactionIdCommand();
+
 	/* add SELECT assign_distributed_transaction_id ... */
 	appendStringInfoString(beginAndSetDistributedTransactionId,
-						   AssignDistributedTransactionIdCommand());
+						   assignDistributedTransactionIdCommand);
 
-	if (!SendRemoteCommand(connection, beginAndSetDistributedTransactionId->data))
+	pfree(assignDistributedTransactionIdCommand);
+
+	bool success = SendRemoteCommand(connection,
+									 beginAndSetDistributedTransactionId->data);
+
+	pfree(beginAndSetDistributedTransactionId->data);
+	pfree(beginAndSetDistributedTransactionId);
+
+	if (!success)
 	{
 		const bool raiseErrors = true;
 
@@ -136,12 +161,74 @@ BeginAndSetDistributedTransactionIdCommand(void)
 	 * behaviour.
 	 */
 	appendStringInfoString(beginAndSetDistributedTransactionId,
-						   "BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED;");
+						   BeginTransactionCommand());
 
 	appendStringInfoString(beginAndSetDistributedTransactionId,
 						   AssignDistributedTransactionIdCommand());
 
 	return beginAndSetDistributedTransactionId;
+}
+
+
+/*
+ * BeginTransactionCommand returns the BEGIN command to use for the current isolation
+ * level.
+ *
+ * Transactions have 3 properties that we care about here:
+ * - XactIsoLevel (isolation level)
+ * - XactDeferrable (deferrable)
+ * - XactReadOnly (read only)
+ *
+ * These properties can be set in several ways:
+ * - via BEGIN TRANSACTION ISOLATION LEVEL ...
+ * - via default_transaction_isolation, ...
+ * - via SET TRANSACTION .. (or plain SET transaction_isolation ...)
+ *
+ * We want to make sure that the properties that are passed to the worker nodes
+ * match the coordinator as much as possible. However, we do not want to waste
+ * bytes repeating the current values ad infinitum.
+ *
+ * The trade-off we make is that we send the isolation level in all cases,
+ * but only set deferrable and read-only if they were explicitly specified
+ * in the BEGIN by the user. The implication is that we may not follow the
+ * default_transaction_* settings on the coordinator if they differ on the
+ * worker.
+ */
+static char *
+BeginTransactionCommand(void)
+{
+	StringInfo beginCommand = makeStringInfo();
+
+	/*
+	 * XactIsoLevel can only be set at the start of the transaction, before the
+	 * first query. Since Citus does not send BEGIN until the first query, we
+	 * can simply use the current values, and they will match the values for the
+	 * outer transaction after any BEGIN and SET TRANSACTION that may have occurred.
+	 */
+	appendStringInfo(beginCommand, "BEGIN TRANSACTION ISOLATION LEVEL %s",
+					 IsolationLevelName[XactIsoLevel]);
+
+	if (BeginXactDeferrable == BeginXactDeferrable_Enabled)
+	{
+		appendStringInfoString(beginCommand, " DEFERRABLE");
+	}
+	else if (BeginXactDeferrable == BeginXactDeferrable_Disabled)
+	{
+		appendStringInfoString(beginCommand, " NOT DEFERRABLE");
+	}
+
+	if (BeginXactReadOnly == BeginXactReadOnly_Enabled)
+	{
+		appendStringInfoString(beginCommand, " READ ONLY");
+	}
+	else if (BeginXactReadOnly == BeginXactReadOnly_Disabled)
+	{
+		appendStringInfoString(beginCommand, " READ WRITE");
+	}
+
+	appendStringInfoChar(beginCommand, ';');
+
+	return beginCommand->data;
 }
 
 
@@ -169,7 +256,11 @@ AssignDistributedTransactionIdCommand(void)
 					 distributedTransactionId->transactionNumber,
 					 timestamp);
 
-	return assignDistributedTransactionId->data;
+	/* free the StringInfo but not the buffer itself */
+	char *command = assignDistributedTransactionId->data;
+	pfree(assignDistributedTransactionId);
+
+	return command;
 }
 
 
@@ -268,16 +359,21 @@ StartRemoteTransactionCommit(MultiConnection *connection)
 	}
 	else if (transaction->transactionState == REMOTE_TRANS_PREPARED)
 	{
-		/* commit the prepared transaction */
-		StringInfoData command;
-
-		initStringInfo(&command);
-		appendStringInfo(&command, "COMMIT PREPARED %s",
-						 quote_literal_cstr(transaction->preparedName));
+		/*
+		 * Commit the prepared transaction.
+		 *
+		 * We need to allocate 420 bytes for command buffer (including '\0'):
+		 *  - len("COMMIT PREPARED ") = 16
+		 *  - maximum quoted length of transaction->preparedName = 2 * 200 + 3 = 403
+		 */
+		char command[420];
+		char *quotedPrepName = quote_literal_cstr(transaction->preparedName);
+		SafeSnprintf(command, sizeof(command), "COMMIT PREPARED %s", quotedPrepName);
+		pfree(quotedPrepName);
 
 		transaction->transactionState = REMOTE_TRANS_2PC_COMMITTING;
 
-		if (!SendRemoteCommand(connection, command.data))
+		if (!SendRemoteCommand(connection, command))
 		{
 			HandleRemoteTransactionConnectionError(connection, raiseErrors);
 		}
@@ -395,16 +491,21 @@ StartRemoteTransactionAbort(MultiConnection *connection)
 	if (transaction->transactionState == REMOTE_TRANS_PREPARING ||
 		transaction->transactionState == REMOTE_TRANS_PREPARED)
 	{
-		StringInfoData command;
-
-		/* await PREPARE TRANSACTION results, closing the connection would leave it dangling */
 		ForgetResults(connection);
 
-		initStringInfo(&command);
-		appendStringInfo(&command, "ROLLBACK PREPARED %s",
-						 quote_literal_cstr(transaction->preparedName));
+		/*
+		 * Await PREPARE TRANSACTION results, closing the connection would leave it dangling.
+		 *
+		 * We need to allocate 422 bytes for command buffer (including '\0'):
+		 *  - len("ROLLBACK PREPARED ") = 18
+		 *  - maximum quoted length of transaction->preparedName = 2 * 200 + 3 = 403
+		 */
+		char command[422];
+		char *quotedPrepName = quote_literal_cstr(transaction->preparedName);
+		SafeSnprintf(command, sizeof(command), "ROLLBACK PREPARED %s", quotedPrepName);
+		pfree(quotedPrepName);
 
-		if (!SendRemoteCommand(connection, command.data))
+		if (!SendRemoteCommand(connection, command))
 		{
 			HandleRemoteTransactionConnectionError(connection, raiseErrors);
 		}
@@ -498,7 +599,6 @@ void
 StartRemoteTransactionPrepare(struct MultiConnection *connection)
 {
 	RemoteTransaction *transaction = &connection->remoteTransaction;
-	StringInfoData command;
 	const bool raiseErrors = true;
 
 	/* can't prepare a nonexistant transaction */
@@ -519,11 +619,17 @@ StartRemoteTransactionPrepare(struct MultiConnection *connection)
 		LogTransactionRecord(workerNode->groupId, transaction->preparedName);
 	}
 
-	initStringInfo(&command);
-	appendStringInfo(&command, "PREPARE TRANSACTION %s",
-					 quote_literal_cstr(transaction->preparedName));
+	/*
+	 * We need to allocate 424 bytes for command buffer (including '\0'):
+	 *  - len("PREPARE TRANSACTION ") = 20
+	 *  - maximum quoted length of transaction->preparedName = 2 * 200 + 3 = 403
+	 */
+	char command[424];
+	char *quotedPrepName = quote_literal_cstr(transaction->preparedName);
+	SafeSnprintf(command, sizeof(command), "PREPARE TRANSACTION %s", quotedPrepName);
+	pfree(quotedPrepName);
 
-	if (!SendRemoteCommand(connection, command.data))
+	if (!SendRemoteCommand(connection, command))
 	{
 		HandleRemoteTransactionConnectionError(connection, raiseErrors);
 	}
@@ -760,11 +866,13 @@ ResetRemoteTransaction(struct MultiConnection *connection)
 	RemoteTransaction *transaction = &connection->remoteTransaction;
 
 	/* unlink from list of open transactions, if necessary */
-	if (transaction->transactionState != REMOTE_TRANS_NOT_STARTED)
+	if (connection->transactionInProgress)
 	{
 		/* XXX: Should we error out for a critical transaction? */
 
 		dlist_delete(&connection->transactionNode);
+		connection->transactionInProgress = false;
+		memset(&connection->transactionNode, 0, sizeof(connection->transactionNode));
 	}
 
 	/* just reset the entire state, relying on 0 being invalid/false */
@@ -841,6 +949,8 @@ CoordinatedRemoteTransactionsPrepare(void)
 	}
 
 	CurrentCoordinatedTransactionState = COORD_TRANS_PREPARED;
+
+	list_free(connectionList);
 }
 
 
@@ -905,6 +1015,8 @@ CoordinatedRemoteTransactionsCommit(void)
 
 		FinishRemoteTransactionCommit(connection);
 	}
+
+	list_free(connectionList);
 }
 
 
@@ -958,6 +1070,8 @@ CoordinatedRemoteTransactionsAbort(void)
 
 		FinishRemoteTransactionAbort(connection);
 	}
+
+	list_free(connectionList);
 }
 
 
@@ -1008,6 +1122,8 @@ CoordinatedRemoteTransactionsSavepointBegin(SubTransactionId subId)
 			transaction->lastSuccessfulSubXact = subId;
 		}
 	}
+
+	list_free(connectionList);
 }
 
 
@@ -1053,6 +1169,8 @@ CoordinatedRemoteTransactionsSavepointRelease(SubTransactionId subId)
 
 		FinishRemoteTransactionSavepointRelease(connection, subId);
 	}
+
+	list_free(connectionList);
 }
 
 
@@ -1134,6 +1252,8 @@ CoordinatedRemoteTransactionsSavepointRollback(SubTransactionId subId)
 		 */
 		UnclaimConnection(connection);
 	}
+
+	list_free(connectionList);
 }
 
 
@@ -1145,10 +1265,17 @@ static void
 StartRemoteTransactionSavepointBegin(MultiConnection *connection, SubTransactionId subId)
 {
 	const bool raiseErrors = true;
-	StringInfo savepointCommand = makeStringInfo();
-	appendStringInfo(savepointCommand, "SAVEPOINT savepoint_%u", subId);
 
-	if (!SendRemoteCommand(connection, savepointCommand->data))
+	/*
+	 * We need to allocate 31 bytes for command buffer (including '\0'):
+	 *  - len("SAVEPOINT savepoint_") = 20
+	 *  - maximum length of str(subId) = 10
+	 */
+	char savepointCommand[31];
+	SafeSnprintf(savepointCommand, sizeof(savepointCommand), "SAVEPOINT savepoint_%u",
+				 subId);
+
+	if (!SendRemoteCommand(connection, savepointCommand))
 	{
 		HandleRemoteTransactionConnectionError(connection, raiseErrors);
 	}
@@ -1184,10 +1311,17 @@ StartRemoteTransactionSavepointRelease(MultiConnection *connection,
 									   SubTransactionId subId)
 {
 	const bool raiseErrors = true;
-	StringInfo savepointCommand = makeStringInfo();
-	appendStringInfo(savepointCommand, "RELEASE SAVEPOINT savepoint_%u", subId);
 
-	if (!SendRemoteCommand(connection, savepointCommand->data))
+	/*
+	 * We need to allocate 39 bytes for command buffer (including '\0'):
+	 *  - len("RELEASE SAVEPOINT savepoint_") = 28
+	 *  - maximum length of str(subId) = 10
+	 */
+	char savepointCommand[39];
+	SafeSnprintf(savepointCommand, sizeof(savepointCommand),
+				 "RELEASE SAVEPOINT savepoint_%u", subId);
+
+	if (!SendRemoteCommand(connection, savepointCommand))
 	{
 		HandleRemoteTransactionConnectionError(connection, raiseErrors);
 	}
@@ -1224,10 +1358,17 @@ StartRemoteTransactionSavepointRollback(MultiConnection *connection,
 										SubTransactionId subId)
 {
 	const bool raiseErrors = false;
-	StringInfo savepointCommand = makeStringInfo();
-	appendStringInfo(savepointCommand, "ROLLBACK TO SAVEPOINT savepoint_%u", subId);
 
-	if (!SendRemoteCommand(connection, savepointCommand->data))
+	/*
+	 * We need to allocate 43 bytes for command buffer (including '\0'):
+	 *  - len("ROLLBACK TO SAVEPOINT savepoint_") = 32
+	 *  - maximum length of str(subId) = 10
+	 */
+	char savepointCommand[43];
+	SafeSnprintf(savepointCommand, sizeof(savepointCommand),
+				 "ROLLBACK TO SAVEPOINT savepoint_%u", subId);
+
+	if (!SendRemoteCommand(connection, savepointCommand))
 	{
 		HandleRemoteTransactionConnectionError(connection, raiseErrors);
 	}

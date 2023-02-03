@@ -60,8 +60,6 @@
 	"SELECT worker_apply_shard_ddl_command (" UINT64_FORMAT ", %s, %s)"
 #define WORKER_APPLY_SHARD_DDL_COMMAND_WITHOUT_SCHEMA \
 	"SELECT worker_apply_shard_ddl_command (" UINT64_FORMAT ", %s)"
-#define WORKER_APPEND_TABLE_TO_SHARD \
-	"SELECT worker_append_table_to_shard (%s, %s, %s, %u)"
 #define WORKER_APPLY_INTER_SHARD_DDL_COMMAND \
 	"SELECT worker_apply_inter_shard_ddl_command (" UINT64_FORMAT ", %s, " UINT64_FORMAT \
 	", %s, %s)"
@@ -117,6 +115,18 @@ typedef enum IncludeSequenceDefaults
 	 */
 	WORKER_NEXTVAL_SEQUENCE_DEFAULTS = 2,
 } IncludeSequenceDefaults;
+
+
+/*
+ * IncludeIdentities decides on how we include identity information
+ * when creating the definition of a table.
+ */
+typedef enum IncludeIdentities
+{
+	NO_IDENTITY = 0, /* don't include identities */
+	INCLUDE_IDENTITY_AS_SEQUENCE_DEFAULTS = 1, /* include identities as sequences */
+	INCLUDE_IDENTITY = 2 /* include identities as-is*/
+} IncludeIdentities;
 
 
 struct TableDDLCommand;
@@ -215,11 +225,14 @@ extern uint64 GetNextPlacementId(void);
 extern Oid ResolveRelationId(text *relationName, bool missingOk);
 extern List * GetFullTableCreationCommands(Oid relationId,
 										   IncludeSequenceDefaults includeSequenceDefaults,
+										   IncludeIdentities includeIdentityDefaults,
 										   bool creatingShellTableOnRemoteNode);
 extern List * GetPostLoadTableCreationCommands(Oid relationId, bool includeIndexes,
 											   bool includeReplicaIdentity);
 extern List * GetPreLoadTableCreationCommands(Oid relationId, IncludeSequenceDefaults
 											  includeSequenceDefaults,
+											  IncludeIdentities
+											  includeIdentityDefaults,
 											  char *accessMethod);
 extern List * GetTableRowLevelSecurityCommands(Oid relationId);
 extern List * GetTableIndexAndConstraintCommands(Oid relationId, int indexFlags);
@@ -287,9 +300,6 @@ extern Datum isolate_tenant_to_new_shard(PG_FUNCTION_ARGS);
 extern Datum citus_split_shard_by_split_points(PG_FUNCTION_ARGS);
 
 /* function declarations for shard copy functinality */
-extern List * CopyShardCommandList(ShardInterval *shardInterval, const
-								   char *sourceNodeName,
-								   int32 sourceNodePort, bool includeData);
 extern List * CopyShardForeignConstraintCommandList(ShardInterval *shardInterval);
 extern void CopyShardForeignConstraintCommandListGrouped(ShardInterval *shardInterval,
 														 List **

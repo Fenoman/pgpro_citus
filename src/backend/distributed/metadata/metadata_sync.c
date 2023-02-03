@@ -121,7 +121,6 @@ static List * GenerateGrantOnFunctionQueriesFromAclItem(Oid schemaOid,
 static List * GrantOnSequenceDDLCommands(Oid sequenceOid);
 static List * GenerateGrantOnSequenceQueriesFromAclItem(Oid sequenceOid,
 														AclItem *aclItem);
-static void SetLocalReplicateReferenceTablesOnActivate(bool state);
 static char * GenerateSetRoleQuery(Oid roleOid);
 static void MetadataSyncSigTermHandler(SIGNAL_ARGS);
 static void MetadataSyncSigAlrmHandler(SIGNAL_ARGS);
@@ -136,7 +135,7 @@ static void EnsureShardMetadataIsSane(Oid relationId, int64 shardId, char storag
 									  text *shardMinValue,
 									  text *shardMaxValue);
 static void EnsureShardPlacementMetadataIsSane(Oid relationId, int64 shardId,
-											   int64 placementId, int32 shardState,
+											   int64 placementId,
 											   int64 shardLength, int32 groupId);
 static char * ColocationGroupCreateCommand(uint32 colocationId, int shardCount,
 										   int replicationFactor,
@@ -162,6 +161,7 @@ PG_FUNCTION_INFO_V1(citus_internal_add_partition_metadata);
 PG_FUNCTION_INFO_V1(citus_internal_delete_partition_metadata);
 PG_FUNCTION_INFO_V1(citus_internal_add_shard_metadata);
 PG_FUNCTION_INFO_V1(citus_internal_add_placement_metadata);
+PG_FUNCTION_INFO_V1(citus_internal_add_placement_metadata_legacy);
 PG_FUNCTION_INFO_V1(citus_internal_update_placement_metadata);
 PG_FUNCTION_INFO_V1(citus_internal_delete_shard_metadata);
 PG_FUNCTION_INFO_V1(citus_internal_update_relation_colocation);
@@ -193,13 +193,8 @@ start_metadata_sync_to_node(PG_FUNCTION_ARGS)
 
 	char *nodeNameString = text_to_cstring(nodeName);
 
-	bool prevReplicateRefTablesOnActivate = ReplicateReferenceTablesOnActivate;
-	SetLocalReplicateReferenceTablesOnActivate(false);
-
 	ActivateNode(nodeNameString, nodePort);
 	TransactionModifiedNodeMetadata = true;
-
-	SetLocalReplicateReferenceTablesOnActivate(prevReplicateRefTablesOnActivate);
 
 	PG_RETURN_VOID();
 }
@@ -220,13 +215,8 @@ start_metadata_sync_to_all_nodes(PG_FUNCTION_ARGS)
 
 	List *workerNodes = ActivePrimaryNonCoordinatorNodeList(RowShareLock);
 
-	bool prevReplicateRefTablesOnActivate = ReplicateReferenceTablesOnActivate;
-	SetLocalReplicateReferenceTablesOnActivate(false);
-
 	ActivateNodeList(workerNodes);
 	TransactionModifiedNodeMetadata = true;
-
-	SetLocalReplicateReferenceTablesOnActivate(prevReplicateRefTablesOnActivate);
 
 	PG_RETURN_BOOL(true);
 }
@@ -1271,7 +1261,7 @@ ShardListInsertCommand(List *shardIntervalList)
 	/* add placements to insertPlacementCommand */
 	StringInfo insertPlacementCommand = makeStringInfo();
 	appendStringInfo(insertPlacementCommand,
-					 "WITH placement_data(shardid, shardstate, "
+					 "WITH placement_data(shardid, "
 					 "shardlength, groupid, placementid)  AS (VALUES ");
 
 	ShardInterval *shardInterval = NULL;
@@ -1295,9 +1285,8 @@ ShardListInsertCommand(List *shardIntervalList)
 			firstPlacementProcessed = true;
 
 			appendStringInfo(insertPlacementCommand,
-							 "(%ld, %d, %ld, %d, %ld)",
+							 "(%ld, %ld, %d, %ld)",
 							 shardId,
-							 placement->shardState,
 							 placement->shardLength,
 							 placement->groupId,
 							 placement->placementId);
@@ -1308,7 +1297,7 @@ ShardListInsertCommand(List *shardIntervalList)
 
 	appendStringInfo(insertPlacementCommand,
 					 "SELECT citus_internal_add_placement_metadata("
-					 "shardid, shardstate, shardlength, groupid, placementid) "
+					 "shardid, shardlength, groupid, placementid) "
 					 "FROM placement_data;");
 
 	/* now add shards to insertShardCommand */
@@ -1485,12 +1474,12 @@ ColocationIdUpdateCommand(Oid relationId, uint32 colocationId)
  * updates all properties (excluding the placementId) with the given ones.
  */
 char *
-PlacementUpsertCommand(uint64 shardId, uint64 placementId, int shardState,
+PlacementUpsertCommand(uint64 shardId, uint64 placementId,
 					   uint64 shardLength, int32 groupId)
 {
 	StringInfo command = makeStringInfo();
 
-	appendStringInfo(command, UPSERT_PLACEMENT, shardId, shardState, shardLength,
+	appendStringInfo(command, UPSERT_PLACEMENT, shardId, shardLength,
 					 groupId, placementId);
 
 	return command->data;
@@ -1646,7 +1635,8 @@ GetDependentSequencesWithRelation(Oid relationId, List **seqInfoList,
 			attrdefResult = lappend_oid(attrdefResult, deprec->objid);
 			attrdefAttnumResult = lappend_int(attrdefAttnumResult, deprec->refobjsubid);
 		}
-		else if (deprec->deptype == DEPENDENCY_AUTO &&
+		else if ((deprec->deptype == DEPENDENCY_AUTO || deprec->deptype ==
+				  DEPENDENCY_INTERNAL) &&
 				 deprec->refobjsubid != 0 &&
 				 deprec->classid == RelationRelationId &&
 				 get_rel_relkind(deprec->objid) == RELKIND_SEQUENCE)
@@ -2470,20 +2460,6 @@ SetLocalEnableMetadataSync(bool state)
 }
 
 
-/*
- * SetLocalReplicateReferenceTablesOnActivate sets the
- * replicate_reference_tables_on_activate locally
- */
-void
-SetLocalReplicateReferenceTablesOnActivate(bool state)
-{
-	set_config_option("citus.replicate_reference_tables_on_activate",
-					  state == true ? "on" : "off",
-					  (superuser() ? PGC_SUSET : PGC_USERSET), PGC_S_SESSION,
-					  GUC_ACTION_LOCAL, true, 0, false);
-}
-
-
 static char *
 GenerateSetRoleQuery(Oid roleOid)
 {
@@ -2629,9 +2605,13 @@ CreateShellTableOnWorkers(Oid relationId)
 	List *commandList = list_make1(DISABLE_DDL_PROPAGATION);
 
 	IncludeSequenceDefaults includeSequenceDefaults = WORKER_NEXTVAL_SEQUENCE_DEFAULTS;
+	IncludeIdentities includeIdentityDefaults =
+		INCLUDE_IDENTITY_AS_SEQUENCE_DEFAULTS;
+
 	bool creatingShellTableOnRemoteNode = true;
 	List *tableDDLCommands = GetFullTableCreationCommands(relationId,
 														  includeSequenceDefaults,
+														  includeIdentityDefaults,
 														  creatingShellTableOnRemoteNode);
 
 	TableDDLCommand *tableDDLCommand = NULL;
@@ -3474,11 +3454,44 @@ citus_internal_add_placement_metadata(PG_FUNCTION_ARGS)
 	CheckCitusVersion(ERROR);
 
 	int64 shardId = PG_GETARG_INT64(0);
-	int32 shardState = PG_GETARG_INT32(1);
+	int64 shardLength = PG_GETARG_INT64(1);
+	int32 groupId = PG_GETARG_INT32(2);
+	int64 placementId = PG_GETARG_INT64(3);
+
+	citus_internal_add_placement_metadata_internal(shardId, shardLength,
+												   groupId, placementId);
+
+	PG_RETURN_VOID();
+}
+
+
+/*
+ * citus_internal_add_placement_metadata_legacy is the old function that will be dropped.
+ */
+Datum
+citus_internal_add_placement_metadata_legacy(PG_FUNCTION_ARGS)
+{
+	CheckCitusVersion(ERROR);
+
+	int64 shardId = PG_GETARG_INT64(0);
 	int64 shardLength = PG_GETARG_INT64(2);
 	int32 groupId = PG_GETARG_INT32(3);
 	int64 placementId = PG_GETARG_INT64(4);
 
+	citus_internal_add_placement_metadata_internal(shardId, shardLength,
+												   groupId, placementId);
+	PG_RETURN_VOID();
+}
+
+
+/*
+ * citus_internal_add_placement_metadata_internal is the internal function
+ * too insert a row into pg_dist_placement
+ */
+void
+citus_internal_add_placement_metadata_internal(int64 shardId, int64 shardLength,
+											   int32 groupId, int64 placementId)
+{
 	bool missingOk = false;
 	Oid relationId = LookupShardRelationFromCatalog(shardId, missingOk);
 
@@ -3498,13 +3511,11 @@ citus_internal_add_placement_metadata(PG_FUNCTION_ARGS)
 		 * fit into basic requirements of Citus metadata, the user can only affect its
 		 * own tables. Given that the user is owner of the table, we should allow.
 		 */
-		EnsureShardPlacementMetadataIsSane(relationId, shardId, placementId, shardState,
+		EnsureShardPlacementMetadataIsSane(relationId, shardId, placementId,
 										   shardLength, groupId);
 	}
 
-	InsertShardPlacementRow(shardId, placementId, shardState, shardLength, groupId);
-
-	PG_RETURN_VOID();
+	InsertShardPlacementRow(shardId, placementId, shardLength, groupId);
 }
 
 
@@ -3514,7 +3525,7 @@ citus_internal_add_placement_metadata(PG_FUNCTION_ARGS)
  */
 static void
 EnsureShardPlacementMetadataIsSane(Oid relationId, int64 shardId, int64 placementId,
-								   int32 shardState, int64 shardLength, int32 groupId)
+								   int64 shardLength, int32 groupId)
 {
 	/* we have just read the metadata, so we are sure that the shard exists */
 	Assert(ShardExists(shardId));
@@ -3524,12 +3535,6 @@ EnsureShardPlacementMetadataIsSane(Oid relationId, int64 shardId, int64 placemen
 		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 						errmsg("Shard placement has invalid placement id "
 							   "(%ld) for shard(%ld)", placementId, shardId)));
-	}
-
-	if (shardState != SHARD_STATE_ACTIVE)
-	{
-		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-						errmsg("Invalid shard state: %d", shardState)));
 	}
 
 	bool nodeIsInMetadata = false;
@@ -3670,7 +3675,7 @@ citus_internal_delete_shard_metadata(PG_FUNCTION_ARGS)
 		EnsureShardOwner(shardId, missingOk);
 	}
 
-	List *shardPlacementList = ShardPlacementListIncludingOrphanedPlacements(shardId);
+	List *shardPlacementList = ShardPlacementList(shardId);
 	ShardPlacement *shardPlacement = NULL;
 	foreach_ptr(shardPlacement, shardPlacementList)
 	{

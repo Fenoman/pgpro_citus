@@ -68,12 +68,6 @@ int GroupSize = 1;
 /* config variable managed via guc.c */
 char *CurrentCluster = "default";
 
-/*
- * Config variable to control whether we should replicate reference tables on
- * node activation or we should defer it to shard creation.
- */
-bool ReplicateReferenceTablesOnActivate = true;
-
 /* did current transaction modify pg_dist_node? */
 bool TransactionModifiedNodeMetadata = false;
 
@@ -126,8 +120,8 @@ static char * NodeMetadataSyncedUpdateCommand(uint32 nodeId, bool metadataSynced
 static void ErrorIfCoordinatorMetadataSetFalse(WorkerNode *workerNode, Datum value,
 											   char *field);
 static WorkerNode * SetShouldHaveShards(WorkerNode *workerNode, bool shouldHaveShards);
-static void RemoveOldShardPlacementForNodeGroup(int groupId);
 static int FindCoordinatorNodeId(void);
+static WorkerNode * FindNodeAnyClusterByNodeId(uint32 nodeId);
 
 /* declarations for dynamic loading */
 PG_FUNCTION_INFO_V1(citus_set_coordinator_host);
@@ -1229,22 +1223,6 @@ ActivateNodeList(List *nodeList)
 	 */
 	SyncDistributedObjectsToNodeList(nodeToSyncMetadata);
 
-	if (ReplicateReferenceTablesOnActivate)
-	{
-		foreach_ptr(node, nodeList)
-		{
-			/*
-			 * We need to replicate reference tables before syncing node metadata, otherwise
-			 * reference table replication logic would try to get lock on the new node before
-			 * having the shard placement on it
-			 */
-			if (NodeIsPrimary(node))
-			{
-				ReplicateAllReferenceTablesToNode(node);
-			}
-		}
-	}
-
 	/*
 	 * Sync node metadata. We must sync node metadata before syncing table
 	 * related pg_dist_xxx metadata. Since table related metadata requires
@@ -1343,7 +1321,7 @@ citus_update_node(PG_FUNCTION_ARGS)
 		}
 	}
 
-	WorkerNode *workerNode = LookupNodeByNodeId(nodeId);
+	WorkerNode *workerNode = FindNodeAnyClusterByNodeId(nodeId);
 	if (workerNode == NULL)
 	{
 		ereport(ERROR, (errcode(ERRCODE_NO_DATA_FOUND),
@@ -1419,7 +1397,7 @@ citus_update_node(PG_FUNCTION_ARGS)
 	UpdateNodeLocation(nodeId, newNodeNameString, newNodePort);
 
 	/* we should be able to find the new node from the metadata */
-	workerNode = FindWorkerNode(newNodeNameString, newNodePort);
+	workerNode = FindWorkerNodeAnyCluster(newNodeNameString, newNodePort);
 	Assert(workerNode->nodeId == nodeId);
 
 	/*
@@ -1620,8 +1598,7 @@ citus_nodename_for_nodeid(PG_FUNCTION_ARGS)
 
 	int nodeId = PG_GETARG_INT32(0);
 
-	bool missingOk = true;
-	WorkerNode *node = FindNodeWithNodeId(nodeId, missingOk);
+	WorkerNode *node = FindNodeAnyClusterByNodeId(nodeId);
 
 	if (node == NULL)
 	{
@@ -1642,8 +1619,7 @@ citus_nodeport_for_nodeid(PG_FUNCTION_ARGS)
 
 	int nodeId = PG_GETARG_INT32(0);
 
-	bool missingOk = true;
-	WorkerNode *node = FindNodeWithNodeId(nodeId, missingOk);
+	WorkerNode *node = FindNodeAnyClusterByNodeId(nodeId);
 
 	if (node == NULL)
 	{
@@ -1767,6 +1743,29 @@ FindWorkerNodeAnyCluster(const char *nodeName, int32 nodePort)
 
 
 /*
+ * FindNodeAnyClusterByNodeId searches pg_dist_node and returns the node with
+ * the nodeId. If the node can't be found returns NULL.
+ */
+static WorkerNode *
+FindNodeAnyClusterByNodeId(uint32 nodeId)
+{
+	bool includeNodesFromOtherClusters = true;
+	List *nodeList = ReadDistNode(includeNodesFromOtherClusters);
+	WorkerNode *node = NULL;
+
+	foreach_ptr(node, nodeList)
+	{
+		if (node->nodeId == nodeId)
+		{
+			return node;
+		}
+	}
+
+	return NULL;
+}
+
+
+/*
  * FindNodeWithNodeId searches pg_dist_node and returns the node with the nodeId.
  * If the node cannot be found this functions errors.
  */
@@ -1818,7 +1817,7 @@ FindCoordinatorNodeId()
 
 /*
  * ReadDistNode iterates over pg_dist_node table, converts each row
- * into it's memory representation (i.e., WorkerNode) and adds them into
+ * into its memory representation (i.e., WorkerNode) and adds them into
  * a list. Lastly, the list is returned to the caller.
  *
  * It skips nodes which are not in the current clusters unless requested to do otherwise
@@ -1847,7 +1846,7 @@ ReadDistNode(bool includeNodesFromOtherClusters)
 		if (includeNodesFromOtherClusters ||
 			strncmp(workerNode->nodeCluster, CurrentCluster, WORKER_LENGTH) == 0)
 		{
-			/* the coordinator acts as if it never sees nodes not in it's cluster */
+			/* the coordinator acts as if it never sees nodes not in its cluster */
 			workerNodeList = lappend(workerNodeList, workerNode);
 		}
 
@@ -1896,8 +1895,6 @@ RemoveNodeFromCluster(char *nodeName, int32 nodePort)
 	}
 
 	DeleteNodeRow(workerNode->workerName, nodePort);
-
-	RemoveOldShardPlacementForNodeGroup(workerNode->groupId);
 
 	/* make sure we don't have any lingering session lifespan connections */
 	CloseNodeConnectionsAfterTransaction(workerNode->workerName, nodePort);
@@ -1967,29 +1964,6 @@ PlacementHasActivePlacementOnAnotherGroup(GroupShardPlacement *sourcePlacement)
 	}
 
 	return foundActivePlacementOnAnotherGroup;
-}
-
-
-/*
- * RemoveOldShardPlacementForNodeGroup removes all old shard placements
- * for the given node group from pg_dist_placement.
- */
-static void
-RemoveOldShardPlacementForNodeGroup(int groupId)
-{
-	/*
-	 * Prevent concurrent deferred drop
-	 */
-	LockPlacementCleanup();
-	List *shardPlacementsOnNode = AllShardPlacementsOnNodeGroup(groupId);
-	GroupShardPlacement *placement = NULL;
-	foreach_ptr(placement, shardPlacementsOnNode)
-	{
-		if (placement->shardState == SHARD_STATE_TO_DELETE)
-		{
-			DeleteShardPlacementRow(placement->placementId);
-		}
-	}
 }
 
 
@@ -2092,7 +2066,7 @@ AddNodeMetadata(char *nodeName, int32 nodePort,
 	 */
 	if (nodeMetadata->groupId != COORDINATOR_GROUP_ID && CoordinatorAddedAsWorkerNode() &&
 		ActivePrimaryNonCoordinatorNodeCount() == 0 &&
-		NodeGroupHasShardPlacements(COORDINATOR_GROUP_ID, true))
+		NodeGroupHasShardPlacements(COORDINATOR_GROUP_ID))
 	{
 		WorkerNode *coordinator = CoordinatorNodeIfAddedAsWorkerOrError();
 
@@ -2232,7 +2206,7 @@ SetWorkerColumnOptional(WorkerNode *workerNode, int columnIndex, Datum value)
 		{
 			/* metadata out of sync, mark the worker as not synced */
 			ereport(WARNING, (errmsg("Updating the metadata of the node %s:%d "
-									 "is failed on node %s:%d."
+									 "is failed on node %s:%d. "
 									 "Metadata on %s:%d is marked as out of sync.",
 									 workerNode->workerName, workerNode->workerPort,
 									 worker->workerName, worker->workerPort,
