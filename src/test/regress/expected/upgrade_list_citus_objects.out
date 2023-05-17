@@ -74,7 +74,11 @@ ORDER BY 1;
  function citus_internal_delete_partition_metadata(regclass)
  function citus_internal_delete_shard_metadata(bigint)
  function citus_internal_global_blocked_processes()
+ function citus_internal_is_replication_origin_tracking_active()
  function citus_internal_local_blocked_processes()
+ function citus_internal_mark_node_not_synced(integer,integer)
+ function citus_internal_start_replication_origin_tracking()
+ function citus_internal_stop_replication_origin_tracking()
  function citus_internal_update_placement_metadata(bigint,integer,integer)
  function citus_internal_update_relation_colocation(oid,integer)
  function citus_is_clock_after(cluster_clock,cluster_clock)
@@ -121,6 +125,10 @@ ORDER BY 1;
  function citus_stat_activity()
  function citus_stat_statements()
  function citus_stat_statements_reset()
+ function citus_stat_tenants(boolean)
+ function citus_stat_tenants_local(boolean)
+ function citus_stat_tenants_local_reset()
+ function citus_stat_tenants_reset()
  function citus_table_is_visible(oid)
  function citus_table_size(regclass)
  function citus_task_wait(bigint,citus_task_status)
@@ -242,6 +250,7 @@ ORDER BY 1;
  function worker_create_or_replace_object(text)
  function worker_create_or_replace_object(text[])
  function worker_create_truncate_trigger(regclass)
+ function worker_drop_all_shell_tables(boolean)
  function worker_drop_distributed_table(text)
  function worker_drop_sequence_dependency(text)
  function worker_drop_shell_table(text)
@@ -317,7 +326,9 @@ ORDER BY 1;
  view citus_shards_on_worker
  view citus_stat_activity
  view citus_stat_statements
+ view citus_stat_tenants
+ view citus_stat_tenants_local
  view pg_dist_shard_placement
  view time_partitions
-(311 rows)
+(322 rows)
 

@@ -12,21 +12,23 @@ Options:
     --seed=<seed>                   random number seed
     --base                          whether to use the base sql schedule or not
 """
+import concurrent.futures
+import multiprocessing
+import os
+import random
+import shutil
 import sys
-import os, shutil
+import time
+
+from docopt import docopt
 
 # https://stackoverflow.com/questions/14132789/relative-imports-for-the-billionth-time/14132912#14132912
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# ignore E402 because these imports require addition to path
+import common  # noqa: E402
 
-import common
-import config as cfg
-import concurrent.futures
-import multiprocessing
-from docopt import docopt
-import time
-import random
-
+import config as cfg  # noqa: E402
 
 testResults = {}
 parallel_thread_amount = 1
@@ -115,7 +117,6 @@ def copy_copy_modified_binary(datadir):
 
 
 def copy_test_files(config):
-
     sql_dir_path = os.path.join(config.datadir, "sql")
     expected_dir_path = os.path.join(config.datadir, "expected")
 
@@ -132,7 +133,9 @@ def copy_test_files(config):
 
                 line = line[colon_index + 1 :].strip()
                 test_names = line.split(" ")
-                copy_test_files_with_names(test_names, sql_dir_path, expected_dir_path, config)
+                copy_test_files_with_names(
+                    test_names, sql_dir_path, expected_dir_path, config
+                )
 
 
 def copy_test_files_with_names(test_names, sql_dir_path, expected_dir_path, config):
@@ -140,22 +143,32 @@ def copy_test_files_with_names(test_names, sql_dir_path, expected_dir_path, conf
         # make empty files for the skipped tests
         if test_name in config.skip_tests:
             expected_sql_file = os.path.join(sql_dir_path, test_name + ".sql")
-            open(expected_sql_file, 'x').close()
+            open(expected_sql_file, "x").close()
 
             expected_out_file = os.path.join(expected_dir_path, test_name + ".out")
-            open(expected_out_file, 'x').close()
+            open(expected_out_file, "x").close()
 
             continue
 
         sql_name = os.path.join("./sql", test_name + ".sql")
-        output_name = os.path.join("./expected", test_name + ".out")
-
         shutil.copy(sql_name, sql_dir_path)
-        if os.path.isfile(output_name):
+
+        # for a test named <t>, all files:
+        # <t>.out, <t>_0.out, <t>_1.out ...
+        # are considered as valid outputs for the test
+        # by the testing tool (pg_regress)
+        # so copy such files to the testing directory
+        output_name = os.path.join("./expected", test_name + ".out")
+        alt_output_version_no = 0
+        while os.path.isfile(output_name):
             # it might be the first time we run this test and the expected file
             # might not be there yet, in that case, we don't want to error out
             # while copying the file.
             shutil.copy(output_name, expected_dir_path)
+            output_name = os.path.join(
+                "./expected", f"{test_name}_{alt_output_version_no}.out"
+            )
+            alt_output_version_no += 1
 
 
 def run_tests(configs, sql_schedule_name):

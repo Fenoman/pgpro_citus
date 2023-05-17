@@ -331,6 +331,10 @@ SELECT 1 FROM columnar_table; -- seq scan
 
 CREATE TABLE new_columnar_table (a int) USING columnar;
 
+-- disable version checks for other sessions too
+ALTER SYSTEM SET citus.enable_version_checks TO OFF;
+SELECT pg_reload_conf();
+
 -- do cleanup for the rest of the tests
 SET citus.enable_version_checks TO OFF;
 SET columnar.enable_version_checks TO OFF;
@@ -525,42 +529,66 @@ SELECT * FROM multi_extension.print_extension_changes();
 
 -- Test downgrade to 11.1-1 from 11.2-1
 ALTER EXTENSION citus UPDATE TO '11.2-1';
-
--- create a table with orphaned shards to see if orphaned shards will be dropped
--- and cleanup records will be created for them
-SET citus.shard_replication_factor to 1;
-CREATE TABLE table_with_orphaned_shards (a int);
-SELECT create_distributed_table('table_with_orphaned_shards', 'a');
--- show there are 4 placements
-SELECT * FROM pg_dist_placement ORDER BY shardid;
--- mark two of them as orphaned
-UPDATE pg_dist_placement SET shardstate = 4 WHERE shardid % 2 = 1;
-
 ALTER EXTENSION citus UPDATE TO '11.1-1';
-
--- show placements and cleanup records
-SELECT * FROM pg_dist_placement ORDER BY shardid;
-SELECT * FROM pg_dist_cleanup;
-
 -- Should be empty result since upgrade+downgrade should be a no-op
 SELECT * FROM multi_extension.print_extension_changes();
 
 -- Snapshot of state at 11.2-1
 ALTER EXTENSION citus UPDATE TO '11.2-1';
 
--- verify that the placements are deleted and cleanup records are created
-SELECT * FROM pg_dist_placement ORDER BY shardid;
-SELECT * FROM pg_dist_cleanup;
+ALTER EXTENSION citus_columnar UPDATE TO '11.2-1';
 
--- error out as cleanup records remain
-ALTER EXTENSION citus UPDATE TO '11.0-4';
+-- Make sure that we defined dependencies from all rel objects (tables,
+-- indexes, sequences ..) to columnar table access method ...
+SELECT pg_class.oid INTO columnar_schema_members
+FROM pg_class, pg_namespace
+WHERE pg_namespace.oid=pg_class.relnamespace AND
+      pg_namespace.nspname='columnar_internal' AND
+      pg_class.relname NOT IN ('chunk_group_pkey',
+                               'chunk_pkey',
+                               'options_pkey',
+                               'stripe_first_row_number_idx',
+                               'stripe_pkey');
+SELECT refobjid INTO columnar_schema_members_pg_depend
+FROM pg_depend
+WHERE classid = 'pg_am'::regclass::oid AND
+      objid = (select oid from pg_am where amname = 'columnar') AND
+      objsubid = 0 AND
+      refclassid = 'pg_class'::regclass::oid AND
+      refobjsubid = 0 AND
+      deptype = 'n';
 
--- cleanup
-SET client_min_messages TO ERROR;
-CALL citus_cleanup_orphaned_resources();
-DROP TABLE table_with_orphaned_shards;
-RESET client_min_messages;
+-- ... , so this should be empty,
+(TABLE columnar_schema_members EXCEPT TABLE columnar_schema_members_pg_depend)
+UNION
+(TABLE columnar_schema_members_pg_depend EXCEPT TABLE columnar_schema_members);
 
+-- ... , and both columnar_schema_members_pg_depend & columnar_schema_members
+-- should have 5 entries.
+SELECT COUNT(*)=5 FROM columnar_schema_members_pg_depend;
+
+DROP TABLE columnar_schema_members, columnar_schema_members_pg_depend;
+
+SELECT * FROM multi_extension.print_extension_changes();
+
+-- Test downgrade to 11.2-1 from 11.2-2
+ALTER EXTENSION citus UPDATE TO '11.2-2';
+ALTER EXTENSION citus UPDATE TO '11.2-1';
+-- Should be empty result since upgrade+downgrade should be a no-op
+SELECT * FROM multi_extension.print_extension_changes();
+
+-- Snapshot of state at 11.2-2
+ALTER EXTENSION citus UPDATE TO '11.2-2';
+SELECT * FROM multi_extension.print_extension_changes();
+
+-- Test downgrade to 11.2-2 from 11.3-1
+ALTER EXTENSION citus UPDATE TO '11.3-1';
+ALTER EXTENSION citus UPDATE TO '11.2-2';
+-- Should be empty result since upgrade+downgrade should be a no-op
+SELECT * FROM multi_extension.print_extension_changes();
+
+-- Snapshot of state at 11.3-1
+ALTER EXTENSION citus UPDATE TO '11.3-1';
 SELECT * FROM multi_extension.print_extension_changes();
 
 -- show running version
@@ -590,6 +618,11 @@ DROP TABLE multi_extension.prev_objects, multi_extension.extension_diff;
 -- see incompatible version errors out
 RESET citus.enable_version_checks;
 RESET columnar.enable_version_checks;
+
+-- reset version check config for other sessions too
+ALTER SYSTEM RESET citus.enable_version_checks;
+SELECT pg_reload_conf();
+
 DROP EXTENSION citus;
 DROP EXTENSION citus_columnar;
 CREATE EXTENSION citus VERSION '8.0-1';

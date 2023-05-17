@@ -252,6 +252,7 @@ typedef struct BackgroundTask
 	int32 *retry_count;
 	TimestampTz *not_before;
 	char *message;
+	List *nodesInvolved;
 
 	/* extra space to store values for nullable value types above */
 	struct
@@ -299,6 +300,9 @@ extern WorkerNode * ActiveShardPlacementWorkerNode(uint64 shardId);
 extern List * BuildShardPlacementList(int64 shardId);
 extern List * AllShardPlacementsOnNodeGroup(int32 groupId);
 extern List * GroupShardPlacementsForTableOnGroup(Oid relationId, int32 groupId);
+extern void LookupTaskPlacementHostAndPort(ShardPlacement *taskPlacement, char **nodeName,
+										   int *nodePort);
+extern bool IsDummyPlacement(ShardPlacement *taskPlacement);
 extern StringInfo GenerateSizeQueryOnMultiplePlacements(List *shardIntervalList,
 														SizeQueryType sizeQueryType,
 														bool optimizePartitionCalculations);
@@ -325,6 +329,7 @@ extern void DeleteShardPlacementRow(uint64 placementId);
 extern void CreateDistributedTable(Oid relationId, char *distributionColumnName,
 								   char distributionMethod, int shardCount,
 								   bool shardCountIsStrict, char *colocateWithTableName);
+extern void CreateReferenceTable(Oid relationId);
 extern void CreateTruncateTrigger(Oid relationId);
 extern TableConversionReturn * UndistributeTable(TableConversionParameters *params);
 
@@ -337,7 +342,6 @@ extern List * GetAllDependencyCreateDDLCommands(const List *dependencies);
 extern bool ShouldPropagate(void);
 extern bool ShouldPropagateCreateInCoordinatedTransction(void);
 extern bool ShouldPropagateAnyObject(List *addresses);
-extern List * ReplicateAllObjectsToNodeCommandList(const char *nodeName, int nodePort);
 
 /* Remaining metadata utility functions  */
 extern Oid TableOwnerOid(Oid relationId);
@@ -385,7 +389,9 @@ extern bool HasNonTerminalJobOfType(const char *jobType, int64 *jobIdOut);
 extern int64 CreateBackgroundJob(const char *jobType, const char *description);
 extern BackgroundTask * ScheduleBackgroundTask(int64 jobId, Oid owner, char *command,
 											   int dependingTaskCount,
-											   int64 dependingTaskIds[]);
+											   int64 dependingTaskIds[],
+											   int nodesInvolvedCount,
+											   int32 nodesInvolved[]);
 extern BackgroundTask * GetRunnableBackgroundTask(void);
 extern void ResetRunningBackgroundTasks(void);
 extern BackgroundJob * GetBackgroundJobByJobId(int64 jobId);

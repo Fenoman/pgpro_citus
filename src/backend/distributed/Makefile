@@ -32,7 +32,12 @@ OBJS += \
 	$(patsubst $(citus_abs_srcdir)/%.c,%.o,$(foreach dir,$(SUBDIRS), $(sort $(wildcard $(citus_abs_srcdir)/$(dir)/*.c))))
 
 # be explicit about the default target
-all:
+.PHONY: cdc
+
+all: cdc
+
+cdc:
+	$(MAKE) -C cdc all
 
 NO_PGXS = 1
 
@@ -79,13 +84,22 @@ ifneq (,$(SQL_Po_files))
 include $(SQL_Po_files)
 endif
 
-.PHONY: clean-full install install-downgrades install-all
+
+.PHONY: clean-full install install-downgrades install-all install-cdc clean-cdc
+
+clean: clean-cdc
+
+clean-cdc:
+	$(MAKE) -C cdc clean
 
 cleanup-before-install:
 	rm -f $(DESTDIR)$(datadir)/$(datamoduledir)/citus.control
 	rm -f $(DESTDIR)$(datadir)/$(datamoduledir)/citus--*
 
-install: cleanup-before-install
+install: cleanup-before-install install-cdc
+
+install-cdc:
+	$(MAKE) -C cdc install
 
 # install and install-downgrades should be run sequentially
 install-all: install
@@ -96,4 +110,5 @@ install-downgrades: $(generated_downgrade_sql_files)
 
 clean-full:
 	$(MAKE) clean
+	$(MAKE) -C cdc clean-full
 	rm -rf $(safestringlib_builddir)

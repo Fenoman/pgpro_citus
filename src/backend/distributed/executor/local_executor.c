@@ -90,12 +90,14 @@
 #include "distributed/local_executor.h"
 #include "distributed/local_plan_cache.h"
 #include "distributed/coordinator_protocol.h"
+#include "distributed/executor_util.h"
 #include "distributed/metadata_cache.h"
 #include "distributed/multi_executor.h"
 #include "distributed/multi_server_executor.h"
 #include "distributed/relation_access_tracking.h"
 #include "distributed/remote_commands.h" /* to access LogRemoteCommands */
 #include "distributed/transaction_management.h"
+#include "distributed/utils/citus_stat_tenants.h"
 #include "distributed/version_compat.h"
 #include "distributed/worker_protocol.h"
 #include "executor/tstoreReceiver.h"
@@ -127,6 +129,8 @@ static void LogLocalCommand(Task *task);
 static uint64 LocallyPlanAndExecuteMultipleQueries(List *queryStrings,
 												   TupleDestination *tupleDest,
 												   Task *task);
+static void SetColocationIdAndPartitionKeyValueForTasks(List *taskList,
+														Job *distributedPlan);
 static void LocallyExecuteUtilityTask(Task *task);
 static void ExecuteUdfTaskQuery(Query *localUdfCommandQuery);
 static void EnsureTransitionPossible(LocalExecutionStatus from,
@@ -224,6 +228,17 @@ ExecuteLocalTaskListExtended(List *taskList,
 	{
 		bool isRemote = false;
 		EnsureTaskExecutionAllowed(isRemote);
+	}
+
+	/*
+	 * If workerJob has a partitionKeyValue, we need to set the colocation id
+	 * and partition key value for each task before we start executing them
+	 * because tenant stats are collected based on these values of a task.
+	 */
+	if (distributedPlan != NULL && distributedPlan->workerJob != NULL && taskList != NIL)
+	{
+		SetJobColocationId(distributedPlan->workerJob);
+		SetColocationIdAndPartitionKeyValueForTasks(taskList, distributedPlan->workerJob);
 	}
 
 	/*
@@ -362,6 +377,26 @@ ExecuteLocalTaskListExtended(List *taskList,
 	}
 
 	return totalRowsProcessed;
+}
+
+
+/*
+ * SetColocationIdAndPartitionKeyValueForTasks sets colocationId and partitionKeyValue
+ * for the tasks in the taskList if workerJob has a colocationId and partitionKeyValue.
+ */
+static void
+SetColocationIdAndPartitionKeyValueForTasks(List *taskList, Job *workerJob)
+{
+	if (workerJob->colocationId != 0 &&
+		workerJob->partitionKeyValue != NULL)
+	{
+		Task *task = NULL;
+		foreach_ptr(task, taskList)
+		{
+			task->colocationId = workerJob->colocationId;
+			task->partitionKeyValue = workerJob->partitionKeyValue;
+		}
+	}
 }
 
 
@@ -645,6 +680,16 @@ LocallyExecuteTaskPlan(PlannedStmt *taskPlan, char *queryString,
 	{
 		LocalExecutorShardId = task->anchorShardId;
 	}
+
+
+	char *partitionKeyValueString = NULL;
+	if (task->partitionKeyValue != NULL)
+	{
+		partitionKeyValueString = DatumToString(task->partitionKeyValue->constvalue,
+												task->partitionKeyValue->consttype);
+	}
+
+	AttributeTask(partitionKeyValueString, task->colocationId, taskPlan->commandType);
 
 	PG_TRY();
 	{

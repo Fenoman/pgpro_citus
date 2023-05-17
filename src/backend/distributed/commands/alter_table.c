@@ -55,6 +55,7 @@
 #include "distributed/multi_partitioning_utils.h"
 #include "distributed/reference_table_utils.h"
 #include "distributed/relation_access_tracking.h"
+#include "distributed/replication_origin_session_utils.h"
 #include "distributed/shared_library_init.h"
 #include "distributed/shard_utils.h"
 #include "distributed/worker_protocol.h"
@@ -216,6 +217,7 @@ static bool WillRecreateForeignKeyToReferenceTable(Oid relationId,
 												   CascadeToColocatedOption cascadeOption);
 static void WarningsForDroppingForeignKeysWithDistributedTables(Oid relationId);
 static void ErrorIfUnsupportedCascadeObjects(Oid relationId);
+static List * WrapTableDDLCommands(List *commandStrings);
 static bool DoesCascadeDropUnsupportedObject(Oid classId, Oid id, HTAB *nodeMap);
 static TableConversionReturn * CopyTableConversionReturnIntoCurrentContext(
 	TableConversionReturn *tableConversionReturn);
@@ -406,7 +408,10 @@ UndistributeTable(TableConversionParameters *params)
 	params->shardCountIsNull = true;
 	TableConversionState *con = CreateTableConversion(params);
 
-	return ConvertTable(con);
+	SetupReplicationOriginLocalSession();
+	TableConversionReturn *conv = ConvertTable(con);
+	ResetReplicationOriginLocalSession();
+	return conv;
 }
 
 
@@ -600,9 +605,18 @@ ConvertTableInternal(TableConversionState *con)
 	List *justBeforeDropCommands = NIL;
 	List *attachPartitionCommands = NIL;
 
-	postLoadCommands =
-		list_concat(postLoadCommands,
-					GetViewCreationTableDDLCommandsOfTable(con->relationId));
+	List *createViewCommands = GetViewCreationCommandsOfTable(con->relationId);
+
+	postLoadCommands = list_concat(postLoadCommands,
+								   WrapTableDDLCommands(createViewCommands));
+
+	/* need to add back to publications after dropping the original table */
+	bool isAdd = true;
+	List *alterPublicationCommands =
+		GetAlterPublicationDDLCommandsForTable(con->relationId, isAdd);
+
+	postLoadCommands = list_concat(postLoadCommands,
+								   WrapTableDDLCommands(alterPublicationCommands));
 
 	List *foreignKeyCommands = NIL;
 	if (con->conversionType == ALTER_DISTRIBUTED_TABLE)
@@ -805,15 +819,30 @@ ConvertTableInternal(TableConversionState *con)
 		ExecuteQueryViaSPI(tableConstructionSQL, SPI_OK_UTILITY);
 	}
 
+	/*
+	 * when there are many partitions, each call to ProcessUtilityParseTree
+	 * accumulates used memory. Free context after each call.
+	 */
+	MemoryContext citusPerPartitionContext =
+		AllocSetContextCreate(CurrentMemoryContext,
+							  "citus_per_partition_context",
+							  ALLOCSET_DEFAULT_SIZES);
+	MemoryContext oldContext = MemoryContextSwitchTo(citusPerPartitionContext);
+
 	char *attachPartitionCommand = NULL;
 	foreach_ptr(attachPartitionCommand, attachPartitionCommands)
 	{
+		MemoryContextReset(citusPerPartitionContext);
+
 		Node *parseTree = ParseTreeNode(attachPartitionCommand);
 
 		ProcessUtilityParseTree(parseTree, attachPartitionCommand,
 								PROCESS_UTILITY_QUERY,
 								NULL, None_Receiver, NULL);
 	}
+
+	MemoryContextSwitchTo(oldContext);
+	MemoryContextDelete(citusPerPartitionContext);
 
 	if (isPartitionTable)
 	{
@@ -1340,8 +1369,7 @@ CreateCitusTableLike(TableConversionState *con)
 	}
 	else if (IsCitusTableType(con->relationId, REFERENCE_TABLE))
 	{
-		CreateDistributedTable(con->newRelationId, NULL, DISTRIBUTE_BY_NONE, 0, false,
-							   NULL);
+		CreateReferenceTable(con->newRelationId);
 	}
 	else if (IsCitusTableType(con->relationId, CITUS_LOCAL_TABLE))
 	{
@@ -1482,17 +1510,16 @@ GetViewCreationCommandsOfTable(Oid relationId)
 
 
 /*
- * GetViewCreationTableDDLCommandsOfTable is the same as GetViewCreationCommandsOfTable,
- * but the returned list includes objects of TableDDLCommand's, not strings.
+ * WrapTableDDLCommands takes a list of command strings and wraps them
+ * in TableDDLCommand structs.
  */
-List *
-GetViewCreationTableDDLCommandsOfTable(Oid relationId)
+static List *
+WrapTableDDLCommands(List *commandStrings)
 {
-	List *commands = GetViewCreationCommandsOfTable(relationId);
 	List *tableDDLCommands = NIL;
 
 	char *command = NULL;
-	foreach_ptr(command, commands)
+	foreach_ptr(command, commandStrings)
 	{
 		tableDDLCommands = lappend(tableDDLCommands, makeTableDDLCommandString(command));
 	}
@@ -1683,20 +1710,13 @@ ReplaceTable(Oid sourceId, Oid targetId, List *justBeforeDropCommands,
 		}
 		else if (ShouldSyncTableMetadata(sourceId))
 		{
-			char *qualifiedTableName = quote_qualified_identifier(schemaName, sourceName);
-
 			/*
 			 * We are converting a citus local table to a distributed/reference table,
 			 * so we should prevent dropping the sequence on the table. Otherwise, we'd
 			 * lose track of the previous changes in the sequence.
 			 */
-			StringInfo command = makeStringInfo();
-
-			appendStringInfo(command,
-							 "SELECT pg_catalog.worker_drop_sequence_dependency(%s);",
-							 quote_literal_cstr(qualifiedTableName));
-
-			SendCommandToWorkersWithMetadata(command->data);
+			char *command = WorkerDropSequenceDependencyCommand(sourceId);
+			SendCommandToWorkersWithMetadata(command);
 		}
 	}
 

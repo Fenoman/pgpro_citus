@@ -74,6 +74,7 @@
 #include "distributed/recursive_planning.h"
 #include "distributed/reference_table_utils.h"
 #include "distributed/relation_access_tracking.h"
+#include "distributed/replication_origin_session_utils.h"
 #include "distributed/run_from_same_connection.h"
 #include "distributed/shard_cleaner.h"
 #include "distributed/shard_transfer.h"
@@ -90,6 +91,7 @@
 #include "distributed/resource_lock.h"
 #include "distributed/transaction_management.h"
 #include "distributed/transaction_recovery.h"
+#include "distributed/utils/citus_stat_tenants.h"
 #include "distributed/utils/directory.h"
 #include "distributed/worker_log_messages.h"
 #include "distributed/worker_manager.h"
@@ -134,6 +136,8 @@ ReadColumnarOptions_type extern_ReadColumnarOptions = NULL;
 #define INIT_COLUMNAR_SYMBOL(typename, funcname) \
 	CppConcat(extern_, funcname) = \
 		(typename) (void *) lookup_external_function(handle, # funcname)
+
+#define CDC_DECODER_DYNAMIC_LIB_PATH "$libdir/citus_decoders:$libdir"
 
 DEFINE_COLUMNAR_PASSTHROUGH_FUNC(columnar_handler)
 DEFINE_COLUMNAR_PASSTHROUGH_FUNC(alter_columnar_table_set)
@@ -206,7 +210,7 @@ static bool StatisticsCollectionGucCheckHook(bool *newval, void **extra, GucSour
 											 source);
 static void CitusAuthHook(Port *port, int status);
 static bool IsSuperuser(char *userName);
-
+static void AdjustDynamicLibraryPathForCdcDecoders(void);
 
 static ClientAuthentication_hook_type original_client_auth_hook = NULL;
 
@@ -222,6 +226,12 @@ static const struct config_enum_entry propagate_set_commands_options[] = {
 static const struct config_enum_entry stat_statements_track_options[] = {
 	{ "none", STAT_STATEMENTS_TRACK_NONE, false },
 	{ "all", STAT_STATEMENTS_TRACK_ALL, false },
+	{ NULL, 0, false }
+};
+
+static const struct config_enum_entry stat_tenants_track_options[] = {
+	{ "none", STAT_TENANTS_TRACK_NONE, false },
+	{ "all", STAT_TENANTS_TRACK_ALL, false },
 	{ NULL, 0, false }
 };
 
@@ -359,6 +369,11 @@ static const struct config_enum_entry cpu_priority_options[] = {
 	{ NULL, 0, false}
 };
 
+static const struct config_enum_entry metadata_sync_mode_options[] = {
+	{ "transactional", METADATA_SYNC_TRANSACTIONAL, false },
+	{ "nontransactional", METADATA_SYNC_NON_TRANSACTIONAL, false },
+	{ NULL, 0, false }
+};
 
 /* *INDENT-ON* */
 
@@ -439,6 +454,8 @@ _PG_init(void)
 	ExecutorStart_hook = CitusExecutorStart;
 	ExecutorRun_hook = CitusExecutorRun;
 	ExplainOneQuery_hook = CitusExplainOneQuery;
+	prev_ExecutorEnd = ExecutorEnd_hook;
+	ExecutorEnd_hook = CitusAttributeToEnd;
 
 	/* register hook for error messages */
 	emit_log_hook = multi_log_hook;
@@ -469,8 +486,21 @@ _PG_init(void)
 	InitializeLocallyReservedSharedConnections();
 	InitializeClusterClockMem();
 
+	/*
+	 * Adjust the Dynamic Library Path to prepend citus_decodes to the dynamic
+	 * library path. This is needed to make sure that the citus decoders are
+	 * loaded before the default decoders for CDC.
+	 */
+	if (EnableChangeDataCapture)
+	{
+		AdjustDynamicLibraryPathForCdcDecoders();
+	}
+
+
 	/* initialize shard split shared memory handle management */
 	InitializeShardSplitSMHandleManagement();
+
+	InitializeMultiTenantMonitorSMHandleManagement();
 
 	/* enable modification of pg_catalog tables during pg_upgrade */
 	if (IsBinaryUpgrade)
@@ -533,6 +563,22 @@ _PG_init(void)
 	INIT_COLUMNAR_SYMBOL(PGFunction, columnar_storage_info);
 	INIT_COLUMNAR_SYMBOL(PGFunction, columnar_store_memory_stats);
 	INIT_COLUMNAR_SYMBOL(PGFunction, test_columnar_storage_write_new_page);
+}
+
+
+/*
+ * PrependCitusDecodersToDynamicLibrayPath prepends the $libdir/citus_decoders
+ * to the dynamic library path. This is needed to make sure that the citus
+ * decoders are loaded before the default decoders for CDC.
+ */
+static void
+AdjustDynamicLibraryPathForCdcDecoders(void)
+{
+	if (strcmp(Dynamic_library_path, "$libdir") == 0)
+	{
+		SetConfigOption("dynamic_library_path", CDC_DECODER_DYNAMIC_LIB_PATH,
+						PGC_POSTMASTER, PGC_S_OVERRIDE);
+	}
 }
 
 
@@ -1133,6 +1179,16 @@ RegisterCitusConfigVariables(void)
 		NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
+		"citus.enable_change_data_capture",
+		gettext_noop("Enables using replication origin tracking for change data capture"),
+		NULL,
+		&EnableChangeDataCapture,
+		false,
+		PGC_USERSET,
+		GUC_STANDARD,
+		NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
 		"citus.enable_cluster_clock",
 		gettext_noop("When users explicitly call UDF citus_get_transaction_clock() "
 					 "and the flag is true, it returns the maximum "
@@ -1263,6 +1319,26 @@ RegisterCitusConfigVariables(void)
 		gettext_noop("Enables object and metadata syncing."),
 		NULL,
 		&EnableMetadataSync,
+		true,
+		PGC_USERSET,
+		GUC_NO_SHOW_ALL,
+		NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		"citus.enable_non_colocated_router_query_pushdown",
+		gettext_noop("Enables router planner for the queries that reference "
+					 "non-colocated distributed tables."),
+		gettext_noop("Normally, router planner planner is only enabled for "
+					 "the queries that reference colocated distributed tables "
+					 "because it is not guaranteed to have the target shards "
+					 "always on the same node, e.g., after rebalancing the "
+					 "shards. For this reason, while enabling this flag allows "
+					 "some degree of optimization for the queries that reference "
+					 "non-colocated distributed tables, it is not guaranteed "
+					 "that the same query will work after rebalancing the shards "
+					 "or altering the shard count of one of those distributed "
+					 "tables."),
+		&EnableNonColocatedRouterQueryPushdown,
 		true,
 		PGC_USERSET,
 		GUC_NO_SHOW_ALL,
@@ -1718,6 +1794,18 @@ RegisterCitusConfigVariables(void)
 		NULL, NULL, NULL);
 
 	DefineCustomIntVariable(
+		"citus.max_background_task_executors_per_node",
+		gettext_noop(
+			"Sets the maximum number of parallel background task executor workers "
+			"for scheduled background tasks that involve a particular node"),
+		NULL,
+		&MaxBackgroundTaskExecutorsPerNode,
+		1, 1, 128,
+		PGC_SIGHUP,
+		GUC_STANDARD,
+		NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
 		"citus.max_cached_connection_lifetime",
 		gettext_noop("Sets the maximum lifetime of cached connections to other nodes."),
 		NULL,
@@ -1847,6 +1935,21 @@ RegisterCitusConfigVariables(void)
 		60 * MS_PER_SECOND, 1, 7 * MS_PER_DAY,
 		PGC_SIGHUP,
 		GUC_UNIT_MS | GUC_NO_SHOW_ALL,
+		NULL, NULL, NULL);
+
+	DefineCustomEnumVariable(
+		"citus.metadata_sync_mode",
+		gettext_noop("Sets transaction mode for metadata syncs."),
+		gettext_noop("metadata sync can be run inside a single coordinated "
+					 "transaction or with multiple small transactions in "
+					 "idempotent way. By default we sync metadata in single "
+					 "coordinated transaction. When we hit memory problems "
+					 "at workers, we have alternative nontransactional mode "
+					 "where we send each command with separate transaction."),
+		&MetadataSyncTransMode,
+		METADATA_SYNC_TRANSACTIONAL, metadata_sync_mode_options,
+		PGC_SUSET,
+		GUC_SUPERUSER_ONLY | GUC_NO_SHOW_ALL,
 		NULL, NULL, NULL);
 
 	DefineCustomIntVariable(
@@ -2283,6 +2386,50 @@ RegisterCitusConfigVariables(void)
 		GUC_STANDARD,
 		NULL, NULL, NULL);
 
+	DefineCustomIntVariable(
+		"citus.stat_tenants_limit",
+		gettext_noop("Number of tenants to be shown in citus_stat_tenants."),
+		NULL,
+		&StatTenantsLimit,
+		100, 1, 10000,
+		PGC_POSTMASTER,
+		GUC_STANDARD,
+		NULL, NULL, NULL);
+
+	DefineCustomEnumVariable(
+		"citus.stat_tenants_log_level",
+		gettext_noop("Sets the level of citus_stat_tenants log messages"),
+		NULL,
+		&StatTenantsLogLevel,
+		CITUS_LOG_LEVEL_OFF, log_level_options,
+		PGC_USERSET,
+		GUC_STANDARD,
+		NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"citus.stat_tenants_period",
+		gettext_noop("Period in seconds to be used for calculating the tenant "
+					 "statistics in citus_stat_tenants."),
+		NULL,
+		&StatTenantsPeriod,
+		60, 1, 60 * 60 * 24,
+		PGC_USERSET,
+		GUC_STANDARD,
+		NULL, NULL, NULL);
+
+	DefineCustomEnumVariable(
+		"citus.stat_tenants_track",
+		gettext_noop("Enables/Disables the stats collection for citus_stat_tenants."),
+		gettext_noop("Enables the stats collection when set to 'all'. "
+					 "Disables when set to 'none'. Disabling can be useful for "
+					 "avoiding extra CPU cycles needed for the calculations."),
+		&StatTenantsTrack,
+		STAT_TENANTS_TRACK_NONE,
+		stat_tenants_track_options,
+		PGC_SUSET,
+		GUC_STANDARD,
+		NULL, NULL, NULL);
+
 	DefineCustomBoolVariable(
 		"citus.subquery_pushdown",
 		gettext_noop("Usage of this GUC is highly discouraged, please read the long "
@@ -2405,7 +2552,6 @@ RegisterCitusConfigVariables(void)
 		PGC_USERSET,
 		GUC_STANDARD,
 		NULL, NULL, NULL);
-
 
 	/* warn about config items in the citus namespace that are not registered above */
 	EmitWarningsOnPlaceholders("citus");

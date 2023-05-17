@@ -4,9 +4,12 @@ ALTER SEQUENCE pg_catalog.pg_dist_groupid_seq RESTART 1;
 
 -- Tests functions related to cluster membership
 
--- add the nodes to the cluster
+-- add the first node to the cluster in transactional mode
 SELECT 1 FROM master_add_node('localhost', :worker_1_port);
+-- add the second node in nontransactional mode
+SET citus.metadata_sync_mode TO 'nontransactional';
 SELECT 1 FROM master_add_node('localhost', :worker_2_port);
+RESET citus.metadata_sync_mode;
 
 -- I am coordinator
 SELECT citus_is_coordinator();
@@ -32,7 +35,7 @@ SELECT master_get_active_worker_nodes();
 SELECT 1 FROM master_add_node('localhost', :worker_2_port);
 
 SELECT citus_disable_node('localhost', :worker_2_port);
-SELECT public.wait_until_metadata_sync();
+SELECT public.wait_until_metadata_sync(60000);
 SELECT master_get_active_worker_nodes();
 
 -- add some shard placements to the cluster
@@ -320,7 +323,7 @@ SELECT 1 FROM master_add_inactive_node('localhost', 9996, groupid => :worker_2_g
 SELECT master_add_inactive_node('localhost', 9999, groupid => :worker_2_group, nodecluster => 'olap', noderole => 'secondary');
 SELECT master_activate_node('localhost', 9999);
 SELECT citus_disable_node('localhost', 9999);
-SELECT public.wait_until_metadata_sync();
+SELECT public.wait_until_metadata_sync(60000);
 SELECT master_remove_node('localhost', 9999);
 
 -- check that you can't manually add two primaries to a group
@@ -505,6 +508,20 @@ BEGIN;
 	SELECT start_metadata_sync_to_all_nodes();
 COMMIT;
 SELECT start_metadata_sync_to_all_nodes();
+
+-- nontransactional sync mode tests
+SET citus.metadata_sync_mode TO 'nontransactional';
+-- do not allow nontransactional sync inside transaction block
+BEGIN;
+	SELECT start_metadata_sync_to_all_nodes();
+COMMIT;
+SELECT start_metadata_sync_to_all_nodes();
+-- do not allow nontransactional node addition inside transaction block
+BEGIN;
+	SELECT citus_remove_node('localhost', :worker_1_port);
+	SELECT citus_add_node('localhost', :worker_1_port);
+COMMIT;
+RESET citus.metadata_sync_mode;
 
 -- verify that at the end of this file, all primary nodes have metadata synced
 SELECT bool_and(hasmetadata) AND bool_and(metadatasynced) FROM pg_dist_node WHERE isactive = 't' and noderole = 'primary';

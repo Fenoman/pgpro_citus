@@ -32,6 +32,7 @@
 #include "catalog/pg_type.h"
 #include "commands/extension.h"
 #include "commands/sequence.h"
+#include "distributed/background_jobs.h"
 #include "distributed/colocation_utils.h"
 #include "distributed/connection_management.h"
 #include "distributed/citus_nodes.h"
@@ -57,7 +58,9 @@
 #include "distributed/relay_utility.h"
 #include "distributed/resource_lock.h"
 #include "distributed/remote_commands.h"
+#include "distributed/shard_rebalancer.h"
 #include "distributed/tuplestore.h"
+#include "distributed/utils/array_type.h"
 #include "distributed/worker_manager.h"
 #include "distributed/worker_protocol.h"
 #include "distributed/version_compat.h"
@@ -777,7 +780,6 @@ GenerateSizeQueryOnMultiplePlacements(List *shardIntervalList,
 		{
 			partitionedShardNames = lappend(partitionedShardNames, quotedShardName);
 		}
-
 		/* for non-partitioned tables, we will use Postgres' size functions */
 		else
 		{
@@ -1667,6 +1669,48 @@ TupleToGroupShardPlacement(TupleDesc tupleDescriptor, HeapTuple heapTuple)
 		datumArray[Anum_pg_dist_placement_groupid - 1]);
 
 	return shardPlacement;
+}
+
+
+/*
+ * LookupTaskPlacementHostAndPort sets the nodename and nodeport for the given task placement
+ * with a lookup.
+ */
+void
+LookupTaskPlacementHostAndPort(ShardPlacement *taskPlacement, char **nodeName,
+							   int *nodePort)
+{
+	if (IsDummyPlacement(taskPlacement))
+	{
+		/*
+		 * If we create a dummy placement for the local node, it is possible
+		 * that the entry doesn't exist in pg_dist_node, hence a lookup will fail.
+		 * In that case we want to use the dummy placements values.
+		 */
+		*nodeName = taskPlacement->nodeName;
+		*nodePort = taskPlacement->nodePort;
+	}
+	else
+	{
+		/*
+		 * We want to lookup the node information again since it is possible that
+		 * there were changes in pg_dist_node and we will get those invalidations
+		 * in LookupNodeForGroup.
+		 */
+		WorkerNode *workerNode = LookupNodeForGroup(taskPlacement->groupId);
+		*nodeName = workerNode->workerName;
+		*nodePort = workerNode->workerPort;
+	}
+}
+
+
+/*
+ * IsDummyPlacement returns true if the given placement is a dummy placement.
+ */
+bool
+IsDummyPlacement(ShardPlacement *taskPlacement)
+{
+	return taskPlacement->nodeId == LOCAL_NODE_ID;
 }
 
 
@@ -2774,7 +2818,8 @@ CreateBackgroundJob(const char *jobType, const char *description)
  */
 BackgroundTask *
 ScheduleBackgroundTask(int64 jobId, Oid owner, char *command, int dependingTaskCount,
-					   int64 dependingTaskIds[])
+					   int64 dependingTaskIds[], int nodesInvolvedCount, int32
+					   nodesInvolved[])
 {
 	BackgroundTask *task = NULL;
 
@@ -2847,6 +2892,11 @@ ScheduleBackgroundTask(int64 jobId, Oid owner, char *command, int dependingTaskC
 
 		values[Anum_pg_dist_background_task_message - 1] = CStringGetTextDatum("");
 		nulls[Anum_pg_dist_background_task_message - 1] = false;
+
+		values[Anum_pg_dist_background_task_nodes_involved - 1] =
+			IntArrayToDatum(nodesInvolvedCount, nodesInvolved);
+		nulls[Anum_pg_dist_background_task_nodes_involved - 1] = (nodesInvolvedCount ==
+																  0);
 
 		HeapTuple newTuple = heap_form_tuple(RelationGetDescr(pgDistBackgroundTask),
 											 values, nulls);
@@ -3159,6 +3209,13 @@ DeformBackgroundTaskHeapTuple(TupleDesc tupleDescriptor, HeapTuple taskTuple)
 			TextDatumGetCString(values[Anum_pg_dist_background_task_message - 1]);
 	}
 
+	if (!nulls[Anum_pg_dist_background_task_nodes_involved - 1])
+	{
+		ArrayType *nodesInvolvedArrayObject =
+			DatumGetArrayTypeP(values[Anum_pg_dist_background_task_nodes_involved - 1]);
+		task->nodesInvolved = IntegerArrayTypeToList(nodesInvolvedArrayObject);
+	}
+
 	return task;
 }
 
@@ -3291,7 +3348,8 @@ GetRunnableBackgroundTask(void)
 		while (HeapTupleIsValid(taskTuple = systable_getnext(scanDescriptor)))
 		{
 			task = DeformBackgroundTaskHeapTuple(tupleDescriptor, taskTuple);
-			if (BackgroundTaskReadyToRun(task))
+			if (BackgroundTaskReadyToRun(task) &&
+				IncrementParallelTaskCountForNodesInvolved(task))
 			{
 				/* found task, close table and return */
 				break;

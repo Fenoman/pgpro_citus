@@ -28,6 +28,10 @@ s/\(ref_id\)=\([0-9]+\)/(ref_id)=(X)/g
 # shard table names for multi_subtransactions
 s/"t2_[0-9]+"/"t2_xxxxxxx"/g
 
+# shard table names for MERGE tests
+s/merge_schema\.([_a-z0-9]+)_40[0-9]+ /merge_schema.\1_xxxxxxx /g
+s/pgmerge_schema\.([_a-z0-9]+)_40[0-9]+ /pgmerge_schema.\1_xxxxxxx /g
+
 # shard table names for multi_subquery
 s/ keyval(1|2|ref)_[0-9]+ / keyval\1_xxxxxxx /g
 
@@ -303,3 +307,8 @@ s/(NOTICE:  issuing SET LOCAL application_name TO 'citus_rebalancer gpid=)[0-9]+
 
 # shard_rebalancer output, flaky improvement number
 s/improvement of 0.1[0-9]* is lower/improvement of 0.1xxxxx is lower/g
+# normalize tenants statistics annotations
+s/\/\*\{"tId":.*\*\///g
+
+# Notice message that contains current columnar version that makes it harder to bump versions
+s/(NOTICE:  issuing CREATE EXTENSION IF NOT EXISTS citus_columnar WITH SCHEMA  pg_catalog VERSION )"[0-9]+\.[0-9]+-[0-9]+"/\1 "x.y-z"/
