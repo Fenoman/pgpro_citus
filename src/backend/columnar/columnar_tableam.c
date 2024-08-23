@@ -1190,7 +1190,7 @@ columnar_vacuum_rel(Relation rel, VacuumParams *params,
 	pgstat_report_vacuum(RelationGetRelid(rel),
 						 rel->rd_rel->relisshared,
 						 Max(new_live_tuples, 0),
-						 0);
+						 0, NULL);
 	pgstat_progress_end_command();
 }
 
