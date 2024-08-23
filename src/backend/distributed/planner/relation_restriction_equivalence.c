@@ -10,30 +10,30 @@
  */
 #include "postgres.h"
 
-#include "distributed/pg_version_constants.h"
+#include "catalog/pg_type.h"
+#include "nodes/makefuncs.h"
+#include "nodes/nodeFuncs.h"
+#include "nodes/pathnodes.h"
+#include "nodes/pg_list.h"
+#include "nodes/primnodes.h"
+#include "optimizer/optimizer.h"
+#include "optimizer/pathnode.h"
+#include "optimizer/paths.h"
+#include "parser/parsetree.h"
+
+#include "pg_version_constants.h"
 
 #include "distributed/colocation_utils.h"
 #include "distributed/distributed_planner.h"
 #include "distributed/listutils.h"
 #include "distributed/metadata_cache.h"
-#include "distributed/multi_logical_planner.h"
 #include "distributed/multi_logical_optimizer.h"
+#include "distributed/multi_logical_planner.h"
 #include "distributed/multi_router_planner.h"
 #include "distributed/pg_dist_partition.h"
 #include "distributed/query_utils.h"
 #include "distributed/relation_restriction_equivalence.h"
 #include "distributed/shard_pruning.h"
-
-#include "catalog/pg_type.h"
-#include "nodes/nodeFuncs.h"
-#include "nodes/pg_list.h"
-#include "nodes/primnodes.h"
-#include "nodes/pathnodes.h"
-#include "optimizer/optimizer.h"
-#include "nodes/makefuncs.h"
-#include "optimizer/paths.h"
-#include "parser/parsetree.h"
-#include "optimizer/pathnode.h"
 
 
 static uint32 AttributeEquivalenceId = 1;
@@ -155,6 +155,7 @@ static bool AllDistributedRelationsInRestrictionContextColocated(
 	RelationRestrictionContext *
 	restrictionContext);
 static bool IsNotSafeRestrictionToRecursivelyPlan(Node *node);
+static bool HasPlaceHolderVar(Node *node);
 static JoinRestrictionContext * FilterJoinRestrictionContext(
 	JoinRestrictionContext *joinRestrictionContext, Relids
 	queryRteIdentities);
@@ -1237,6 +1238,12 @@ AddToAttributeEquivalenceClass(AttributeEquivalenceClass *attributeEquivalenceCl
 		return;
 	}
 
+	/* outer join checks in PG16 */
+	if (IsRelOptOuterJoin(root, varToBeAdded->varno))
+	{
+		return;
+	}
+
 	RangeTblEntry *rangeTableEntry = root->simple_rte_array[varToBeAdded->varno];
 	if (rangeTableEntry->rtekind == RTE_RELATION)
 	{
@@ -1375,6 +1382,30 @@ GetTargetSubquery(PlannerInfo *root, RangeTblEntry *rangeTableEntry, Var *varToB
 	}
 
 	return targetSubquery;
+}
+
+
+/*
+ * IsRelOptOuterJoin returns true if the RelOpt referenced
+ * by varNo is an outer join, false otherwise.
+ */
+bool
+IsRelOptOuterJoin(PlannerInfo *root, int varNo)
+{
+#if PG_VERSION_NUM >= PG_VERSION_16
+	if (root->simple_rel_array_size <= varNo)
+	{
+		return true;
+	}
+
+	RelOptInfo *rel = root->simple_rel_array[varNo];
+	if (rel == NULL)
+	{
+		/* must be an outer join */
+		return true;
+	}
+#endif
+	return false;
 }
 
 
@@ -2142,9 +2173,20 @@ GetRestrictInfoListForRelation(RangeTblEntry *rangeTblEntry,
 		 * If the restriction involves multiple tables, we cannot add it to
 		 * input relation's expression list.
 		 */
-		Relids varnos = pull_varnos_compat(relationRestriction->plannerInfo,
-										   (Node *) restrictionClause);
+		Relids varnos = pull_varnos(relationRestriction->plannerInfo,
+									(Node *) restrictionClause);
 		if (bms_num_members(varnos) != 1)
+		{
+			continue;
+		}
+
+		/*
+		 * PlaceHolderVar is not relevant to be processed inside a restriction clause.
+		 * Otherwise, pull_var_clause_default would throw error. PG would create
+		 * the restriction to physical Var that PlaceHolderVar points anyway, so it is
+		 * safe to skip this restriction.
+		 */
+		if (FindNodeMatchingCheckFunction((Node *) restrictionClause, HasPlaceHolderVar))
 		{
 			continue;
 		}
@@ -2211,6 +2253,16 @@ IsNotSafeRestrictionToRecursivelyPlan(Node *node)
 		return true;
 	}
 	return false;
+}
+
+
+/*
+ * HasPlaceHolderVar returns true if given node contains any PlaceHolderVar.
+ */
+static bool
+HasPlaceHolderVar(Node *node)
+{
+	return IsA(node, PlaceHolderVar);
 }
 
 

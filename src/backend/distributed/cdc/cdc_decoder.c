@@ -8,8 +8,9 @@
  *-------------------------------------------------------------------------
  */
 
-#include "cdc_decoder_utils.h"
 #include "postgres.h"
+
+#include "cdc_decoder_utils.h"
 #include "fmgr.h"
 
 #include "access/genam.h"
@@ -203,8 +204,7 @@ AddShardIdToHashTable(uint64 shardId, ShardIdHashEntry *entry)
 {
 	entry->shardId = shardId;
 	entry->distributedTableId = CdcLookupShardRelationFromCatalog(shardId, true);
-	entry->isReferenceTable = CdcPartitionMethodViaCatalog(entry->distributedTableId) ==
-							  'n';
+	entry->isReferenceTable = CdcIsReferenceTableViaCatalog(entry->distributedTableId);
 	return entry->distributedTableId;
 }
 
@@ -361,12 +361,14 @@ GetTupleForTargetSchemaForCdc(HeapTuple sourceRelationTuple,
 			targetNulls[targetIndex] = true;
 			targetIndex++;
 		}
+
 		/* If this source attribute has been dropped, just skip this source attribute.*/
 		else if (TupleDescAttr(sourceRelDesc, sourceIndex)->attisdropped)
 		{
 			sourceIndex++;
 			continue;
 		}
+
 		/* If both source and target attributes are not dropped, add the attribute field to targetValues. */
 		else if (sourceIndex < sourceRelDesc->natts)
 		{

@@ -64,7 +64,8 @@ CreateDomainStmt *
 RecreateDomainStmt(Oid domainOid)
 {
 	CreateDomainStmt *stmt = makeNode(CreateDomainStmt);
-	stmt->domainname = stringToQualifiedNameList(format_type_be_qualified(domainOid));
+	stmt->domainname = stringToQualifiedNameList_compat(format_type_be_qualified(
+															domainOid));
 
 	HeapTuple tup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(domainOid));
 	if (!HeapTupleIsValid(tup))
@@ -206,11 +207,7 @@ MakeCollateClauseFromOid(Oid collationOid)
 	List *objName = NIL;
 	List *objArgs = NIL;
 
-	#if PG_VERSION_NUM >= PG_VERSION_14
 	getObjectIdentityParts(&collateAddress, &objName, &objArgs, false);
-	#else
-	getObjectIdentityParts(&collateAddress, &objName, &objArgs);
-	#endif
 
 	char *name = NULL;
 	foreach_ptr(name, objName)

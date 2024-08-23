@@ -9,12 +9,19 @@
  */
 
 #include "postgres.h"
+
 #include "miscadmin.h"
 
 #include "catalog/namespace.h"
 #include "catalog/pg_class.h"
 #include "commands/tablecmds.h"
 #include "commands/trigger.h"
+#include "storage/lmgr.h"
+#include "utils/builtins.h"
+#include "utils/lsyscache.h"
+#include "utils/regproc.h"
+#include "utils/rel.h"
+
 #include "distributed/adaptive_executor.h"
 #include "distributed/citus_ruleutils.h"
 #include "distributed/commands.h"
@@ -31,13 +38,8 @@
 #include "distributed/reference_table_utils.h"
 #include "distributed/resource_lock.h"
 #include "distributed/transaction_management.h"
-#include "distributed/worker_transaction.h"
 #include "distributed/worker_shard_visibility.h"
-#include "storage/lmgr.h"
-#include "utils/builtins.h"
-#include "utils/lsyscache.h"
-#include "utils/regproc.h"
-#include "utils/rel.h"
+#include "distributed/worker_transaction.h"
 
 
 /* Local functions forward declarations for unsupported command checks */
@@ -182,7 +184,7 @@ truncate_local_data_after_distributing_table(PG_FUNCTION_ARGS)
 	TruncateStmt *truncateStmt = makeNode(TruncateStmt);
 
 	char *relationName = generate_qualified_relation_name(relationId);
-	List *names = stringToQualifiedNameList(relationName);
+	List *names = stringToQualifiedNameList_compat(relationName);
 	truncateStmt->relations = list_make1(makeRangeVarFromNameList(names));
 	truncateStmt->restart_seqs = false;
 	truncateStmt->behavior = DROP_CASCADE;
@@ -324,7 +326,8 @@ ExecuteTruncateStmtSequentialIfNecessary(TruncateStmt *command)
 	{
 		Oid relationId = RangeVarGetRelid(rangeVar, NoLock, failOK);
 
-		if (IsCitusTable(relationId) && !HasDistributionKey(relationId) &&
+		if ((IsCitusTableType(relationId, REFERENCE_TABLE) ||
+			 IsCitusTableType(relationId, CITUS_LOCAL_TABLE)) &&
 			TableReferenced(relationId))
 		{
 			char *relationName = get_rel_name(relationId);

@@ -11,6 +11,9 @@
 #define ERRORMESSAGE_H
 
 #include "c.h"
+
+#include "pg_version_compat.h"
+
 #include "distributed/citus_nodes.h"
 
 

@@ -7,62 +7,66 @@
  *-------------------------------------------------------------------------
  */
 
-#include "postgres.h"
-
-#include "distributed/pg_version_constants.h"
-
-#include "funcapi.h"
-
 #include <float.h>
 #include <limits.h>
+
+#include "postgres.h"
+
+#include "funcapi.h"
 
 #include "access/htup_details.h"
 #include "access/xact.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
+#include "executor/executor.h"
+#include "nodes/makefuncs.h"
+#include "nodes/nodeFuncs.h"
+#include "nodes/pg_list.h"
+
+#include "pg_version_constants.h"
+
 #include "distributed/citus_depended_object.h"
 #include "distributed/citus_nodefuncs.h"
 #include "distributed/citus_nodes.h"
 #include "distributed/citus_ruleutils.h"
 #include "distributed/colocation_utils.h"
+#include "distributed/combine_query_planner.h"
 #include "distributed/commands.h"
+#include "distributed/coordinator_protocol.h"
 #include "distributed/cte_inline.h"
+#include "distributed/distributed_planner.h"
 #include "distributed/function_call_delegation.h"
 #include "distributed/insert_select_planner.h"
 #include "distributed/intermediate_result_pruning.h"
 #include "distributed/intermediate_results.h"
 #include "distributed/listutils.h"
-#include "distributed/coordinator_protocol.h"
 #include "distributed/merge_planner.h"
 #include "distributed/metadata_cache.h"
 #include "distributed/multi_executor.h"
-#include "distributed/distributed_planner.h"
-#include "distributed/query_pushdown_planning.h"
 #include "distributed/multi_logical_optimizer.h"
 #include "distributed/multi_logical_planner.h"
 #include "distributed/multi_partitioning_utils.h"
 #include "distributed/multi_physical_planner.h"
-#include "distributed/combine_query_planner.h"
 #include "distributed/multi_router_planner.h"
+#include "distributed/query_pushdown_planning.h"
 #include "distributed/query_utils.h"
 #include "distributed/recursive_planning.h"
-#include "distributed/shardinterval_utils.h"
 #include "distributed/shard_utils.h"
+#include "distributed/shardinterval_utils.h"
 #include "distributed/utils/citus_stat_tenants.h"
 #include "distributed/version_compat.h"
 #include "distributed/worker_shard_visibility.h"
-#include "executor/executor.h"
-#include "nodes/makefuncs.h"
-#include "nodes/nodeFuncs.h"
-#include "nodes/pg_list.h"
-#include "parser/parsetree.h"
-#include "parser/parse_type.h"
+#if PG_VERSION_NUM >= PG_VERSION_16
+#include "parser/parse_relation.h"
+#endif
 #include "optimizer/optimizer.h"
-#include "optimizer/plancat.h"
 #include "optimizer/pathnode.h"
-#include "optimizer/planner.h"
+#include "optimizer/plancat.h"
 #include "optimizer/planmain.h"
+#include "optimizer/planner.h"
+#include "parser/parse_type.h"
+#include "parser/parsetree.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
 #include "utils/lsyscache.h"
@@ -108,6 +112,7 @@ static int AssignRTEIdentities(List *rangeTableList, int rteIdCounter);
 static void AssignRTEIdentity(RangeTblEntry *rangeTableEntry, int rteIdentifier);
 static void AdjustPartitioningForDistributedPlanning(List *rangeTableList,
 													 bool setPartitionedTablesInherited);
+static bool RTEWentThroughAdjustPartitioning(RangeTblEntry *rangeTableEntry);
 static PlannedStmt * FinalizeNonRouterPlan(PlannedStmt *localPlan,
 										   DistributedPlan *distributedPlan,
 										   CustomScan *customScan);
@@ -144,6 +149,8 @@ static void WarnIfListHasForeignDistributedTable(List *rangeTableList);
 static RouterPlanType GetRouterPlanType(Query *query,
 										Query *originalQuery,
 										bool hasUnresolvedParams);
+static void ConcatenateRTablesAndPerminfos(PlannedStmt *mainPlan,
+										   PlannedStmt *concatPlan);
 
 
 /* Distributed planner hook */
@@ -491,6 +498,20 @@ AdjustPartitioningForDistributedPlanning(List *rangeTableList,
 			}
 		}
 	}
+}
+
+
+/*
+ * RTEWentThroughAdjustPartitioning returns true if the given rangetableentry
+ * has been modified through AdjustPartitioningForDistributedPlanning
+ * function, false otherwise.
+ */
+static bool
+RTEWentThroughAdjustPartitioning(RangeTblEntry *rangeTableEntry)
+{
+	return (rangeTableEntry->rtekind == RTE_RELATION &&
+			PartitionedTable(rangeTableEntry->relid) &&
+			rangeTableEntry->inh == false);
 }
 
 
@@ -925,6 +946,10 @@ GetRouterPlanType(Query *query, Query *originalQuery, bool hasUnresolvedParams)
 	}
 	else if (IsMergeQuery(originalQuery))
 	{
+		if (hasUnresolvedParams)
+		{
+			return REPLAN_WITH_BOUND_PARAMETERS;
+		}
 		return MERGE_QUERY;
 	}
 	else
@@ -990,7 +1015,8 @@ CreateDistributedPlan(uint64 planId, bool allowRecursivePlanning, Query *origina
 		case MERGE_QUERY:
 		{
 			distributedPlan =
-				CreateMergePlan(originalQuery, query, plannerRestrictionContext);
+				CreateMergePlan(planId, originalQuery, query, plannerRestrictionContext,
+								boundParams);
 			break;
 		}
 
@@ -1061,6 +1087,11 @@ CreateDistributedPlan(uint64 planId, bool allowRecursivePlanning, Query *origina
 	/*
 	 * Plan subqueries and CTEs that cannot be pushed down by recursively
 	 * calling the planner and return the resulting plans to subPlanList.
+	 * Note that GenerateSubplansForSubqueriesAndCTEs will reset perminfoindexes
+	 * for some RTEs in originalQuery->rtable list, while not changing
+	 * originalQuery->rteperminfos. That's fine because we will go through
+	 * standard_planner again, which will adjust things accordingly in
+	 * set_plan_references>add_rtes_to_flat_rtable>add_rte_to_flat_rtable.
 	 */
 	List *subPlanList = GenerateSubplansForSubqueriesAndCTEs(planId, originalQuery,
 															 plannerRestrictionContext);
@@ -1377,6 +1408,12 @@ FinalizePlan(PlannedStmt *localPlan, DistributedPlan *distributedPlan)
 			break;
 		}
 
+		case MULTI_EXECUTOR_NON_PUSHABLE_MERGE_QUERY:
+		{
+			customScan->methods = &NonPushableMergeCommandCustomScanMethods;
+			break;
+		}
+
 		default:
 		{
 			customScan->methods = &DelayedErrorCustomScanMethods;
@@ -1454,9 +1491,39 @@ FinalizeNonRouterPlan(PlannedStmt *localPlan, DistributedPlan *distributedPlan,
 	finalPlan->utilityStmt = localPlan->utilityStmt;
 
 	/* add original range table list for access permission checks */
-	finalPlan->rtable = list_concat(finalPlan->rtable, localPlan->rtable);
+	ConcatenateRTablesAndPerminfos(finalPlan, localPlan);
 
 	return finalPlan;
+}
+
+
+static void
+ConcatenateRTablesAndPerminfos(PlannedStmt *mainPlan, PlannedStmt *concatPlan)
+{
+	mainPlan->rtable = list_concat(mainPlan->rtable, concatPlan->rtable);
+#if PG_VERSION_NUM >= PG_VERSION_16
+
+	/*
+	 * concatPlan's range table list is concatenated to mainPlan's range table list
+	 * therefore all the perminfoindexes should be updated to their value
+	 * PLUS the highest perminfoindex in mainPlan's perminfos, which is exactly
+	 * the list length.
+	 */
+	int mainPlan_highest_perminfoindex = list_length(mainPlan->permInfos);
+
+	ListCell *lc;
+	foreach(lc, concatPlan->rtable)
+	{
+		RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
+		if (rte->perminfoindex != 0)
+		{
+			rte->perminfoindex = rte->perminfoindex + mainPlan_highest_perminfoindex;
+		}
+	}
+
+	/* finally, concatenate perminfos as well */
+	mainPlan->permInfos = list_concat(mainPlan->permInfos, concatPlan->permInfos);
+#endif
 }
 
 
@@ -1491,7 +1558,7 @@ FinalizeRouterPlan(PlannedStmt *localPlan, CustomScan *customScan)
 	routerPlan->rtable = list_make1(remoteScanRangeTableEntry);
 
 	/* add original range table list for access permission checks */
-	routerPlan->rtable = list_concat(routerPlan->rtable, localPlan->rtable);
+	ConcatenateRTablesAndPerminfos(routerPlan, localPlan);
 
 	routerPlan->canSetTag = true;
 	routerPlan->relationOids = NIL;
@@ -1962,6 +2029,62 @@ multi_relation_restriction_hook(PlannerInfo *root, RelOptInfo *relOptInfo,
 		lappend(relationRestrictionContext->relationRestrictionList, relationRestriction);
 
 	MemoryContextSwitchTo(oldMemoryContext);
+}
+
+
+/*
+ * multi_get_relation_info_hook modifies the relation's indexlist
+ * if necessary, to avoid a crash in PG16 caused by our
+ * Citus function AdjustPartitioningForDistributedPlanning().
+ *
+ * AdjustPartitioningForDistributedPlanning() is a hack that we use
+ * to prevent Postgres' standard_planner() to expand all the partitions
+ * for the distributed planning when a distributed partitioned table
+ * is queried. It is required for both correctness and performance
+ * reasons. Although we can eliminate the use of the function for
+ * the correctness (e.g., make sure that rest of the planner can handle
+ * partitions), it's performance implication is hard to avoid. Certain
+ * planning logic of Citus (such as router or query pushdown) relies
+ * heavily on the relationRestrictionList. If
+ * AdjustPartitioningForDistributedPlanning() is removed, all the
+ * partitions show up in the relationRestrictionList, causing high
+ * planning times for such queries.
+ */
+void
+multi_get_relation_info_hook(PlannerInfo *root, Oid relationObjectId, bool inhparent,
+							 RelOptInfo *rel)
+{
+	if (!CitusHasBeenLoaded())
+	{
+		return;
+	}
+
+	Index varno = rel->relid;
+	RangeTblEntry *rangeTableEntry = planner_rt_fetch(varno, root);
+
+	if (RTEWentThroughAdjustPartitioning(rangeTableEntry))
+	{
+		ListCell *lc = NULL;
+		foreach(lc, rel->indexlist)
+		{
+			IndexOptInfo *indexOptInfo = (IndexOptInfo *) lfirst(lc);
+			if (get_rel_relkind(indexOptInfo->indexoid) == RELKIND_PARTITIONED_INDEX)
+			{
+				/*
+				 * Normally, we should not need this. However, the combination of
+				 * Postgres commit 3c569049b7b502bb4952483d19ce622ff0af5fd6 and
+				 * Citus function AdjustPartitioningForDistributedPlanning()
+				 * forces us to do this. The commit expects partitioned indexes
+				 * to belong to relations with "inh" flag set properly. Whereas, the
+				 * function overrides "inh" flag. To avoid a crash,
+				 * we go over the list of indexinfos and remove all partitioned indexes.
+				 * Partitioned indexes were ignored pre PG16 anyway, we are essentially
+				 * not breaking any logic.
+				 */
+				rel->indexlist = foreach_delete_current(rel->indexlist, lc);
+			}
+		}
+	}
 }
 
 
@@ -2463,6 +2586,18 @@ HasUnresolvedExternParamsWalker(Node *expression, ParamListInfo boundParams)
 
 
 /*
+ * ContainsSingleShardTable returns true if given query contains reference
+ * to a single-shard table.
+ */
+bool
+ContainsSingleShardTable(Query *query)
+{
+	RTEListProperties *rteListProperties = GetRTEListPropertiesForQuery(query);
+	return rteListProperties->hasSingleShardDistTable;
+}
+
+
+/*
  * GetRTEListPropertiesForQuery is a wrapper around GetRTEListProperties that
  * returns RTEListProperties for the rte list retrieved from query.
  */
@@ -2538,6 +2673,15 @@ GetRTEListProperties(List *rangeTableList)
 		else if (IsCitusTableTypeCacheEntry(cacheEntry, DISTRIBUTED_TABLE))
 		{
 			rteListProperties->hasDistributedTable = true;
+
+			if (!HasDistributionKeyCacheEntry(cacheEntry))
+			{
+				rteListProperties->hasSingleShardDistTable = true;
+			}
+			else
+			{
+				rteListProperties->hasDistTableWithShardKey = true;
+			}
 		}
 		else
 		{

@@ -14,15 +14,16 @@
 #ifndef MULTI_LOGICAL_PLANNER_H
 #define MULTI_LOGICAL_PLANNER_H
 
+#include "nodes/nodes.h"
+#include "nodes/parsenodes.h"
+#include "nodes/pg_list.h"
+#include "nodes/primnodes.h"
+
 #include "distributed/citus_nodes.h"
 #include "distributed/errormessage.h"
 #include "distributed/log_utils.h"
 #include "distributed/multi_join_order.h"
 #include "distributed/relation_restriction_equivalence.h"
-#include "nodes/nodes.h"
-#include "nodes/primnodes.h"
-#include "nodes/parsenodes.h"
-#include "nodes/pg_list.h"
 
 
 #define SUBQUERY_RANGE_TABLE_ID -1
@@ -200,6 +201,7 @@ extern bool IsCitusTableRTE(Node *node);
 extern bool IsDistributedOrReferenceTableRTE(Node *node);
 extern bool IsDistributedTableRTE(Node *node);
 extern bool IsReferenceTableRTE(Node *node);
+extern bool IsTableWithDistKeyRTE(Node *node);
 extern bool IsCitusExtraDataContainerRelation(RangeTblEntry *rte);
 extern bool ContainsReadIntermediateResultFunction(Node *node);
 extern bool ContainsReadIntermediateResultArrayFunction(Node *node);

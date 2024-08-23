@@ -10,11 +10,12 @@
 #include "postgres.h"
 
 #include "catalog/namespace.h"
-#include "distributed/function_utils.h"
-#include "distributed/version_compat.h"
 #include "executor/executor.h"
 #include "utils/builtins.h"
 #include "utils/regproc.h"
+
+#include "distributed/function_utils.h"
+#include "distributed/version_compat.h"
 
 
 /*
@@ -41,12 +42,13 @@ FunctionOidExtended(const char *schemaName, const char *functionName, int argume
 					bool missingOK)
 {
 	char *qualifiedFunctionName = quote_qualified_identifier(schemaName, functionName);
-	List *qualifiedFunctionNameList = stringToQualifiedNameList(qualifiedFunctionName);
+	List *qualifiedFunctionNameList = stringToQualifiedNameList_compat(
+		qualifiedFunctionName);
 	List *argumentList = NIL;
 	const bool findVariadics = false;
 	const bool findDefaults = false;
 
-	FuncCandidateList functionList = FuncnameGetCandidates_compat(
+	FuncCandidateList functionList = FuncnameGetCandidates(
 		qualifiedFunctionNameList,
 		argumentCount,
 		argumentList,

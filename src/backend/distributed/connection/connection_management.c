@@ -9,39 +9,39 @@
  */
 
 #include "postgres.h"
-#include "pgstat.h"
 
 #include "libpq-fe.h"
-
 #include "miscadmin.h"
-
+#include "pg_config.h"
+#include "pgstat.h"
 #include "safe_lib.h"
-#include "postmaster/postmaster.h"
+
 #include "access/hash.h"
 #include "commands/dbcommands.h"
+#include "mb/pg_wchar.h"
+#include "portability/instr_time.h"
+#include "postmaster/postmaster.h"
+#include "storage/ipc.h"
+#include "utils/hsearch.h"
+#include "utils/memutils.h"
+
 #include "distributed/backend_data.h"
+#include "distributed/cancel_utils.h"
 #include "distributed/connection_management.h"
-#include "distributed/errormessage.h"
 #include "distributed/error_codes.h"
+#include "distributed/errormessage.h"
+#include "distributed/hash_helpers.h"
 #include "distributed/listutils.h"
 #include "distributed/log_utils.h"
 #include "distributed/memutils.h"
 #include "distributed/metadata_cache.h"
-#include "distributed/hash_helpers.h"
 #include "distributed/placement_connection.h"
+#include "distributed/remote_commands.h"
 #include "distributed/run_from_same_connection.h"
 #include "distributed/shared_connection_stats.h"
-#include "distributed/cancel_utils.h"
-#include "distributed/remote_commands.h"
 #include "distributed/time_constants.h"
 #include "distributed/version_compat.h"
 #include "distributed/worker_log_messages.h"
-#include "mb/pg_wchar.h"
-#include "pg_config.h"
-#include "portability/instr_time.h"
-#include "storage/ipc.h"
-#include "utils/hsearch.h"
-#include "utils/memutils.h"
 
 
 int NodeConnectionTimeout = 30000;
@@ -371,7 +371,7 @@ StartNodeUserDatabaseConnection(uint32 flags, const char *hostname, int32 port,
 	 */
 	MultiConnection *connection = MemoryContextAllocZero(ConnectionContext,
 														 sizeof(MultiConnection));
-	connection->initilizationState = POOL_STATE_NOT_INITIALIZED;
+	connection->initializationState = POOL_STATE_NOT_INITIALIZED;
 	dlist_push_tail(entry->connections, &connection->connectionNode);
 
 	/* these two flags are by nature cannot happen at the same time */
@@ -417,7 +417,7 @@ StartNodeUserDatabaseConnection(uint32 flags, const char *hostname, int32 port,
 	 * We've already incremented the counter above, so we should decrement
 	 * when we're done with the connection.
 	 */
-	connection->initilizationState = POOL_STATE_COUNTER_INCREMENTED;
+	connection->initializationState = POOL_STATE_COUNTER_INCREMENTED;
 
 	StartConnectionEstablishment(connection, &key);
 
@@ -430,7 +430,7 @@ StartNodeUserDatabaseConnection(uint32 flags, const char *hostname, int32 port,
 	}
 
 	/* fully initialized the connection, record it */
-	connection->initilizationState = POOL_STATE_INITIALIZED;
+	connection->initializationState = POOL_STATE_INITIALIZED;
 
 	return connection;
 }
@@ -486,7 +486,7 @@ FindAvailableConnection(dlist_head *connections, uint32 flags)
 			continue;
 		}
 
-		if (connection->initilizationState != POOL_STATE_INITIALIZED)
+		if (connection->initializationState != POOL_STATE_INITIALIZED)
 		{
 			/*
 			 * If the connection has not been initialized, it should not be
@@ -780,7 +780,7 @@ ShutdownConnection(MultiConnection *connection)
 
 
 /*
- * MultiConnectionStatePoll executes a PQconnectPoll on the connection to progres the
+ * MultiConnectionStatePoll executes a PQconnectPoll on the connection to progress the
  * connection establishment. The return value of this function indicates if the
  * MultiConnectionPollState has been changed, which could require a change to the WaitEventSet
  */
@@ -1046,8 +1046,15 @@ FinishConnectionListEstablishment(List *multiConnectionList)
 
 				continue;
 			}
-
+			bool beforePollSocket = PQsocket(connectionState->connection->pgConn);
 			bool connectionStateChanged = MultiConnectionStatePoll(connectionState);
+
+			if (beforePollSocket != PQsocket(connectionState->connection->pgConn))
+			{
+				/* rebuild the wait events if MultiConnectionStatePoll() changed the socket */
+				waitEventSetRebuild = true;
+			}
+
 			if (connectionStateChanged)
 			{
 				if (connectionState->phase != MULTI_CONNECTION_PHASE_CONNECTING)
@@ -1182,10 +1189,10 @@ CitusPQFinish(MultiConnection *connection)
 	}
 
 	/* behave idempotently, there is no gurantee that CitusPQFinish() is called once */
-	if (connection->initilizationState >= POOL_STATE_COUNTER_INCREMENTED)
+	if (connection->initializationState >= POOL_STATE_COUNTER_INCREMENTED)
 	{
 		DecrementSharedConnectionCounter(connection->hostname, connection->port);
-		connection->initilizationState = POOL_STATE_NOT_INITIALIZED;
+		connection->initializationState = POOL_STATE_NOT_INITIALIZED;
 	}
 }
 
@@ -1312,33 +1319,6 @@ StartConnectionEstablishment(MultiConnection *connection, ConnectionHashKey *key
 
 	SetCitusNoticeReceiver(connection);
 }
-
-
-#if PG_VERSION_NUM < 140000
-
-/*
- * WarmUpConnParamsHash warms up the ConnParamsHash by loading all the
- * conn params for active primary nodes.
- */
-void
-WarmUpConnParamsHash(void)
-{
-	List *workerNodeList = ActivePrimaryNodeList(AccessShareLock);
-	WorkerNode *workerNode = NULL;
-	foreach_ptr(workerNode, workerNodeList)
-	{
-		ConnectionHashKey key;
-		strlcpy(key.hostname, workerNode->workerName, MAX_NODE_LENGTH);
-		key.port = workerNode->workerPort;
-		strlcpy(key.database, CurrentDatabaseName(), NAMEDATALEN);
-		strlcpy(key.user, CurrentUserName(), NAMEDATALEN);
-		key.replicationConnParam = false;
-		FindOrCreateConnParamsEntry(&key);
-	}
-}
-
-
-#endif
 
 
 /*
@@ -1509,7 +1489,7 @@ ShouldShutdownConnection(MultiConnection *connection, const int cachedConnection
 	 * from their application name.
 	 */
 	return (IsCitusInternalBackend() || IsRebalancerInternalBackend()) ||
-		   connection->initilizationState != POOL_STATE_INITIALIZED ||
+		   connection->initializationState != POOL_STATE_INITIALIZED ||
 		   cachedConnectionCount >= MaxCachedConnectionsPerWorker ||
 		   connection->forceCloseAtTransactionEnd ||
 		   PQstatus(connection->pgConn) != CONNECTION_OK ||
@@ -1568,7 +1548,7 @@ RestartConnection(MultiConnection *connection)
 	 * Not that we have to do this because ShutdownConnection() sets the
 	 * state to not initialized.
 	 */
-	connection->initilizationState = POOL_STATE_INITIALIZED;
+	connection->initializationState = POOL_STATE_INITIALIZED;
 	connection->connectionState = MULTI_CONNECTION_CONNECTING;
 }
 

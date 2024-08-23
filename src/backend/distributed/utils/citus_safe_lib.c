@@ -12,18 +12,17 @@
  *-------------------------------------------------------------------------
  */
 
-#include "postgres.h"
+#include <limits.h>
 
-#include "distributed/pg_version_constants.h"
+#include "postgres.h"
 
 #include "safe_lib.h"
 
-#include <limits.h>
-
-#include "distributed/citus_safe_lib.h"
 #include "lib/stringinfo.h"
 
-#define citus_vsnprintf pg_vsnprintf
+#include "pg_version_constants.h"
+
+#include "distributed/citus_safe_lib.h"
 
 
 /*
@@ -338,7 +337,7 @@ SafeSnprintf(char *restrict buffer, rsize_t bufsz, const char *restrict format, 
 	va_list args;
 
 	va_start(args, format);
-	size_t result = citus_vsnprintf(buffer, bufsz, format, args);
+	int result = pg_vsnprintf(buffer, bufsz, format, args);
 	va_end(args);
 	return result;
 }

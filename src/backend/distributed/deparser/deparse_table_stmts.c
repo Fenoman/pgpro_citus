@@ -11,26 +11,31 @@
  */
 #include "postgres.h"
 
-#include "distributed/commands.h"
-#include "distributed/deparser.h"
-#include "distributed/version_compat.h"
+#include "catalog/heap.h"
+#include "commands/defrem.h"
+#include "commands/tablecmds.h"
 #include "nodes/nodes.h"
 #include "nodes/parsenodes.h"
 #include "parser/parse_expr.h"
-#include "parser/parse_type.h"
 #include "parser/parse_relation.h"
+#include "parser/parse_type.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/ruleutils.h"
 
+#include "distributed/commands.h"
+#include "distributed/deparser.h"
 #include "distributed/namespace_utils.h"
-#include "commands/tablecmds.h"
+#include "distributed/version_compat.h"
 
 static void AppendAlterTableSchemaStmt(StringInfo buf, AlterObjectSchemaStmt *stmt);
 static void AppendAlterTableStmt(StringInfo buf, AlterTableStmt *stmt);
 static void AppendAlterTableCmd(StringInfo buf, AlterTableCmd *alterTableCmd,
 								AlterTableStmt *stmt);
-static void AppendAlterTableCmdAddColumn(StringInfo buf, AlterTableCmd *alterTableCmd);
+static void AppendAlterTableCmdAddColumn(StringInfo buf, AlterTableCmd *alterTableCmd,
+										 AlterTableStmt *stmt);
+static void AppendAlterTableCmdDropConstraint(StringInfo buf,
+											  AlterTableCmd *alterTableCmd);
 
 char *
 DeparseAlterTableSchemaStmt(Node *node)
@@ -75,7 +80,7 @@ DeparseAlterTableStmt(Node *node)
 	StringInfoData str = { 0 };
 	initStringInfo(&str);
 
-	Assert(AlterTableStmtObjType_compat(stmt) == OBJECT_TABLE);
+	Assert(stmt->objtype == OBJECT_TABLE);
 
 	AppendAlterTableStmt(&str, stmt);
 	return str.data;
@@ -94,7 +99,7 @@ AppendAlterTableStmt(StringInfo buf, AlterTableStmt *stmt)
 														stmt->relation->relname);
 	ListCell *cmdCell = NULL;
 
-	Assert(AlterTableStmtObjType_compat(stmt) == OBJECT_TABLE);
+	Assert(stmt->objtype == OBJECT_TABLE);
 
 	appendStringInfo(buf, "ALTER TABLE %s", identifier);
 	foreach(cmdCell, stmt->cmds)
@@ -116,7 +121,7 @@ AppendAlterTableStmt(StringInfo buf, AlterTableStmt *stmt)
  * AppendColumnNameList converts a list of columns into comma separated string format
  * (colname_1, colname_2, .., colname_n).
  */
-static void
+void
 AppendColumnNameList(StringInfo buf, List *columns)
 {
 	appendStringInfoString(buf, " (");
@@ -140,13 +145,19 @@ AppendColumnNameList(StringInfo buf, List *columns)
 
 
 /*
- * AppendAlterTableCmdAddConstraint builds the add constraint command for index constraints
- * in the ADD CONSTRAINT <conname> {PRIMARY KEY, UNIQUE, EXCLUSION} form and appends it to the buf.
+ * AppendAlterTableCmdConstraint builds a string required to create given
+ * constraint as part of an ADD CONSTRAINT or an ADD COLUMN subcommand,
+ * and appends it to the buf.
  */
 static void
-AppendAlterTableCmdAddConstraint(StringInfo buf, Constraint *constraint,
-								 AlterTableStmt *stmt)
+AppendAlterTableCmdConstraint(StringInfo buf, Constraint *constraint,
+							  AlterTableStmt *stmt, AlterTableType subtype)
 {
+	if (subtype != AT_AddConstraint && subtype != AT_AddColumn)
+	{
+		ereport(ERROR, (errmsg("Unsupported alter table subtype: %d", (int) subtype)));
+	}
+
 	/* Need to deparse the alter table constraint command only if we are adding a constraint name.*/
 	if (constraint->conname == NULL)
 	{
@@ -154,7 +165,15 @@ AppendAlterTableCmdAddConstraint(StringInfo buf, Constraint *constraint,
 							"Constraint name can not be NULL when deparsing the constraint.")));
 	}
 
-	appendStringInfoString(buf, " ADD CONSTRAINT ");
+	if (subtype == AT_AddConstraint)
+	{
+		appendStringInfoString(buf, " ADD CONSTRAINT ");
+	}
+	else
+	{
+		appendStringInfoString(buf, " CONSTRAINT ");
+	}
+
 	appendStringInfo(buf, "%s ", quote_identifier(constraint->conname));
 
 	/* postgres version >= PG15
@@ -182,13 +201,34 @@ AppendAlterTableCmdAddConstraint(StringInfo buf, Constraint *constraint,
 #endif
 		}
 
-		AppendColumnNameList(buf, constraint->keys);
+		if (subtype == AT_AddConstraint)
+		{
+			AppendColumnNameList(buf, constraint->keys);
+		}
 
 		if (constraint->including != NULL)
 		{
 			appendStringInfoString(buf, " INCLUDE ");
 
 			AppendColumnNameList(buf, constraint->including);
+		}
+
+		if (constraint->options != NIL)
+		{
+			appendStringInfoString(buf, " WITH(");
+
+			ListCell *defListCell;
+			foreach(defListCell, constraint->options)
+			{
+				DefElem *def = (DefElem *) lfirst(defListCell);
+
+				bool first = (defListCell == list_head(constraint->options));
+				appendStringInfo(buf, "%s%s=%s", first ? "" : ",",
+								 quote_identifier(def->defname),
+								 quote_literal_cstr(defGetString(def)));
+			}
+
+			appendStringInfoChar(buf, ')');
 		}
 	}
 	else if (constraint->contype == CONSTR_EXCLUSION)
@@ -238,6 +278,18 @@ AppendAlterTableCmdAddConstraint(StringInfo buf, Constraint *constraint,
 	}
 	else if (constraint->contype == CONSTR_CHECK)
 	{
+		if (subtype == AT_AddColumn)
+		{
+			/*
+			 * Preprocess should've rejected deparsing such an ALTER TABLE
+			 * command but be on the safe side.
+			 */
+			ereport(ERROR, (errmsg("cannot add check constraint to column by "
+								   "using ADD COLUMN command"),
+							errhint("Consider using ALTER TABLE ... ADD CONSTRAINT "
+									"... CHECK command after adding the column")));
+		}
+
 		LOCKMODE lockmode = AlterTableGetLockLevel(stmt->cmds);
 		Oid leftRelationId = AlterTableLookupRelation(stmt, lockmode);
 
@@ -273,13 +325,18 @@ AppendAlterTableCmdAddConstraint(StringInfo buf, Constraint *constraint,
 	}
 	else if (constraint->contype == CONSTR_FOREIGN)
 	{
-		appendStringInfoString(buf, " FOREIGN KEY");
+		if (subtype == AT_AddConstraint)
+		{
+			appendStringInfoString(buf, " FOREIGN KEY");
 
-		AppendColumnNameList(buf, constraint->fk_attrs);
+			AppendColumnNameList(buf, constraint->fk_attrs);
+		}
 
 		appendStringInfoString(buf, " REFERENCES");
 
-		appendStringInfo(buf, " %s", quote_identifier(constraint->pktable->relname));
+		appendStringInfo(buf, " %s", quote_qualified_identifier(
+							 constraint->pktable->schemaname,
+							 constraint->pktable->relname));
 
 		if (list_length(constraint->pk_attrs) > 0)
 		{
@@ -375,10 +432,30 @@ AppendAlterTableCmdAddConstraint(StringInfo buf, Constraint *constraint,
 		}
 	}
 
-	/* FOREIGN KEY and CHECK constraints migth have NOT VALID option */
-	if (constraint->skip_validation)
+	/*
+	 * For ADD CONSTRAINT subcommand, FOREIGN KEY and CHECK constraints migth
+	 * have NOT VALID option.
+	 *
+	 * Note that skip_validation might be true for an ADD COLUMN too but this
+	 * is not because Postgres supports this but because Citus sets this flag
+	 * to true for foreign key constraints added via ADD COLUMN. So we don't
+	 * check for skip_validation for ADD COLUMN subcommand.
+	 */
+	if (subtype == AT_AddConstraint && constraint->skip_validation)
 	{
 		appendStringInfoString(buf, " NOT VALID ");
+	}
+
+	if (subtype == AT_AddColumn &&
+		(constraint->deferrable || constraint->initdeferred))
+	{
+		/*
+		 * For ADD COLUMN subcommand, the fact that whether given constraint
+		 * is deferrable or initially deferred is indicated by another Constraint
+		 * object, not via deferrable / initdeferred fields.
+		 */
+		ereport(ERROR, (errmsg("unexpected value set for deferrable/initdeferred "
+							   "field for an ADD COLUMN subcommand")));
 	}
 
 	if (constraint->deferrable)
@@ -405,7 +482,13 @@ AppendAlterTableCmd(StringInfo buf, AlterTableCmd *alterTableCmd, AlterTableStmt
 	{
 		case AT_AddColumn:
 		{
-			AppendAlterTableCmdAddColumn(buf, alterTableCmd);
+			AppendAlterTableCmdAddColumn(buf, alterTableCmd, stmt);
+			break;
+		}
+
+		case AT_DropConstraint:
+		{
+			AppendAlterTableCmdDropConstraint(buf, alterTableCmd);
 			break;
 		}
 
@@ -419,7 +502,7 @@ AppendAlterTableCmd(StringInfo buf, AlterTableCmd *alterTableCmd, AlterTableStmt
 			 */
 			if (ConstrTypeCitusCanDefaultName(constraint->contype))
 			{
-				AppendAlterTableCmdAddConstraint(buf, constraint, stmt);
+				AppendAlterTableCmdConstraint(buf, constraint, stmt, AT_AddConstraint);
 				break;
 			}
 		}
@@ -436,26 +519,79 @@ AppendAlterTableCmd(StringInfo buf, AlterTableCmd *alterTableCmd, AlterTableStmt
 
 
 /*
+ * GeneratedWhenStr returns the char representation of given generated_when
+ * value.
+ */
+static const char *
+GeneratedWhenStr(char generatedWhen)
+{
+	switch (generatedWhen)
+	{
+		case 'a':
+		{
+			return "ALWAYS";
+		}
+
+		case 'd':
+		{
+			return "BY DEFAULT";
+		}
+
+		default:
+			ereport(ERROR, (errmsg("unrecognized generated_when: %d",
+								   generatedWhen)));
+	}
+}
+
+
+/*
+ * DeparseRawExprForColumnDefault returns string representation of given
+ * rawExpr based on given column type information.
+ */
+static char *
+DeparseRawExprForColumnDefault(Oid relationId, Oid columnTypeId, int32 columnTypeMod,
+							   char *columnName, char attgenerated, Node *rawExpr)
+{
+	ParseState *pstate = make_parsestate(NULL);
+	Relation relation = RelationIdGetRelation(relationId);
+	AddRangeTableEntryToQueryCompat(pstate, relation);
+
+	Node *defaultExpr = cookDefault(pstate, rawExpr,
+									columnTypeId, columnTypeMod,
+									columnName, attgenerated);
+
+	List *deparseContext = deparse_context_for(get_rel_name(relationId), relationId);
+
+	int saveNestLevel = PushEmptySearchPath();
+	char *defaultExprStr = deparse_expression(defaultExpr, deparseContext, false, false);
+	PopEmptySearchPath(saveNestLevel);
+
+	RelationClose(relation);
+
+	return defaultExprStr;
+}
+
+
+/*
  * AppendAlterTableCmd builds and appends to the given buffer an AT_AddColumn command
  * from given AlterTableCmd object in the form ADD COLUMN ...
  */
 static void
-AppendAlterTableCmdAddColumn(StringInfo buf, AlterTableCmd *alterTableCmd)
+AppendAlterTableCmdAddColumn(StringInfo buf, AlterTableCmd *alterTableCmd,
+							 AlterTableStmt *stmt)
 {
 	Assert(alterTableCmd->subtype == AT_AddColumn);
 
+	Oid relationId = AlterTableLookupRelation(stmt, NoLock);
+
 	appendStringInfoString(buf, " ADD COLUMN ");
 
-	ColumnDef *columnDefinition = (ColumnDef *) alterTableCmd->def;
-
-	/*
-	 * the way we use the deparser now, constraints are always NULL
-	 * adding this check for ColumnDef consistency
-	 */
-	if (columnDefinition->constraints != NULL)
+	if (alterTableCmd->missing_ok)
 	{
-		ereport(ERROR, (errmsg("Constraints are not supported for AT_AddColumn")));
+		appendStringInfoString(buf, "IF NOT EXISTS ");
 	}
+
+	ColumnDef *columnDefinition = (ColumnDef *) alterTableCmd->def;
 
 	if (columnDefinition->colname)
 	{
@@ -468,21 +604,113 @@ AppendAlterTableCmdAddColumn(StringInfo buf, AlterTableCmd *alterTableCmd)
 	typenameTypeIdAndMod(NULL, columnDefinition->typeName, &typeOid, &typmod);
 	appendStringInfo(buf, "%s", format_type_extended(typeOid, typmod,
 													 formatFlags));
-	if (columnDefinition->is_not_null)
+
+	if (columnDefinition->compression)
 	{
-		appendStringInfoString(buf, " NOT NULL");
+		appendStringInfo(buf, " COMPRESSION %s",
+						 quote_identifier(columnDefinition->compression));
 	}
 
-	/*
-	 * the way we use the deparser now, collation is never used
-	 * since the data type of columns that use sequences for default
-	 * are only int,smallint and bigint (never text, varchar, char)
-	 * Adding this part only for ColumnDef consistency
-	 */
 	Oid collationOid = GetColumnDefCollation(NULL, columnDefinition, typeOid);
 	if (OidIsValid(collationOid))
 	{
 		const char *identifier = FormatCollateBEQualified(collationOid);
 		appendStringInfo(buf, " COLLATE %s", identifier);
+	}
+
+	ListCell *constraintCell = NULL;
+	foreach(constraintCell, columnDefinition->constraints)
+	{
+		Constraint *constraint = (Constraint *) lfirst(constraintCell);
+
+		if (constraint->contype == CONSTR_NOTNULL)
+		{
+			appendStringInfoString(buf, " NOT NULL");
+		}
+		else if (constraint->contype == CONSTR_NULL)
+		{
+			appendStringInfoString(buf, " NULL");
+		}
+		else if (constraint->contype == CONSTR_DEFAULT)
+		{
+			char attgenerated = '\0';
+			appendStringInfo(buf, " DEFAULT %s",
+							 DeparseRawExprForColumnDefault(relationId, typeOid, typmod,
+															columnDefinition->colname,
+															attgenerated,
+															constraint->raw_expr));
+		}
+		else if (constraint->contype == CONSTR_IDENTITY)
+		{
+			/*
+			 * Citus doesn't support adding identity columns via ALTER TABLE,
+			 * so we don't bother teaching the deparser about them.
+			 */
+			ereport(ERROR, (errmsg("unexpectedly found identity column "
+								   "definition in ALTER TABLE command")));
+		}
+		else if (constraint->contype == CONSTR_GENERATED)
+		{
+			char attgenerated = 's';
+			appendStringInfo(buf, " GENERATED %s AS (%s) STORED",
+							 GeneratedWhenStr(constraint->generated_when),
+							 DeparseRawExprForColumnDefault(relationId, typeOid, typmod,
+															columnDefinition->colname,
+															attgenerated,
+															constraint->raw_expr));
+		}
+		else if (constraint->contype == CONSTR_CHECK ||
+				 constraint->contype == CONSTR_PRIMARY ||
+				 constraint->contype == CONSTR_UNIQUE ||
+				 constraint->contype == CONSTR_EXCLUSION ||
+				 constraint->contype == CONSTR_FOREIGN)
+		{
+			AppendAlterTableCmdConstraint(buf, constraint, stmt, AT_AddColumn);
+		}
+		else if (constraint->contype == CONSTR_ATTR_DEFERRABLE)
+		{
+			appendStringInfoString(buf, " DEFERRABLE");
+		}
+		else if (constraint->contype == CONSTR_ATTR_NOT_DEFERRABLE)
+		{
+			appendStringInfoString(buf, " NOT DEFERRABLE");
+		}
+		else if (constraint->contype == CONSTR_ATTR_DEFERRED)
+		{
+			appendStringInfoString(buf, " INITIALLY DEFERRED");
+		}
+		else if (constraint->contype == CONSTR_ATTR_IMMEDIATE)
+		{
+			appendStringInfoString(buf, " INITIALLY IMMEDIATE");
+		}
+		else
+		{
+			ereport(ERROR, (errmsg("unsupported constraint type"),
+							errdetail("constraint type: %d", constraint->contype)));
+		}
+	}
+}
+
+
+/*
+ * AppendAlterTableCmdDropConstraint builds and appends to the given buffer an
+ * AT_DropConstraint command from given AlterTableCmd object in the form
+ * DROP CONSTRAINT ...
+ */
+static void
+AppendAlterTableCmdDropConstraint(StringInfo buf, AlterTableCmd *alterTableCmd)
+{
+	appendStringInfoString(buf, " DROP CONSTRAINT");
+
+	if (alterTableCmd->missing_ok)
+	{
+		appendStringInfoString(buf, " IF EXISTS");
+	}
+
+	appendStringInfo(buf, " %s", quote_identifier(alterTableCmd->name));
+
+	if (alterTableCmd->behavior == DROP_CASCADE)
+	{
+		appendStringInfoString(buf, " CASCADE");
 	}
 }

@@ -10,6 +10,7 @@
  */
 
 #include "postgres.h"
+
 #include "miscadmin.h"
 
 #include "access/genam.h"
@@ -19,26 +20,29 @@
 #include "catalog/indexing.h"
 #include "catalog/pg_type.h"
 #include "commands/sequence.h"
-#include "distributed/colocation_utils.h"
-#include "distributed/listutils.h"
-#include "distributed/metadata_utility.h"
-#include "distributed/coordinator_protocol.h"
-#include "distributed/metadata_cache.h"
-#include "distributed/metadata_sync.h"
-#include "distributed/multi_logical_planner.h"
-#include "distributed/multi_partitioning_utils.h"
-#include "distributed/pg_dist_colocation.h"
-#include "distributed/resource_lock.h"
-#include "distributed/shardinterval_utils.h"
-#include "distributed/version_compat.h"
-#include "distributed/utils/array_type.h"
-#include "distributed/worker_protocol.h"
-#include "distributed/worker_transaction.h"
 #include "storage/lmgr.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
+
+#include "distributed/colocation_utils.h"
+#include "distributed/commands.h"
+#include "distributed/coordinator_protocol.h"
+#include "distributed/listutils.h"
+#include "distributed/metadata_cache.h"
+#include "distributed/metadata_sync.h"
+#include "distributed/metadata_utility.h"
+#include "distributed/multi_logical_planner.h"
+#include "distributed/multi_partitioning_utils.h"
+#include "distributed/pg_dist_colocation.h"
+#include "distributed/resource_lock.h"
+#include "distributed/shardinterval_utils.h"
+#include "distributed/tenant_schema_metadata.h"
+#include "distributed/utils/array_type.h"
+#include "distributed/version_compat.h"
+#include "distributed/worker_protocol.h"
+#include "distributed/worker_transaction.h"
 
 
 /* local function forward declarations */
@@ -49,9 +53,9 @@ static bool HashPartitionedShardIntervalsEqual(ShardInterval *leftShardInterval,
 											   ShardInterval *rightShardInterval);
 static int CompareShardPlacementsByNode(const void *leftElement,
 										const void *rightElement);
-static void DeleteColocationGroup(uint32 colocationId);
 static uint32 CreateColocationGroupForRelation(Oid sourceRelationId);
 static void BreakColocation(Oid sourceRelationId);
+static uint32 SingleShardTableGetNodeId(Oid relationId);
 
 
 /* exports for SQL callable functions */
@@ -115,16 +119,19 @@ update_distributed_table_colocation(PG_FUNCTION_ARGS)
 	text *colocateWithTableNameText = PG_GETARG_TEXT_P(1);
 
 	EnsureTableOwner(targetRelationId);
+	ErrorIfTenantTable(targetRelationId, TenantOperationNames[TENANT_UPDATE_COLOCATION]);
 
 	char *colocateWithTableName = text_to_cstring(colocateWithTableNameText);
 	if (IsColocateWithNone(colocateWithTableName))
 	{
-		EnsureHashDistributedTable(targetRelationId);
+		EnsureHashOrSingleShardDistributedTable(targetRelationId);
 		BreakColocation(targetRelationId);
 	}
 	else
 	{
 		Oid colocateWithTableId = ResolveRelationId(colocateWithTableNameText, false);
+		ErrorIfTenantTable(colocateWithTableId,
+						   TenantOperationNames[TENANT_COLOCATE_WITH]);
 		EnsureTableOwner(colocateWithTableId);
 		MarkTablesColocated(colocateWithTableId, targetRelationId);
 	}
@@ -170,12 +177,11 @@ BreakColocation(Oid sourceRelationId)
 	 */
 	Relation pgDistColocation = table_open(DistColocationRelationId(), ExclusiveLock);
 
-	uint32 newColocationId = GetNextColocationId();
-	bool localOnly = false;
-	UpdateRelationColocationGroup(sourceRelationId, newColocationId, localOnly);
+	uint32 oldColocationId = TableColocationId(sourceRelationId);
+	CreateColocationGroupForRelation(sourceRelationId);
 
-	/* if there is not any remaining table in the colocation group, delete it */
-	DeleteColocationGroupIfNoTablesBelong(sourceRelationId);
+	/* if there is not any remaining table in the old colocation group, delete it */
+	DeleteColocationGroupIfNoTablesBelong(oldColocationId);
 
 	table_close(pgDistColocation, NoLock);
 }
@@ -263,8 +269,8 @@ MarkTablesColocated(Oid sourceRelationId, Oid targetRelationId)
 							   "other tables")));
 	}
 
-	EnsureHashDistributedTable(sourceRelationId);
-	EnsureHashDistributedTable(targetRelationId);
+	EnsureHashOrSingleShardDistributedTable(sourceRelationId);
+	EnsureHashOrSingleShardDistributedTable(targetRelationId);
 	CheckReplicationModel(sourceRelationId, targetRelationId);
 	CheckDistributionColumnType(sourceRelationId, targetRelationId);
 
@@ -528,7 +534,7 @@ ColocationId(int shardCount, int replicationFactor, Oid distributionColumnType, 
 	ScanKeyInit(&scanKey[0], Anum_pg_dist_colocation_distributioncolumntype,
 				BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(distributionColumnType));
 	ScanKeyInit(&scanKey[1], Anum_pg_dist_colocation_shardcount,
-				BTEqualStrategyNumber, F_INT4EQ, UInt32GetDatum(shardCount));
+				BTEqualStrategyNumber, F_INT4EQ, Int32GetDatum(shardCount));
 	ScanKeyInit(&scanKey[2], Anum_pg_dist_colocation_replicationfactor,
 				BTEqualStrategyNumber, F_INT4EQ, Int32GetDatum(replicationFactor));
 	ScanKeyInit(&scanKey[3], Anum_pg_dist_colocation_distributioncolumncollation,
@@ -545,6 +551,13 @@ ColocationId(int shardCount, int replicationFactor, Oid distributionColumnType, 
 	{
 		Form_pg_dist_colocation colocationForm =
 			(Form_pg_dist_colocation) GETSTRUCT(colocationTuple);
+
+		/* avoid chosing a colocation group that belongs to a tenant schema */
+		if (IsTenantSchemaColocationGroup(colocationForm->colocationid))
+		{
+			colocationTuple = systable_getnext(scanDescriptor);
+			continue;
+		}
 
 		if (colocationId == INVALID_COLOCATION_ID || colocationId >
 			colocationForm->colocationid)
@@ -978,7 +991,7 @@ ColocationGroupTableList(uint32 colocationId, uint32 count)
 	}
 
 	ScanKeyInit(&scanKey[0], Anum_pg_dist_partition_colocationid,
-				BTEqualStrategyNumber, F_INT4EQ, UInt32GetDatum(colocationId));
+				BTEqualStrategyNumber, F_INT4EQ, Int32GetDatum(colocationId));
 
 	Relation pgDistPartition = table_open(DistPartitionRelationId(), AccessShareLock);
 	TupleDesc tupleDescriptor = RelationGetDescr(pgDistPartition);
@@ -1155,7 +1168,7 @@ ColocatedNonPartitionShardIntervalList(ShardInterval *shardInterval)
  * guarantee that the table isn't dropped for the remainder of the transaction.
  */
 Oid
-ColocatedTableId(Oid colocationId)
+ColocatedTableId(int32 colocationId)
 {
 	Oid colocatedTableId = InvalidOid;
 	bool indexOK = true;
@@ -1172,7 +1185,7 @@ ColocatedTableId(Oid colocationId)
 	}
 
 	ScanKeyInit(&scanKey[0], Anum_pg_dist_partition_colocationid,
-				BTEqualStrategyNumber, F_INT4EQ, ObjectIdGetDatum(colocationId));
+				BTEqualStrategyNumber, F_INT4EQ, Int32GetDatum(colocationId));
 
 	Relation pgDistPartition = table_open(DistPartitionRelationId(), AccessShareLock);
 	TupleDesc tupleDescriptor = RelationGetDescr(pgDistPartition);
@@ -1221,6 +1234,56 @@ ColocatedTableId(Oid colocationId)
 
 
 /*
+ * SingleShardTableColocationNodeId takes a colocation id that presumably
+ * belongs to colocation group used to colocate a set of single-shard
+ * tables and returns id of the node that stores / is expected to store
+ * the shards within the colocation group.
+ */
+uint32
+SingleShardTableColocationNodeId(uint32 colocationId)
+{
+	List *tablesInColocationGroup = ColocationGroupTableList(colocationId, 0);
+	if (list_length(tablesInColocationGroup) == 0)
+	{
+		int workerNodeIndex =
+			EmptySingleShardTableColocationDecideNodeId(colocationId);
+		List *workerNodeList = DistributedTablePlacementNodeList(RowShareLock);
+		WorkerNode *workerNode = (WorkerNode *) list_nth(workerNodeList, workerNodeIndex);
+
+		return workerNode->nodeId;
+	}
+	else
+	{
+		Oid colocatedTableId = ColocatedTableId(colocationId);
+		return SingleShardTableGetNodeId(colocatedTableId);
+	}
+}
+
+
+/*
+ * SingleShardTableGetNodeId returns id of the node that stores shard of
+ * given single-shard table.
+ */
+static uint32
+SingleShardTableGetNodeId(Oid relationId)
+{
+	if (!IsCitusTableType(relationId, SINGLE_SHARD_DISTRIBUTED))
+	{
+		ereport(ERROR, (errmsg("table is not a single-shard distributed table")));
+	}
+
+	int64 shardId = GetFirstShardId(relationId);
+	List *shardPlacementList = ShardPlacementList(shardId);
+	if (list_length(shardPlacementList) != 1)
+	{
+		ereport(ERROR, (errmsg("table shard does not have a single shard placement")));
+	}
+
+	return ((ShardPlacement *) linitial(shardPlacementList))->nodeId;
+}
+
+
+/*
  * ColocatedShardIdInRelation returns shardId of the shard from given relation, so that
  * returned shard is co-located with given shard.
  */
@@ -1258,9 +1321,9 @@ DeleteColocationGroupIfNoTablesBelong(uint32 colocationId)
 
 /*
  * DeleteColocationGroup deletes the colocation group from pg_dist_colocation
- * throughout the cluster.
+ * throughout the cluster and dissociates the tenant schema if any.
  */
-static void
+void
 DeleteColocationGroup(uint32 colocationId)
 {
 	DeleteColocationGroupLocally(colocationId);
@@ -1281,7 +1344,7 @@ DeleteColocationGroupLocally(uint32 colocationId)
 	Relation pgDistColocation = table_open(DistColocationRelationId(), RowExclusiveLock);
 
 	ScanKeyInit(&scanKey[0], Anum_pg_dist_colocation_colocationid,
-				BTEqualStrategyNumber, F_INT4EQ, UInt32GetDatum(colocationId));
+				BTEqualStrategyNumber, F_INT4EQ, Int32GetDatum(colocationId));
 
 	SysScanDesc scanDescriptor = systable_beginscan(pgDistColocation, InvalidOid, indexOK,
 													NULL, scanKeyCount, scanKey);
@@ -1384,17 +1447,19 @@ EnsureTableCanBeColocatedWith(Oid relationId, char replicationModel,
 							  Oid distributionColumnType, Oid sourceRelationId)
 {
 	CitusTableCacheEntry *sourceTableEntry = GetCitusTableCacheEntry(sourceRelationId);
-	char sourceReplicationModel = sourceTableEntry->replicationModel;
-	Var *sourceDistributionColumn = DistPartitionKeyOrError(sourceRelationId);
 
-	if (!IsCitusTableTypeCacheEntry(sourceTableEntry, HASH_DISTRIBUTED))
+	if (IsCitusTableTypeCacheEntry(sourceTableEntry, APPEND_DISTRIBUTED) ||
+		IsCitusTableTypeCacheEntry(sourceTableEntry, RANGE_DISTRIBUTED) ||
+		IsCitusTableTypeCacheEntry(sourceTableEntry, CITUS_LOCAL_TABLE))
 	{
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						errmsg("cannot distribute relation"),
-						errdetail("Currently, colocate_with option is only supported "
-								  "for hash distributed tables.")));
+						errdetail("Currently, colocate_with option is not supported "
+								  "with append / range distributed tables and local "
+								  "tables added to metadata.")));
 	}
 
+	char sourceReplicationModel = sourceTableEntry->replicationModel;
 	if (sourceReplicationModel != replicationModel)
 	{
 		char *relationName = get_rel_name(relationId);
@@ -1406,7 +1471,9 @@ EnsureTableCanBeColocatedWith(Oid relationId, char replicationModel,
 								  sourceRelationName, relationName)));
 	}
 
-	Oid sourceDistributionColumnType = sourceDistributionColumn->vartype;
+	Var *sourceDistributionColumn = DistPartitionKey(sourceRelationId);
+	Oid sourceDistributionColumnType = !sourceDistributionColumn ? InvalidOid :
+									   sourceDistributionColumn->vartype;
 	if (sourceDistributionColumnType != distributionColumnType)
 	{
 		char *relationName = get_rel_name(relationId);
@@ -1417,5 +1484,26 @@ EnsureTableCanBeColocatedWith(Oid relationId, char replicationModel,
 						errdetail("Distribution column types don't match for "
 								  "%s and %s.", sourceRelationName,
 								  relationName)));
+	}
+
+	/* prevent colocating regular tables with tenant tables */
+	Oid sourceRelationSchemaId = get_rel_namespace(sourceRelationId);
+	Oid targetRelationSchemaId = get_rel_namespace(relationId);
+	if (IsTenantSchema(sourceRelationSchemaId) &&
+		sourceRelationSchemaId != targetRelationSchemaId)
+	{
+		char *relationName = get_rel_name(relationId);
+		char *sourceRelationName = get_rel_name(sourceRelationId);
+		char *sourceRelationSchemaName = get_namespace_name(sourceRelationSchemaId);
+
+		ereport(ERROR, (errmsg("cannot colocate tables %s and %s",
+							   sourceRelationName, relationName),
+						errdetail("Cannot colocate tables with distributed schema tables"
+								  " by using colocate_with option."),
+						errhint("Consider using \"CREATE TABLE\" statement "
+								"to create this table as a single-shard distributed "
+								"table in the same schema to automatically colocate "
+								"it with %s.%s",
+								sourceRelationSchemaName, sourceRelationName)));
 	}
 }

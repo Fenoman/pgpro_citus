@@ -12,18 +12,20 @@
  */
 #include "postgres.h"
 
-#include "distributed/citus_ruleutils.h"
-#include "distributed/deparser.h"
-#include "distributed/listutils.h"
 #include "lib/stringinfo.h"
 #include "nodes/nodes.h"
 #include "utils/builtins.h"
+
+#include "distributed/citus_ruleutils.h"
+#include "distributed/deparser.h"
+#include "distributed/listutils.h"
 
 static void AppendCreateSchemaStmt(StringInfo buf, CreateSchemaStmt *stmt);
 static void AppendDropSchemaStmt(StringInfo buf, DropStmt *stmt);
 static void AppendGrantOnSchemaStmt(StringInfo buf, GrantStmt *stmt);
 static void AppendGrantOnSchemaSchemas(StringInfo buf, GrantStmt *stmt);
 static void AppendAlterSchemaRenameStmt(StringInfo buf, RenameStmt *stmt);
+static void AppendAlterSchemaOwnerStmt(StringInfo buf, AlterOwnerStmt *stmt);
 
 char *
 DeparseCreateSchemaStmt(Node *node)
@@ -65,6 +67,31 @@ DeparseGrantOnSchemaStmt(Node *node)
 	AppendGrantOnSchemaStmt(&str, stmt);
 
 	return str.data;
+}
+
+
+char *
+DeparseAlterSchemaOwnerStmt(Node *node)
+{
+	AlterOwnerStmt *stmt = castNode(AlterOwnerStmt, node);
+
+	StringInfoData str = { 0 };
+	initStringInfo(&str);
+
+	AppendAlterSchemaOwnerStmt(&str, stmt);
+
+	return str.data;
+}
+
+
+static void
+AppendAlterSchemaOwnerStmt(StringInfo buf, AlterOwnerStmt *stmt)
+{
+	Assert(stmt->objectType == OBJECT_SCHEMA);
+
+	appendStringInfo(buf, "ALTER SCHEMA %s OWNER TO %s;",
+					 quote_identifier(strVal(stmt->object)),
+					 RoleSpecString(stmt->newowner, true));
 }
 
 
@@ -152,35 +179,11 @@ AppendGrantOnSchemaStmt(StringInfo buf, GrantStmt *stmt)
 {
 	Assert(stmt->objtype == OBJECT_SCHEMA);
 
-	appendStringInfo(buf, "%s ", stmt->is_grant ? "GRANT" : "REVOKE");
-
-	if (!stmt->is_grant && stmt->grant_option)
-	{
-		appendStringInfo(buf, "GRANT OPTION FOR ");
-	}
-
-	AppendGrantPrivileges(buf, stmt);
+	AppendGrantSharedPrefix(buf, stmt);
 
 	AppendGrantOnSchemaSchemas(buf, stmt);
 
-	AppendGrantGrantees(buf, stmt);
-
-	if (stmt->is_grant && stmt->grant_option)
-	{
-		appendStringInfo(buf, " WITH GRANT OPTION");
-	}
-	if (!stmt->is_grant)
-	{
-		if (stmt->behavior == DROP_RESTRICT)
-		{
-			appendStringInfo(buf, " RESTRICT");
-		}
-		else if (stmt->behavior == DROP_CASCADE)
-		{
-			appendStringInfo(buf, " CASCADE");
-		}
-	}
-	appendStringInfo(buf, ";");
+	AppendGrantSharedSuffix(buf, stmt);
 }
 
 

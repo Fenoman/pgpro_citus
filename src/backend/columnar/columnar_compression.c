@@ -13,14 +13,20 @@
  */
 #include "postgres.h"
 
-#include "citus_version.h"
 #include "common/pg_lzcompress.h"
 #include "lib/stringinfo.h"
+
+#include "citus_version.h"
+#include "pg_version_constants.h"
 
 #include "columnar/columnar_compression.h"
 
 #if HAVE_CITUS_LIBLZ4
 #include <lz4.h>
+#endif
+
+#if PG_VERSION_NUM >= PG_VERSION_16
+#include "varatt.h"
 #endif
 
 #if HAVE_LIBZSTD

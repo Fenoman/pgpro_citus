@@ -12,11 +12,10 @@
 
 #include "postgres.h"
 
-#include "distributed/pg_version_constants.h"
-
+#include "nodes/pathnodes.h"
 #include "nodes/plannodes.h"
 
-#include "nodes/pathnodes.h"
+#include "pg_version_constants.h"
 
 #include "distributed/citus_nodes.h"
 #include "distributed/errormessage.h"
@@ -147,8 +146,18 @@ typedef struct RTEListProperties
 	bool hasReferenceTable;
 	bool hasCitusLocalTable;
 
-	/* includes hash, append and range partitioned tables */
+	/* includes hash, single-shard, append and range partitioned tables */
 	bool hasDistributedTable;
+
+	/*
+	 * Effectively, hasDistributedTable is equal to
+	 *  "hasDistTableWithShardKey || hasSingleShardDistTable".
+	 *
+	 * We provide below two for the callers that want to know what kind of
+	 * distributed tables that given query has references to.
+	 */
+	bool hasDistTableWithShardKey;
+	bool hasSingleShardDistTable;
 
 	/* union of hasReferenceTable, hasCitusLocalTable and hasDistributedTable */
 	bool hasCitusTable;
@@ -224,6 +233,8 @@ extern List * TranslatedVarsForRteIdentity(int rteIdentity);
 extern struct DistributedPlan * GetDistributedPlan(CustomScan *node);
 extern void multi_relation_restriction_hook(PlannerInfo *root, RelOptInfo *relOptInfo,
 											Index restrictionIndex, RangeTblEntry *rte);
+extern void multi_get_relation_info_hook(PlannerInfo *root, Oid relationObjectId, bool
+										 inhparent, RelOptInfo *rel);
 extern void multi_join_restriction_hook(PlannerInfo *root,
 										RelOptInfo *joinrel,
 										RelOptInfo *outerrel,
@@ -243,6 +254,7 @@ extern int32 BlessRecordExpression(Expr *expr);
 extern void DissuadePlannerFromUsingPlan(PlannedStmt *plan);
 extern PlannedStmt * FinalizePlan(PlannedStmt *localPlan,
 								  struct DistributedPlan *distributedPlan);
+extern bool ContainsSingleShardTable(Query *query);
 extern RTEListProperties * GetRTEListPropertiesForQuery(Query *query);
 
 

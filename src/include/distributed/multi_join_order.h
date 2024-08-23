@@ -99,7 +99,8 @@ extern bool NodeIsEqualsOpExpr(Node *node);
 extern bool IsSupportedReferenceJoin(JoinType joinType, bool leftIsReferenceTable,
 									 bool rightIsReferenceTable);
 extern OpExpr * SinglePartitionJoinClause(List *partitionColumnList,
-										  List *applicableJoinClauses);
+										  List *applicableJoinClauses,
+										  bool *foundTypeMismatch);
 extern OpExpr * DualPartitionJoinClause(List *applicableJoinClauses);
 extern Var * LeftColumnOrNULL(OpExpr *joinClause);
 extern Var * RightColumnOrNULL(OpExpr *joinClause);
@@ -108,6 +109,8 @@ extern Var * DistPartitionKey(Oid relationId);
 extern Var * DistPartitionKeyOrError(Oid relationId);
 extern char PartitionMethod(Oid relationId);
 extern char TableReplicationModel(Oid relationId);
+extern bool JoinOnColumns(List *currentPartitionColumnList, Var *candidatePartitionColumn,
+						  List *joinClauseList);
 
 
 #endif   /* MULTI_JOIN_ORDER_H */

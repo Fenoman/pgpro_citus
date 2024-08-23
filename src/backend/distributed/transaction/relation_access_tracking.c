@@ -15,22 +15,23 @@
  */
 #include "postgres.h"
 
-#include "distributed/pg_version_constants.h"
-
 #include "miscadmin.h"
 
 #include "access/xact.h"
+#include "common/hashfn.h"
+#include "utils/hsearch.h"
+#include "utils/lsyscache.h"
+
+#include "pg_version_constants.h"
+
 #include "distributed/colocation_utils.h"
 #include "distributed/hash_helpers.h"
 #include "distributed/listutils.h"
+#include "distributed/metadata_cache.h"
 #include "distributed/multi_executor.h"
 #include "distributed/multi_join_order.h"
 #include "distributed/multi_partitioning_utils.h"
-#include "distributed/metadata_cache.h"
 #include "distributed/relation_access_tracking.h"
-#include "utils/hsearch.h"
-#include "common/hashfn.h"
-#include "utils/lsyscache.h"
 
 
 /* Config variables managed via guc.c */
@@ -195,7 +196,7 @@ RecordRelationAccessIfNonDistTable(Oid relationId, ShardPlacementAccessType acce
 	 * recursively calling RecordRelationAccessBase(), so becareful about
 	 * removing this check.
 	 */
-	if (IsCitusTable(relationId) && HasDistributionKey(relationId))
+	if (IsCitusTableType(relationId, DISTRIBUTED_TABLE))
 	{
 		return;
 	}
@@ -732,7 +733,7 @@ CheckConflictingRelationAccesses(Oid relationId, ShardPlacementAccessType access
 
 	CitusTableCacheEntry *cacheEntry = GetCitusTableCacheEntry(relationId);
 
-	if (HasDistributionKeyCacheEntry(cacheEntry) ||
+	if (IsCitusTableTypeCacheEntry(cacheEntry, DISTRIBUTED_TABLE) ||
 		cacheEntry->referencingRelationsViaForeignKey == NIL)
 	{
 		return;
@@ -931,7 +932,7 @@ HoldsConflictingLockWithReferencedRelations(Oid relationId, ShardPlacementAccess
 		 * We're only interested in foreign keys to reference tables and citus
 		 * local tables.
 		 */
-		if (IsCitusTable(referencedRelation) && HasDistributionKey(referencedRelation))
+		if (IsCitusTableType(referencedRelation, DISTRIBUTED_TABLE))
 		{
 			continue;
 		}
@@ -993,7 +994,7 @@ HoldsConflictingLockWithReferencingRelations(Oid relationId, ShardPlacementAcces
 	CitusTableCacheEntry *cacheEntry = GetCitusTableCacheEntry(relationId);
 	bool holdsConflictingLocks = false;
 
-	Assert(!HasDistributionKeyCacheEntry(cacheEntry));
+	Assert(!IsCitusTableTypeCacheEntry(cacheEntry, DISTRIBUTED_TABLE));
 
 	Oid referencingRelation = InvalidOid;
 	foreach_oid(referencingRelation, cacheEntry->referencingRelationsViaForeignKey)

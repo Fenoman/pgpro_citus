@@ -3,9 +3,6 @@ CREATE SCHEMA "publication-1";
 SET search_path TO publication;
 SET citus.shard_replication_factor TO 1;
 
--- for citus_add_local_table_to_metadata / create_distributed_table_concurrently
-SELECT citus_set_coordinator_host('localhost', :master_port);
-
 CREATE OR REPLACE FUNCTION activate_node_snapshot()
     RETURNS text[]
     LANGUAGE C STRICT
@@ -87,8 +84,13 @@ SELECT DISTINCT c FROM (
     SELECT array_agg(c) FROM (SELECT c FROM unnest(activate_node_snapshot()) c WHERE c LIKE '%CREATE PUBLICATION%' AND c LIKE '%pubtables%' ORDER BY 1) s$$)
   ORDER BY c) s;
 
--- distribute a table, creating a mixed publication
+-- distribute a table and create a tenant schema, creating a mixed publication
 SELECT create_distributed_table('test','x', colocate_with := 'none');
+SET citus.enable_schema_based_sharding TO ON;
+CREATE SCHEMA citus_schema_1;
+CREATE TABLE citus_schema_1.test (x int primary key, y int, "column-1" int, doc xml);
+SET citus.enable_schema_based_sharding TO OFF;
+ALTER PUBLICATION pubtables_orig ADD TABLE citus_schema_1.test;
 
 -- some generic operations
 ALTER PUBLICATION pubtables_orig RENAME TO pubtables;
@@ -100,7 +102,12 @@ ALTER PUBLICATION pubtables ADD TABLE notexist;
 -- operations with a distributed table
 ALTER PUBLICATION pubtables DROP TABLE test;
 ALTER PUBLICATION pubtables ADD TABLE test;
-ALTER PUBLICATION pubtables SET TABLE test, "test-pubs", "publication-1"."test-pubs";
+ALTER PUBLICATION pubtables SET TABLE test, "test-pubs", "publication-1"."test-pubs", citus_schema_1.test;
+
+-- operations with a tenant schema table
+ALTER PUBLICATION pubtables DROP TABLE citus_schema_1.test;
+ALTER PUBLICATION pubtables ADD TABLE citus_schema_1.test;
+ALTER PUBLICATION pubtables SET TABLE test, "test-pubs", "publication-1"."test-pubs", citus_schema_1.test;
 
 -- operations with a local table in a mixed publication
 ALTER PUBLICATION pubtables DROP TABLE "test-pubs";
@@ -121,7 +128,7 @@ ALTER PUBLICATION pubtables ADD TABLE "test-pubs";
 
 -- create a publication with distributed and local tables
 DROP PUBLICATION pubtables;
-CREATE PUBLICATION pubtables FOR TABLE test, "test-pubs", "publication-1"."test-pubs";
+CREATE PUBLICATION pubtables FOR TABLE test, "test-pubs", "publication-1"."test-pubs", citus_schema_1.test;
 
 -- change distributed tables
 SELECT alter_distributed_table('test', shard_count := 5, cascade_to_colocated := true);
@@ -187,13 +194,12 @@ SELECT substring(:'server_version', '\d+')::int >= 15 AS server_version_ge_15
 SET client_min_messages TO ERROR;
 DROP SCHEMA publication CASCADE;
 DROP SCHEMA "publication-1" CASCADE;
-
-SELECT citus_remove_node('localhost', :master_port);
+DROP SCHEMA citus_schema_1 CASCADE;
 \q
 \endif
 
 -- recreate a mixed publication
-CREATE PUBLICATION pubtables FOR TABLE test, "publication-1"."test-pubs";
+CREATE PUBLICATION pubtables FOR TABLE test, "publication-1"."test-pubs", citus_schema_1.test;
 
 -- operations on an existing distributed table
 ALTER PUBLICATION pubtables DROP TABLE test;
@@ -201,6 +207,19 @@ ALTER PUBLICATION pubtables ADD TABLE test (y);
 ALTER PUBLICATION pubtables SET TABLE test WHERE (doc IS DOCUMENT);
 ALTER PUBLICATION pubtables SET TABLE test WHERE (xmlexists('//foo[text() = ''bar'']' PASSING BY VALUE doc));
 ALTER PUBLICATION pubtables SET TABLE test WHERE (CASE x WHEN 5 THEN true ELSE false END);
+
+SELECT DISTINCT c FROM (
+  SELECT unnest(result::text[]) c
+  FROM run_command_on_workers($$
+    SELECT array_agg(c) FROM (SELECT c FROM unnest(activate_node_snapshot()) c WHERE c LIKE '%CREATE PUBLICATION%' AND c LIKE '%pubtables%' ORDER BY 1) s$$)
+  ORDER BY c) s;
+
+-- operations on an existing tenant schema table
+ALTER PUBLICATION pubtables ADD TABLE citus_schema_1.test (y);
+ALTER PUBLICATION pubtables DROP TABLE citus_schema_1.test;
+ALTER PUBLICATION pubtables SET TABLE citus_schema_1.test WHERE (doc IS DOCUMENT);
+ALTER PUBLICATION pubtables SET TABLE citus_schema_1.test WHERE (xmlexists('//foo[text() = ''bar'']' PASSING BY VALUE doc));
+ALTER PUBLICATION pubtables SET TABLE citus_schema_1.test WHERE (CASE x WHEN 5 THEN true ELSE false END);
 
 SELECT DISTINCT c FROM (
   SELECT unnest(result::text[]) c
@@ -254,6 +273,110 @@ CREATE PUBLICATION pubdep FOR TABLES IN SCHEMA deptest;
 RESET citus.create_object_propagation;
 DROP SCHEMA deptest CASCADE;
 
+--
+-- PG16 allows publications with schema and table of the same schema.
+-- backpatched to PG15
+-- Relevant PG commit: https://github.com/postgres/postgres/commit/13a185f
+--
+
+CREATE SCHEMA publication2;
+CREATE TABLE publication2.test1 (id int);
+SELECT create_distributed_table('publication2.test1', 'id');
+
+-- should be able to create publication with schema and table of the same
+-- schema
+CREATE PUBLICATION testpub_for_tbl_schema FOR TABLES IN SCHEMA publication2, TABLE publication2.test1;
+SELECT DISTINCT c FROM (
+  SELECT unnest(result::text[]) c
+  FROM run_command_on_workers($$
+    SELECT array_agg(c) FROM (SELECT c FROM unnest(activate_node_snapshot()) c WHERE c LIKE '%CREATE PUBLICATION%' AND c LIKE '%testpub_for_tbl_schema%' ORDER BY 1) s$$)
+  ORDER BY c) s;
+
+CREATE TABLE publication.test2 (id int);
+SELECT create_distributed_table('publication.test2', 'id');
+ALTER PUBLICATION testpub_for_tbl_schema ADD TABLE publication.test2;
+SELECT DISTINCT c FROM (
+  SELECT unnest(result::text[]) c
+  FROM run_command_on_workers($$
+    SELECT array_agg(c) FROM (SELECT c FROM unnest(activate_node_snapshot()) c WHERE c LIKE '%CREATE PUBLICATION%' AND c LIKE '%testpub_for_tbl_schema%' ORDER BY 1) s$$)
+  ORDER BY c) s;
+
+-- should be able to have publication2 schema and its new table test2 in testpub_for_tbl_schema publication
+ALTER TABLE test2 SET SCHEMA publication2;
+
+-- should be able to add a table of the same schema to the schema publication
+CREATE TABLE publication2.test3 (x int primary key, y int, "column-1" int);
+SELECT create_distributed_table('publication2.test3', 'x');
+ALTER PUBLICATION testpub_for_tbl_schema ADD TABLE publication2.test3;
+SELECT DISTINCT c FROM (
+  SELECT unnest(result::text[]) c
+  FROM run_command_on_workers($$
+    SELECT array_agg(c) FROM (SELECT c FROM unnest(activate_node_snapshot()) c WHERE c LIKE '%CREATE PUBLICATION%' AND c LIKE '%testpub_for_tbl_schema%' ORDER BY 1) s$$)
+  ORDER BY c) s;
+
+-- should be able to drop the table
+ALTER PUBLICATION testpub_for_tbl_schema DROP TABLE publication2.test3;
+SELECT DISTINCT c FROM (
+  SELECT unnest(result::text[]) c
+  FROM run_command_on_workers($$
+    SELECT array_agg(c) FROM (SELECT c FROM unnest(activate_node_snapshot()) c WHERE c LIKE '%CREATE PUBLICATION%' AND c LIKE '%testpub_for_tbl_schema%' ORDER BY 1) s$$)
+  ORDER BY c) s;
+
+DROP PUBLICATION testpub_for_tbl_schema;
+CREATE PUBLICATION testpub_for_tbl_schema FOR TABLES IN SCHEMA publication2;
+-- should be able to set publication with schema and table of the same schema
+ALTER PUBLICATION testpub_for_tbl_schema SET TABLES IN SCHEMA publication2, TABLE publication2.test1 WHERE (id < 99);
+SELECT DISTINCT c FROM (
+  SELECT unnest(result::text[]) c
+  FROM run_command_on_workers($$
+    SELECT array_agg(c) FROM (SELECT c FROM unnest(activate_node_snapshot()) c WHERE c LIKE '%CREATE PUBLICATION%' AND c LIKE '%testpub_for_tbl_schema%' ORDER BY 1) s$$)
+  ORDER BY c) s;
+
+-- test that using column list for table is disallowed if any schemas are
+-- part of the publication
+DROP PUBLICATION testpub_for_tbl_schema;
+
+-- failure - cannot use column list and schema together
+CREATE PUBLICATION testpub_for_tbl_schema FOR TABLES IN SCHEMA publication2, TABLE publication2.test3(y);
+
+-- ok - only publish schema
+CREATE PUBLICATION testpub_for_tbl_schema FOR TABLES IN SCHEMA publication2;
+SELECT DISTINCT c FROM (
+  SELECT unnest(result::text[]) c
+  FROM run_command_on_workers($$
+    SELECT array_agg(c) FROM (SELECT c FROM unnest(activate_node_snapshot()) c WHERE c LIKE '%CREATE PUBLICATION%' AND c LIKE '%testpub_for_tbl_schema%' ORDER BY 1) s$$)
+  ORDER BY c) s;
+
+-- failure - add a table with column list when there is already a schema in the
+-- publication
+ALTER PUBLICATION testpub_for_tbl_schema ADD TABLE publication2.test3(y);
+
+-- ok - only publish table with column list
+ALTER PUBLICATION testpub_for_tbl_schema SET TABLE publication2.test3(y);
+SELECT DISTINCT c FROM (
+  SELECT unnest(result::text[]) c
+  FROM run_command_on_workers($$
+    SELECT array_agg(c) FROM (SELECT c FROM unnest(activate_node_snapshot()) c WHERE c LIKE '%CREATE PUBLICATION%' AND c LIKE '%testpub_for_tbl_schema%' ORDER BY 1) s$$)
+  ORDER BY c) s;
+
+-- failure - specify a schema when there is already a column list in the
+-- publication
+ALTER PUBLICATION testpub_for_tbl_schema ADD TABLES IN SCHEMA publication2;
+
+-- failure - cannot SET column list and schema together
+ALTER PUBLICATION testpub_for_tbl_schema SET TABLES IN SCHEMA publication2, TABLE publication2.test3(y);
+
+-- ok - drop table
+ALTER PUBLICATION testpub_for_tbl_schema DROP TABLE publication2.test3;
+SELECT DISTINCT c FROM (
+  SELECT unnest(result::text[]) c
+  FROM run_command_on_workers($$
+    SELECT array_agg(c) FROM (SELECT c FROM unnest(activate_node_snapshot()) c WHERE c LIKE '%CREATE PUBLICATION%' AND c LIKE '%testpub_for_tbl_schema%' ORDER BY 1) s$$)
+  ORDER BY c) s;
+
+-- failure - cannot ADD column list and schema together
+ALTER PUBLICATION testpub_for_tbl_schema ADD TABLES IN SCHEMA publication2, TABLE publication2.test3(y);
+
 -- make sure we can sync all the publication metadata
 SELECT start_metadata_sync_to_all_nodes();
 
@@ -261,9 +384,10 @@ DROP PUBLICATION pubdep;
 DROP PUBLICATION "pub-mix";
 DROP PUBLICATION pubtables;
 DROP PUBLICATION pubpartitioned;
+DROP PUBLICATION testpub_for_tbl_schema;
 
 SET client_min_messages TO ERROR;
 DROP SCHEMA publication CASCADE;
 DROP SCHEMA "publication-1" CASCADE;
-
-SELECT citus_remove_node('localhost', :master_port);
+DROP SCHEMA citus_schema_1 CASCADE;
+DROP SCHEMA publication2 CASCADE;

@@ -22,10 +22,6 @@
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
-#include "distributed/citus_ruleutils.h"
-#include "distributed/commands.h"
-#include "distributed/deparser.h"
-#include "distributed/version_compat.h"
 #include "lib/stringinfo.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodes.h"
@@ -38,8 +34,13 @@
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
-#include "utils/syscache.h"
 #include "utils/regproc.h"
+#include "utils/syscache.h"
+
+#include "distributed/citus_ruleutils.h"
+#include "distributed/commands.h"
+#include "distributed/deparser.h"
+#include "distributed/version_compat.h"
 
 
 /* forward declaration for deparse functions */
@@ -749,35 +750,11 @@ AppendGrantOnFunctionStmt(StringInfo buf, GrantStmt *stmt)
 			 "GRANT .. ALL FUNCTIONS/PROCEDURES IN SCHEMA is not supported for formatting.");
 	}
 
-	appendStringInfoString(buf, stmt->is_grant ? "GRANT " : "REVOKE ");
-
-	if (!stmt->is_grant && stmt->grant_option)
-	{
-		appendStringInfoString(buf, "GRANT OPTION FOR ");
-	}
-
-	AppendGrantPrivileges(buf, stmt);
+	AppendGrantSharedPrefix(buf, stmt);
 
 	AppendGrantOnFunctionFunctions(buf, stmt);
 
-	AppendGrantGrantees(buf, stmt);
-
-	if (stmt->is_grant && stmt->grant_option)
-	{
-		appendStringInfoString(buf, " WITH GRANT OPTION");
-	}
-	if (!stmt->is_grant)
-	{
-		if (stmt->behavior == DROP_RESTRICT)
-		{
-			appendStringInfoString(buf, " RESTRICT");
-		}
-		else if (stmt->behavior == DROP_CASCADE)
-		{
-			appendStringInfoString(buf, " CASCADE");
-		}
-	}
-	appendStringInfoString(buf, ";");
+	AppendGrantSharedSuffix(buf, stmt);
 }
 
 

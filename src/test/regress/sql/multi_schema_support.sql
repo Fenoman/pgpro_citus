@@ -293,7 +293,19 @@ SELECT * FROM nation_hash ORDER BY 1,2,3,4;
 
 --test COLLATION with schema
 SET search_path TO public;
+
+SHOW server_version \gset
+SELECT substring(:'server_version', '\d+')::int >= 16 AS server_version_ge_16
+\gset
+
+\if :server_version_ge_16
+-- In PG16, read-only server settings lc_collate and lc_ctype are removed
+-- Relevant PG commit: b0f6c437160db640d4ea3e49398ebc3ba39d1982
+SELECT quote_ident((SELECT CASE WHEN datlocprovider='i' THEN daticulocale ELSE datcollate END FROM pg_database WHERE datname = current_database())) as current_locale \gset
+\else
 SELECT quote_ident(current_setting('lc_collate')) as current_locale \gset
+\endif
+
 CREATE COLLATION test_schema_support.english (LOCALE = :current_locale);
 
 \c - - - :master_port
@@ -671,7 +683,7 @@ CREATE SCHEMA new_schema;
 
 SELECT objid::oid::regnamespace as "Distributed Schemas"
     FROM pg_catalog.pg_dist_object
-    WHERE objid::oid::regnamespace IN ('old_schema', 'new_schema');
+    WHERE objid::oid::regnamespace IN ('old_schema', 'new_schema') ORDER BY objid::oid::regnamespace;
 \c - - - :worker_1_port
 SELECT table_schema AS "Shards' Schema"
     FROM information_schema.tables
@@ -684,7 +696,7 @@ ALTER TABLE old_schema.table_set_schema SET SCHEMA new_schema;
 
 SELECT objid::oid::regnamespace as "Distributed Schemas"
     FROM pg_catalog.pg_dist_object
-    WHERE objid::oid::regnamespace IN ('old_schema', 'new_schema');
+    WHERE objid::oid::regnamespace IN ('old_schema', 'new_schema') ORDER BY objid::oid::regnamespace;
 \c - - - :worker_1_port
 SELECT table_schema AS "Shards' Schema"
     FROM information_schema.tables
@@ -742,7 +754,7 @@ CREATE SCHEMA new_schema;
 
 SELECT objid::oid::regnamespace as "Distributed Schemas"
     FROM pg_catalog.pg_dist_object
-    WHERE objid::oid::regnamespace IN ('old_schema', 'new_schema');
+    WHERE objid::oid::regnamespace IN ('old_schema', 'new_schema') ORDER BY objid::oid::regnamespace;
 \c - - - :worker_1_port
 SELECT table_schema AS "Shards' Schema", COUNT(*) AS "Counts"
     FROM information_schema.tables
@@ -756,7 +768,7 @@ ALTER TABLE table_set_schema SET SCHEMA new_schema;
 
 SELECT objid::oid::regnamespace as "Distributed Schemas"
     FROM pg_catalog.pg_dist_object
-    WHERE objid::oid::regnamespace IN ('old_schema', 'new_schema');
+    WHERE objid::oid::regnamespace IN ('old_schema', 'new_schema') ORDER BY objid::oid::regnamespace;
 \c - - - :worker_1_port
 SELECT table_schema AS "Shards' Schema", COUNT(*) AS "Counts"
     FROM information_schema.tables
@@ -802,6 +814,9 @@ ALTER TABLE IF EXISTS non_existent_table SET SCHEMA non_existent_schema;
 DROP SCHEMA existing_schema, another_existing_schema CASCADE;
 
 
+-- test DROP SCHEMA with nonexisting schemas
+DROP SCHEMA ax, bx, cx, dx, ex, fx, gx, jx;
+
 -- test ALTER TABLE SET SCHEMA with interesting names
 CREATE SCHEMA "cItuS.T E E N'sSchema";
 CREATE SCHEMA "citus-teen's scnd schm.";
@@ -843,8 +858,6 @@ SET citus.next_shard_id TO 1197000;
 -- we do not use run_command_on_coordinator_and_workers here because when there is CASCADE, it causes deadlock
 DROP OWNED BY "test-user" CASCADE;
 DROP USER "test-user";
-
-DROP FUNCTION run_command_on_coordinator_and_workers(p_sql text);
 
 -- test run_command_on_* UDFs with schema
 CREATE SCHEMA run_test_schema;
@@ -949,6 +962,25 @@ SELECT COUNT(*) FROM bar.test;
 ALTER SCHEMA "CiTuS.TeeN" RENAME TO "Citus'Teen123";
 SELECT * FROM "Citus'Teen123"."TeeNTabLE.1!?!" ORDER BY id;
 
+-- test alter owner propagation
+CREATE ROLE test_non_super_user;
+ALTER ROLE test_non_super_user NOSUPERUSER;
+
+SELECT pg_get_userbyid(nspowner) AS schema_owner
+    FROM pg_namespace
+    WHERE nspname = 'bar';
+
+ALTER SCHEMA bar OWNER TO test_non_super_user;
+
+select result from run_command_on_workers ($$
+  SELECT pg_get_userbyid(nspowner) AS schema_owner
+  FROM pg_namespace
+  WHERE nspname = 'bar'
+$$);
+
+ALTER SCHEMA bar OWNER TO postgres;
+DROP ROLE test_non_super_user;
+
 -- test error
 INSERT INTO bar.test VALUES (3,3), (4,4), (5,5), (6,6), (7,7), (8,8), (9,9);
 
@@ -963,11 +995,225 @@ BEGIN;
     ALTER SCHEMA bar RENAME TO foo;
 ROLLBACK;
 
+-- below tests are to verify dependency propagation with nested sub-transactions
+-- TEST1
+BEGIN;
+    CREATE SCHEMA sc1;
+    CREATE SEQUENCE sc1.seq;
+    CREATE TABLE sc1.s1(id int default(nextval('sc1.seq')));
+    SELECT create_distributed_table('sc1.s1','id');
+COMMIT;
+DROP SCHEMA sc1 CASCADE;
+
+-- TEST2
+CREATE SCHEMA sc1;
+BEGIN;
+    CREATE SEQUENCE sc1.seq1;
+    CREATE TABLE sc1.s1(id int default(nextval('sc1.seq1')));
+    SELECT create_distributed_table('sc1.s1','id');
+COMMIT;
+DROP SCHEMA sc1 CASCADE;
+
+-- TEST3
+SET citus.enable_metadata_sync TO off;
+CREATE SCHEMA sc1;
+SET citus.enable_metadata_sync TO on;
+BEGIN;
+    CREATE TABLE sc1.s1(id int);
+    SELECT create_distributed_table('sc1.s1','id');
+COMMIT;
+DROP SCHEMA sc1 CASCADE;
+
+-- TEST4
+BEGIN;
+  SAVEPOINT sp1;
+    CREATE SCHEMA sc1;
+  ROLLBACK TO SAVEPOINT sp1;
+
+  SET LOCAL citus.enable_metadata_sync TO off;
+  CREATE SCHEMA sc1;
+  SET LOCAL citus.enable_metadata_sync TO on;
+
+  CREATE TABLE sc1.s1(id int);
+  SELECT create_distributed_table('sc1.s1','id');
+COMMIT;
+DROP SCHEMA sc1 CASCADE;
+
+-- TEST5
+BEGIN;
+  SAVEPOINT sp1;
+    CREATE SCHEMA sc1;
+  RELEASE SAVEPOINT sp1;
+
+  CREATE SEQUENCE seq1;
+  CREATE TABLE sc1.s1(id int default(nextval('seq1')));
+  SELECT create_distributed_table('sc1.s1','id');
+COMMIT;
+DROP SCHEMA sc1 CASCADE;
+DROP SEQUENCE seq1;
+
+-- TEST6
+BEGIN;
+  SAVEPOINT sp1;
+    SAVEPOINT sp2;
+      CREATE SCHEMA sc1;
+    ROLLBACK TO SAVEPOINT sp2;
+  RELEASE SAVEPOINT sp1;
+
+  SET LOCAL citus.enable_metadata_sync TO off;
+  CREATE SCHEMA sc1;
+  SET LOCAL citus.enable_metadata_sync TO on;
+
+  CREATE TABLE sc1.s1(id int);
+  SELECT create_distributed_table('sc1.s1','id');
+COMMIT;
+DROP SCHEMA sc1 CASCADE;
+
+-- TEST7
+BEGIN;
+  SAVEPOINT sp1;
+    SAVEPOINT sp2;
+      CREATE SCHEMA sc1;
+    RELEASE SAVEPOINT sp2;
+  RELEASE SAVEPOINT sp1;
+
+  CREATE SEQUENCE seq1;
+  CREATE TABLE sc1.s1(id int default(nextval('seq1')));
+  SELECT create_distributed_table('sc1.s1','id');
+COMMIT;
+DROP SCHEMA sc1 CASCADE;
+DROP SEQUENCE seq1;
+
+-- TEST8
+BEGIN;
+  SAVEPOINT sp1;
+    SAVEPOINT sp2;
+      CREATE SCHEMA sc1;
+    RELEASE SAVEPOINT sp2;
+  ROLLBACK TO SAVEPOINT sp1;
+
+  SET LOCAL citus.enable_metadata_sync TO off;
+  CREATE SCHEMA sc1;
+  SET LOCAL citus.enable_metadata_sync TO on;
+
+  CREATE TABLE sc1.s1(id int);
+  SELECT create_distributed_table('sc1.s1','id');
+COMMIT;
+DROP SCHEMA sc1 CASCADE;
+
+-- TEST9
+BEGIN;
+  SAVEPOINT sp1;
+    SAVEPOINT sp2;
+      CREATE SCHEMA sc2;
+    ROLLBACK TO SAVEPOINT sp2;
+
+    SAVEPOINT sp3;
+      CREATE SCHEMA sc1;
+    RELEASE SAVEPOINT sp3;
+  RELEASE SAVEPOINT sp1;
+
+  CREATE SEQUENCE seq1;
+  CREATE TABLE sc1.s1(id int default(nextval('seq1')));
+  SELECT create_distributed_table('sc1.s1','id');
+COMMIT;
+DROP SCHEMA sc1 CASCADE;
+DROP SEQUENCE seq1;
+
+-- TEST10
+BEGIN;
+  SAVEPOINT sp1;
+    SAVEPOINT sp2;
+      CREATE SCHEMA sc2;
+    RELEASE SAVEPOINT sp2;
+    SAVEPOINT sp3;
+      CREATE SCHEMA sc3;
+      SAVEPOINT sp4;
+        CREATE SCHEMA sc1;
+      ROLLBACK TO SAVEPOINT sp4;
+    RELEASE SAVEPOINT sp3;
+  RELEASE SAVEPOINT sp1;
+
+  SET LOCAL citus.enable_metadata_sync TO off;
+  CREATE SCHEMA sc1;
+  SET LOCAL citus.enable_metadata_sync TO on;
+
+  CREATE TABLE sc1.s1(id int);
+  SELECT create_distributed_table('sc1.s1','id');
+COMMIT;
+DROP SCHEMA sc1 CASCADE;
+DROP SCHEMA sc2 CASCADE;
+DROP SCHEMA sc3 CASCADE;
+
+-- TEST11
+BEGIN;
+  SAVEPOINT sp1;
+    SAVEPOINT sp2;
+      CREATE SCHEMA sc2;
+    RELEASE SAVEPOINT sp2;
+    SAVEPOINT sp3;
+      CREATE SCHEMA sc3;
+      SAVEPOINT sp4;
+        CREATE SCHEMA sc1;
+      RELEASE SAVEPOINT sp4;
+    RELEASE SAVEPOINT sp3;
+  RELEASE SAVEPOINT sp1;
+
+  CREATE SEQUENCE seq1;
+  CREATE TABLE sc1.s1(id int default(nextval('seq1')));
+  SELECT create_distributed_table('sc1.s1','id');
+COMMIT;
+DROP SCHEMA sc1 CASCADE;
+DROP SCHEMA sc2 CASCADE;
+DROP SCHEMA sc3 CASCADE;
+DROP SEQUENCE seq1;
+
+-- TEST12
+BEGIN;
+  SAVEPOINT sp1;
+    SAVEPOINT sp2;
+      CREATE SCHEMA sc2;
+    RELEASE SAVEPOINT sp2;
+    SAVEPOINT sp3;
+      CREATE SCHEMA sc3;
+      SAVEPOINT sp4;
+        CREATE SEQUENCE seq1;
+        CREATE SCHEMA sc1;
+        CREATE TABLE sc1.s1(id int default(nextval('seq1')));
+        SELECT create_distributed_table('sc1.s1','id');
+      RELEASE SAVEPOINT sp4;
+    RELEASE SAVEPOINT sp3;
+  RELEASE SAVEPOINT sp1;
+COMMIT;
+DROP SCHEMA sc1 CASCADE;
+DROP SCHEMA sc2 CASCADE;
+DROP SCHEMA sc3 CASCADE;
+DROP SEQUENCE seq1;
+
+-- issue-6614
+CREATE FUNCTION create_schema_test() RETURNS void AS $$
+BEGIN
+    SET citus.create_object_propagation = 'deferred';
+    CREATE SCHEMA test_1;
+    CREATE TABLE test_1.test (
+        id bigserial constraint test_pk primary key,
+        creation_date timestamp constraint test_creation_date_df default timezone('UTC'::text, CURRENT_TIMESTAMP)  not null
+    );
+    PERFORM create_reference_table('test_1.test');
+	RETURN;
+END;
+$$ LANGUAGE plpgsql;
+SELECT create_schema_test();
+SELECT result FROM run_command_on_all_nodes($$ SELECT COUNT(*) = 1 FROM pg_dist_partition WHERE logicalrelid = 'test_1.test'::regclass $$);
+DROP FUNCTION create_schema_test;
+DROP SCHEMA test_1 CASCADE;
+
 -- Clean up the created schema
 SET client_min_messages TO WARNING;
 
 SELECT pg_identify_object_as_address(classid, objid, objsubid) FROM pg_catalog.pg_dist_object
     WHERE classid=2615 and objid IN (select oid from pg_namespace where nspname='run_test_schema');
+DROP TABLE public.nation_local;
 DROP SCHEMA run_test_schema, test_schema_support_join_1, test_schema_support_join_2, "Citus'Teen123", "CiTUS.TEEN2", bar, test_schema_support CASCADE;
 -- verify that the dropped schema is removed from worker's pg_dist_object
 SELECT pg_identify_object_as_address(classid, objid, objsubid) FROM pg_catalog.pg_dist_object

@@ -15,17 +15,23 @@
 #include "c.h"
 
 #include "nodes/parsenodes.h"
+
 #include "distributed/distributed_planner.h"
 #include "distributed/errormessage.h"
 #include "distributed/multi_physical_planner.h"
 
-extern bool IsMergeAllowedOnRelation(Query *parse, RangeTblEntry *rte);
-extern DeferredErrorMessage * MergeQuerySupported(Query *originalQuery,
-												  bool multiShardQuery,
-												  PlannerRestrictionContext *
-												  plannerRestrictionContext);
-extern DistributedPlan * CreateMergePlan(Query *originalQuery, Query *query,
+extern DistributedPlan * CreateMergePlan(uint64 planId, Query *originalQuery,
+										 Query *query,
 										 PlannerRestrictionContext *
-										 plannerRestrictionContext);
+										 plannerRestrictionContext,
+										 ParamListInfo boundParams);
+extern bool IsLocalTableModification(Oid targetRelationId, Query *query,
+									 uint64 shardId,
+									 RTEListProperties *rteProperties);
+extern void NonPushableMergeCommandExplainScan(CustomScanState *node, List *ancestors,
+											   struct ExplainState *es);
+extern Var * FetchAndValidateInsertVarIfExists(Oid targetRelationId, Query *query);
+extern RangeTblEntry * ExtractMergeSourceRangeTableEntry(Query *query, bool joinSourceOk);
+
 
 #endif /* MERGE_PLANNER_H */

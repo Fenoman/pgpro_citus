@@ -19,6 +19,8 @@
 
 #include "postgres.h"
 
+#include "miscadmin.h"
+
 #include "access/genam.h"
 #include "access/htup_details.h"
 #include "access/xact.h"
@@ -26,8 +28,16 @@
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_statistic_ext.h"
 #include "catalog/pg_type.h"
-#include "distributed/commands/utility_hook.h"
+#include "utils/builtins.h"
+#include "utils/fmgroids.h"
+#include "utils/fmgrprotos.h"
+#include "utils/lsyscache.h"
+#include "utils/relcache.h"
+#include "utils/ruleutils.h"
+#include "utils/syscache.h"
+
 #include "distributed/commands.h"
+#include "distributed/commands/utility_hook.h"
 #include "distributed/deparse_shard_query.h"
 #include "distributed/deparser.h"
 #include "distributed/listutils.h"
@@ -37,14 +47,6 @@
 #include "distributed/relation_access_tracking.h"
 #include "distributed/resource_lock.h"
 #include "distributed/worker_transaction.h"
-#include "miscadmin.h"
-#include "utils/builtins.h"
-#include "utils/fmgroids.h"
-#include "utils/fmgrprotos.h"
-#include "utils/lsyscache.h"
-#include "utils/relcache.h"
-#include "utils/ruleutils.h"
-#include "utils/syscache.h"
 
 #define DEFAULT_STATISTICS_TARGET -1
 #define ALTER_INDEX_COLUMN_SET_STATS_COMMAND \
@@ -76,6 +78,14 @@ PreprocessCreateStatisticsStmt(Node *node, const char *queryString,
 	}
 
 	EnsureCoordinator();
+
+	if (!(stmt->defnames))
+	{
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("cannot create statistics without a name on a "
+							   "Citus table"),
+						errhint("Consider specifying a name for the statistics")));
+	}
 
 	QualifyTreeNode((Node *) stmt);
 
@@ -522,7 +532,7 @@ GetExplicitStatisticsCommandList(Oid relationId)
 	RelationClose(relation);
 
 	/* generate fully-qualified names */
-	PushOverrideEmptySearchPath(CurrentMemoryContext);
+	int saveNestLevel = PushEmptySearchPath();
 
 	Oid statisticsId = InvalidOid;
 	foreach_oid(statisticsId, statisticsIdList)
@@ -571,7 +581,7 @@ GetExplicitStatisticsCommandList(Oid relationId)
 	}
 
 	/* revert back to original search_path */
-	PopOverrideSearchPath();
+	PopEmptySearchPath(saveNestLevel);
 
 	return explicitStatisticsCommandList;
 }

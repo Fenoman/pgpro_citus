@@ -9,7 +9,6 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
-#include "distributed/pg_version_constants.h"
 
 #include "access/genam.h"
 #include "access/table.h"
@@ -18,6 +17,14 @@
 #include "catalog/pg_trigger.h"
 #include "commands/extension.h"
 #include "commands/trigger.h"
+#include "utils/builtins.h"
+#include "utils/fmgroids.h"
+#include "utils/fmgrprotos.h"
+#include "utils/lsyscache.h"
+#include "utils/syscache.h"
+
+#include "pg_version_constants.h"
+
 #include "distributed/commands.h"
 #include "distributed/commands/utility_hook.h"
 #include "distributed/coordinator_protocol.h"
@@ -29,11 +36,6 @@
 #include "distributed/namespace_utils.h"
 #include "distributed/shard_utils.h"
 #include "distributed/worker_protocol.h"
-#include "utils/builtins.h"
-#include "utils/fmgrprotos.h"
-#include "utils/fmgroids.h"
-#include "utils/lsyscache.h"
-#include "utils/syscache.h"
 
 
 /* appropriate lock modes for the owner relation according to postgres */
@@ -74,7 +76,7 @@ GetExplicitTriggerCommandList(Oid relationId)
 {
 	List *createTriggerCommandList = NIL;
 
-	PushOverrideEmptySearchPath(CurrentMemoryContext);
+	int saveNestLevel = PushEmptySearchPath();
 
 	List *triggerIdList = GetExplicitTriggerIdList(relationId);
 
@@ -116,7 +118,7 @@ GetExplicitTriggerCommandList(Oid relationId)
 	}
 
 	/* revert back to original search_path */
-	PopOverrideSearchPath();
+	PopEmptySearchPath(saveNestLevel);
 
 	return createTriggerCommandList;
 }
@@ -249,7 +251,7 @@ GetExplicitTriggerIdList(Oid relationId)
 	ScanKeyData scanKey[1];
 
 	ScanKeyInit(&scanKey[0], Anum_pg_trigger_tgrelid,
-				BTEqualStrategyNumber, F_OIDEQ, relationId);
+				BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(relationId));
 
 	bool useIndex = true;
 	SysScanDesc scanDescriptor = systable_beginscan(pgTrigger, TriggerRelidNameIndexId,

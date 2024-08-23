@@ -11,50 +11,15 @@
  *-------------------------------------------------------------------------
  */
 
-#include "postgres.h"
-
-#include "distributed/pg_version_constants.h"
-
 #include <stddef.h>
+
+#include "postgres.h"
 
 #include "access/stratnum.h"
 #include "access/xact.h"
 #include "catalog/pg_opfamily.h"
+#include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
-#include "distributed/colocation_utils.h"
-#include "distributed/citus_clauses.h"
-#include "distributed/citus_nodes.h"
-#include "distributed/citus_nodefuncs.h"
-#include "distributed/deparse_shard_query.h"
-#include "distributed/distribution_column.h"
-#include "distributed/errormessage.h"
-#include "distributed/executor_util.h"
-#include "distributed/log_utils.h"
-#include "distributed/insert_select_planner.h"
-#include "distributed/intermediate_result_pruning.h"
-#include "distributed/metadata_utility.h"
-#include "distributed/coordinator_protocol.h"
-#include "distributed/merge_planner.h"
-#include "distributed/metadata_cache.h"
-#include "distributed/multi_executor.h"
-#include "distributed/multi_join_order.h"
-#include "distributed/multi_logical_planner.h"
-#include "distributed/multi_logical_optimizer.h"
-#include "distributed/multi_partitioning_utils.h"
-#include "distributed/multi_physical_planner.h"
-#include "distributed/multi_router_planner.h"
-#include "distributed/multi_server_executor.h"
-#include "distributed/listutils.h"
-#include "distributed/citus_ruleutils.h"
-#include "distributed/query_pushdown_planning.h"
-#include "distributed/query_utils.h"
-#include "distributed/reference_table_utils.h"
-#include "distributed/relation_restriction_equivalence.h"
-#include "distributed/relay_utility.h"
-#include "distributed/recursive_planning.h"
-#include "distributed/resource_lock.h"
-#include "distributed/shardinterval_utils.h"
-#include "distributed/shard_pruning.h"
 #include "executor/execdesc.h"
 #include "lib/stringinfo.h"
 #include "nodes/makefuncs.h"
@@ -65,12 +30,13 @@
 #include "nodes/primnodes.h"
 #include "optimizer/clauses.h"
 #include "optimizer/joininfo.h"
+#include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
-#include "optimizer/optimizer.h"
+#include "optimizer/planmain.h"
 #include "optimizer/restrictinfo.h"
-#include "parser/parsetree.h"
 #include "parser/parse_oper.h"
+#include "parser/parsetree.h"
 #include "postmaster/postmaster.h"
 #include "storage/lock.h"
 #include "utils/builtins.h"
@@ -80,8 +46,42 @@
 #include "utils/rel.h"
 #include "utils/typcache.h"
 
-#include "catalog/pg_proc.h"
-#include "optimizer/planmain.h"
+#include "pg_version_constants.h"
+
+#include "distributed/citus_clauses.h"
+#include "distributed/citus_nodefuncs.h"
+#include "distributed/citus_nodes.h"
+#include "distributed/citus_ruleutils.h"
+#include "distributed/colocation_utils.h"
+#include "distributed/coordinator_protocol.h"
+#include "distributed/deparse_shard_query.h"
+#include "distributed/distribution_column.h"
+#include "distributed/errormessage.h"
+#include "distributed/executor_util.h"
+#include "distributed/insert_select_planner.h"
+#include "distributed/intermediate_result_pruning.h"
+#include "distributed/listutils.h"
+#include "distributed/log_utils.h"
+#include "distributed/merge_planner.h"
+#include "distributed/metadata_cache.h"
+#include "distributed/metadata_utility.h"
+#include "distributed/multi_executor.h"
+#include "distributed/multi_join_order.h"
+#include "distributed/multi_logical_optimizer.h"
+#include "distributed/multi_logical_planner.h"
+#include "distributed/multi_partitioning_utils.h"
+#include "distributed/multi_physical_planner.h"
+#include "distributed/multi_router_planner.h"
+#include "distributed/multi_server_executor.h"
+#include "distributed/query_pushdown_planning.h"
+#include "distributed/query_utils.h"
+#include "distributed/recursive_planning.h"
+#include "distributed/reference_table_utils.h"
+#include "distributed/relation_restriction_equivalence.h"
+#include "distributed/relay_utility.h"
+#include "distributed/resource_lock.h"
+#include "distributed/shard_pruning.h"
+#include "distributed/shardinterval_utils.h"
 
 /* intermediate value for INSERT processing */
 typedef struct InsertValues
@@ -152,11 +152,10 @@ static List * ExtractInsertValuesList(Query *query, Var *partitionColumn);
 static DeferredErrorMessage * DeferErrorIfUnsupportedRouterPlannableSelectQuery(
 	Query *query);
 static DeferredErrorMessage * ErrorIfQueryHasUnroutableModifyingCTE(Query *queryTree);
-#if PG_VERSION_NUM >= PG_VERSION_14
 static DeferredErrorMessage * ErrorIfQueryHasCTEWithSearchClause(Query *queryTree);
-static bool ContainsSearchClauseWalker(Node *node);
-#endif
+static bool ContainsSearchClauseWalker(Node *node, void *context);
 static bool SelectsFromDistributedTable(List *rangeTableList, Query *query);
+static bool AllShardsColocated(List *relationShardList);
 static ShardPlacement * CreateDummyPlacement(bool hasLocalRelation);
 static ShardPlacement * CreateLocalDummyPlacement();
 static int CompareInsertValuesByShardId(const void *leftElement,
@@ -385,6 +384,26 @@ AddPartitionKeyNotNullFilterToSelect(Query *subqery)
 		subqery->jointree->quals = make_and_qual(subqery->jointree->quals,
 												 (Node *) nullTest);
 	}
+}
+
+
+/*
+ * ExtractSourceResultRangeTableEntry Generic wrapper for modification commands that
+ * utilizes results as input, based on an source query.
+ */
+RangeTblEntry *
+ExtractSourceResultRangeTableEntry(Query *query)
+{
+	if (IsMergeQuery(query))
+	{
+		return ExtractMergeSourceRangeTableEntry(query, false);
+	}
+	else if (CheckInsertSelectQuery(query))
+	{
+		return ExtractSelectRangeTableEntry(query);
+	}
+
+	return NULL;
 }
 
 
@@ -1098,14 +1117,12 @@ ModifyQuerySupported(Query *queryTree, Query *originalQuery, bool multiShardQuer
 		}
 	}
 
-#if PG_VERSION_NUM >= PG_VERSION_14
 	DeferredErrorMessage *CTEWithSearchClauseError =
 		ErrorIfQueryHasCTEWithSearchClause(originalQuery);
 	if (CTEWithSearchClauseError != NULL)
 	{
 		return CTEWithSearchClauseError;
 	}
-#endif
 
 	return NULL;
 }
@@ -1863,19 +1880,7 @@ RouterJob(Query *originalQuery, PlannerRestrictionContext *plannerRestrictionCon
 
 	if (*planningError)
 	{
-		/*
-		 * For MERGE, we do _not_ plan any other router job than the MERGE job itself,
-		 * let's not continue further down the lane in distributed planning, simply
-		 * bail out.
-		 */
-		if (IsMergeQuery(originalQuery))
-		{
-			RaiseDeferredError(*planningError, ERROR);
-		}
-		else
-		{
-			return NULL;
-		}
+		return NULL;
 	}
 
 	Job *job = CreateJob(originalQuery);
@@ -1885,17 +1890,36 @@ RouterJob(Query *originalQuery, PlannerRestrictionContext *plannerRestrictionCon
 	{
 		RangeTblEntry *updateOrDeleteOrMergeRTE = ExtractResultRelationRTE(originalQuery);
 
-		/*
-		 * If all of the shards are pruned, we replace the relation RTE into
-		 * subquery RTE that returns no results. However, this is not useful
-		 * for UPDATE and DELETE queries. Therefore, if we detect a UPDATE or
-		 * DELETE RTE with subquery type, we just set task list to empty and return
-		 * the job.
-		 */
 		if (updateOrDeleteOrMergeRTE->rtekind == RTE_SUBQUERY)
 		{
-			job->taskList = NIL;
-			return job;
+			/*
+			 * Not generating tasks for MERGE target relation might
+			 * result in incorrect behavior as source rows with NOT
+			 * MATCHED clause might qualify for insertion.
+			 */
+			if (IsMergeQuery(originalQuery))
+			{
+				ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								errmsg("Merge command is currently "
+									   "unsupported with filters that "
+									   "prunes down to zero shards"),
+								errhint("Avoid `WHERE false` clause or "
+										"any equivalent filters that "
+										"could prune down to zero shards")));
+			}
+			else
+			{
+				/*
+				 * If all of the shards are pruned, we replace the
+				 * relation RTE into subquery RTE that returns no
+				 * results. However, this is not useful for UPDATE
+				 * and DELETE queries. Therefore, if we detect a
+				 * UPDATE or DELETE RTE with subquery type, we just
+				 * set task list to empty and return the job.
+				 */
+				job->taskList = NIL;
+				return job;
+			}
 		}
 	}
 
@@ -2246,10 +2270,8 @@ SelectsFromDistributedTable(List *rangeTableList, Query *query)
 }
 
 
-static bool ContainsOnlyLocalTables(RTEListProperties *rteProperties);
-
 /*
- * RouterQuery runs router pruning logic for SELECT, UPDATE and DELETE queries.
+ * RouterQuery runs router pruning logic for SELECT, UPDATE, DELETE, and MERGE queries.
  * If there are shards present and query is routable, all RTEs have been updated
  * to point to the relevant shards in the originalQuery. Also, placementList is
  * filled with the list of worker nodes that has all the required shard placements
@@ -2282,6 +2304,7 @@ PlanRouterQuery(Query *originalQuery,
 	DeferredErrorMessage *planningError = NULL;
 	bool shardsPresent = false;
 	CmdType commandType = originalQuery->commandType;
+	Oid targetRelationId = InvalidOid;
 	bool fastPathRouterQuery =
 		plannerRestrictionContext->fastPathRestrictionContext->fastPathRouterQuery;
 
@@ -2348,13 +2371,7 @@ PlanRouterQuery(Query *originalQuery,
 
 		Assert(UpdateOrDeleteOrMergeQuery(originalQuery));
 
-		if (IsMergeQuery(originalQuery))
-		{
-			planningError = MergeQuerySupported(originalQuery,
-												isMultiShardQuery,
-												plannerRestrictionContext);
-		}
-		else
+		if (!IsMergeQuery(originalQuery))
 		{
 			planningError = ModifyQuerySupported(originalQuery, originalQuery,
 												 isMultiShardQuery,
@@ -2375,6 +2392,15 @@ PlanRouterQuery(Query *originalQuery,
 	*relationShardList =
 		RelationShardListForShardIntervalList(*prunedShardIntervalListList,
 											  &shardsPresent);
+
+	if (!EnableNonColocatedRouterQueryPushdown &&
+		!AllShardsColocated(*relationShardList))
+	{
+		return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
+							 "router planner does not support queries that "
+							 "reference non-colocated distributed tables",
+							 NULL, NULL);
+	}
 
 	if (!shardsPresent && !replacePrunedQueryWithDummy)
 	{
@@ -2403,13 +2429,14 @@ PlanRouterQuery(Query *originalQuery,
 
 	/* both Postgres tables and materialized tables are locally avaliable */
 	RTEListProperties *rteProperties = GetRTEListPropertiesForQuery(originalQuery);
-	if (shardId == INVALID_SHARD_ID && ContainsOnlyLocalTables(rteProperties))
+
+	if (isLocalTableModification)
 	{
-		if (commandType != CMD_SELECT)
-		{
-			*isLocalTableModification = true;
-		}
+		*isLocalTableModification =
+			IsLocalTableModification(targetRelationId, originalQuery, shardId,
+									 rteProperties);
 	}
+
 	bool hasPostgresLocalRelation =
 		rteProperties->hasPostgresLocalTable || rteProperties->hasMaterializedView;
 	List *taskPlacementList =
@@ -2444,10 +2471,96 @@ PlanRouterQuery(Query *originalQuery,
 
 
 /*
+ * AllShardsColocated returns true if all the shards in the given relationShardList
+ * have colocated tables and are on the same shard index.
+ */
+static bool
+AllShardsColocated(List *relationShardList)
+{
+	RelationShard *relationShard = NULL;
+	int shardIndex = -1;
+	int colocationId = -1;
+	CitusTableType tableType = ANY_CITUS_TABLE_TYPE;
+
+	foreach_ptr(relationShard, relationShardList)
+	{
+		Oid relationId = relationShard->relationId;
+		uint64 shardId = relationShard->shardId;
+		if (shardId == INVALID_SHARD_ID)
+		{
+			/* intermediate results are always colocated, so ignore */
+			continue;
+		}
+
+		CitusTableCacheEntry *tableEntry = LookupCitusTableCacheEntry(relationId);
+		if (tableEntry == NULL)
+		{
+			/* local tables never colocated */
+			return false;
+		}
+
+		CitusTableType currentTableType = GetCitusTableType(tableEntry);
+		if (currentTableType == REFERENCE_TABLE)
+		{
+			/*
+			 * Reference tables are always colocated so it is
+			 * safe to skip them.
+			 */
+			continue;
+		}
+		else if (IsCitusTableTypeCacheEntry(tableEntry, DISTRIBUTED_TABLE))
+		{
+			if (tableType == ANY_CITUS_TABLE_TYPE)
+			{
+				tableType = currentTableType;
+			}
+			else if (tableType != currentTableType)
+			{
+				/*
+				 * We cannot qualify different types of distributed tables
+				 * as colocated.
+				 */
+				return false;
+			}
+
+			if (currentTableType == RANGE_DISTRIBUTED ||
+				currentTableType == APPEND_DISTRIBUTED)
+			{
+				/* we do not have further strict colocation chceks */
+				continue;
+			}
+		}
+
+		int currentColocationId = TableColocationId(relationId);
+		if (colocationId == -1)
+		{
+			colocationId = currentColocationId;
+		}
+		else if (colocationId != currentColocationId)
+		{
+			return false;
+		}
+
+		int currentIndex = ShardIndex(LoadShardInterval(shardId));
+		if (shardIndex == -1)
+		{
+			shardIndex = currentIndex;
+		}
+		else if (shardIndex != currentIndex)
+		{
+			return false;
+		}
+	}
+
+	return true;
+}
+
+
+/*
  * ContainsOnlyLocalTables returns true if there is only
  * local tables and not any distributed or reference table.
  */
-static bool
+bool
 ContainsOnlyLocalTables(RTEListProperties *rteProperties)
 {
 	return !rteProperties->hasDistributedTable && !rteProperties->hasReferenceTable;
@@ -2683,7 +2796,7 @@ TargetShardIntervalForFastPathQuery(Query *query, bool *isMultiShardQuery,
 
 	if (!HasDistributionKey(relationId))
 	{
-		/* we don't need to do shard pruning for non-distributed tables */
+		/* we don't need to do shard pruning for single shard tables */
 		return list_make1(LoadShardIntervalList(relationId));
 	}
 
@@ -2973,7 +3086,7 @@ BuildRoutesForInsert(Query *query, DeferredErrorMessage **planningError)
 
 	Assert(query->commandType == CMD_INSERT);
 
-	/* reference tables and citus local tables can only have one shard */
+	/* tables that don't have distribution column can only have one shard */
 	if (!HasDistributionKeyCacheEntry(cacheEntry))
 	{
 		List *shardIntervalList = LoadShardIntervalList(distributedTableId);
@@ -2989,6 +3102,12 @@ BuildRoutesForInsert(Query *query, DeferredErrorMessage **planningError)
 			else if (IsCitusTableTypeCacheEntry(cacheEntry, CITUS_LOCAL_TABLE))
 			{
 				ereport(ERROR, (errmsg("local table cannot have %d shards",
+									   shardCount)));
+			}
+			else if (IsCitusTableTypeCacheEntry(cacheEntry, SINGLE_SHARD_DISTRIBUTED))
+			{
+				ereport(ERROR, (errmsg("distributed tables having a null shard key "
+									   "cannot have %d shards",
 									   shardCount)));
 			}
 		}
@@ -3722,23 +3841,12 @@ DeferErrorIfUnsupportedRouterPlannableSelectQuery(Query *query)
 							 NULL, NULL);
 	}
 
-	if (!EnableNonColocatedRouterQueryPushdown &&
-		!AllDistributedRelationsInListColocated(distributedRelationList))
-	{
-		return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
-							 "router planner does not support queries that "
-							 "reference non-colocated distributed tables",
-							 NULL, NULL);
-	}
-
-#if PG_VERSION_NUM >= PG_VERSION_14
 	DeferredErrorMessage *CTEWithSearchClauseError =
 		ErrorIfQueryHasCTEWithSearchClause(query);
 	if (CTEWithSearchClauseError != NULL)
 	{
 		return CTEWithSearchClauseError;
 	}
-#endif
 
 	return ErrorIfQueryHasUnroutableModifyingCTE(query);
 }
@@ -3848,7 +3956,8 @@ ErrorIfQueryHasUnroutableModifyingCTE(Query *queryTree)
 			CitusTableCacheEntry *modificationTableCacheEntry =
 				GetCitusTableCacheEntry(distributedTableId);
 
-			if (!HasDistributionKeyCacheEntry(modificationTableCacheEntry))
+			if (!IsCitusTableTypeCacheEntry(modificationTableCacheEntry,
+											DISTRIBUTED_TABLE))
 			{
 				return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
 									 "cannot router plan modification of a non-distributed table",
@@ -3872,8 +3981,6 @@ ErrorIfQueryHasUnroutableModifyingCTE(Query *queryTree)
 }
 
 
-#if PG_VERSION_NUM >= PG_VERSION_14
-
 /*
  * ErrorIfQueryHasCTEWithSearchClause checks if the query contains any common table
  * expressions with search clause and errors out if it does.
@@ -3881,7 +3988,7 @@ ErrorIfQueryHasUnroutableModifyingCTE(Query *queryTree)
 static DeferredErrorMessage *
 ErrorIfQueryHasCTEWithSearchClause(Query *queryTree)
 {
-	if (ContainsSearchClauseWalker((Node *) queryTree))
+	if (ContainsSearchClauseWalker((Node *) queryTree, NULL))
 	{
 		return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
 							 "CTEs with search clauses are not supported",
@@ -3896,7 +4003,7 @@ ErrorIfQueryHasCTEWithSearchClause(Query *queryTree)
  * CommonTableExprs with search clause
  */
 static bool
-ContainsSearchClauseWalker(Node *node)
+ContainsSearchClauseWalker(Node *node, void *context)
 {
 	if (node == NULL)
 	{
@@ -3918,9 +4025,6 @@ ContainsSearchClauseWalker(Node *node)
 
 	return expression_tree_walker(node, ContainsSearchClauseWalker, NULL);
 }
-
-
-#endif
 
 
 /*

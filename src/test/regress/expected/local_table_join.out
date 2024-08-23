@@ -86,7 +86,13 @@ CREATE FOREIGN TABLE foreign_table (
 CREATE MATERIALIZED VIEW mv1 AS SELECT * FROM postgres_table;
 CREATE MATERIALIZED VIEW mv2 AS SELECT * FROM distributed_table;
 SET client_min_messages TO DEBUG1;
--- the user doesn't allow local / distributed table joinn
+-- the user doesn't allow local / distributed table join
+SELECT master_remove_node('localhost', :master_port); -- https://github.com/citusdata/citus/issues/6958
+ master_remove_node
+---------------------------------------------------------------------
+
+(1 row)
+
 SET citus.local_table_join_policy TO 'never';
 SELECT count(*) FROM postgres_table JOIN distributed_table USING(key);
 ERROR:  direct joins between distributed and local tables are not supported
@@ -94,6 +100,12 @@ HINT:  Use CTE's or subqueries to select from local tables and use them in joins
 SELECT count(*) FROM postgres_table JOIN reference_table USING(key);
 ERROR:  direct joins between distributed and local tables are not supported
 HINT:  Use CTE's or subqueries to select from local tables and use them in joins
+SELECT citus_set_coordinator_host('localhost'); -- https://github.com/citusdata/citus/issues/6958
+ citus_set_coordinator_host
+---------------------------------------------------------------------
+
+(1 row)
+
 -- the user prefers local table recursively planned
 SET citus.local_table_join_policy TO 'prefer-local';
 SELECT count(*) FROM postgres_table JOIN distributed_table USING(key);
@@ -1358,9 +1370,6 @@ select typdefault from (
         select a from tbl
         where typdefault > 'a'
         limit 1) as subq_0
-    where (
-      select true as bool from pg_catalog.pg_am limit 1
-    )
   ) as subq_1
 ) as subq_2;
  typdefault
@@ -1388,15 +1397,11 @@ select typdefault from (
         select a from tbl
         where typdefault > 'a'
         limit 1) as subq_0
-    where (
-      select true as bool from pg_catalog.pg_am limit 1
-    )
   ) as subq_1
 ) as subq_2;
-DEBUG:  generating subplan XXX_1 for subquery SELECT true AS bool FROM pg_am LIMIT 1
 DEBUG:  Wrapping relation "custom_pg_type" to a subquery
-DEBUG:  generating subplan XXX_2 for subquery SELECT typdefault FROM local_table_join.custom_pg_type WHERE true
-DEBUG:  Plan XXX query after replacing subqueries and CTEs: SELECT typdefault FROM (SELECT subq_1.typdefault FROM (SELECT custom_pg_type.typdefault FROM (SELECT custom_pg_type_1.typdefault FROM (SELECT intermediate_result.typdefault FROM read_intermediate_result('XXX_2'::text, 'binary'::citus_copy_format) intermediate_result(typdefault text)) custom_pg_type_1) custom_pg_type, LATERAL (SELECT tbl.a FROM local_table_join.tbl WHERE (custom_pg_type.typdefault OPERATOR(pg_catalog.>) 'a'::text) LIMIT 1) subq_0 WHERE (SELECT intermediate_result.bool FROM read_intermediate_result('XXX_1'::text, 'binary'::citus_copy_format) intermediate_result(bool boolean))) subq_1) subq_2
+DEBUG:  generating subplan XXX_1 for subquery SELECT typdefault FROM local_table_join.custom_pg_type WHERE true
+DEBUG:  Plan XXX query after replacing subqueries and CTEs: SELECT typdefault FROM (SELECT subq_1.typdefault FROM (SELECT custom_pg_type.typdefault FROM (SELECT custom_pg_type_1.typdefault FROM (SELECT intermediate_result.typdefault FROM read_intermediate_result('XXX_1'::text, 'binary'::citus_copy_format) intermediate_result(typdefault text)) custom_pg_type_1) custom_pg_type, LATERAL (SELECT tbl.a FROM local_table_join.tbl WHERE (custom_pg_type.typdefault OPERATOR(pg_catalog.>) 'a'::text) LIMIT 1) subq_0) subq_1) subq_2
 ERROR:  cannot push down this subquery
 DETAIL:  Limit clause is currently unsupported when a lateral subquery references a column from complex subqueries, CTEs or local tables
 -- Not supported because of 4470
@@ -1586,6 +1591,12 @@ DEBUG:  Plan XXX query after replacing subqueries and CTEs: SELECT 1 AS res FROM
 (1 row)
 
 ROLLBACK;
+SELECT master_remove_node('localhost', :master_port); -- https://github.com/citusdata/citus/issues/6958
+ master_remove_node
+---------------------------------------------------------------------
+
+(1 row)
+
 BEGIN;
 SELECT create_reference_table('table1');
 NOTICE:  Copying data from local table...
@@ -1632,7 +1643,13 @@ DEBUG:  Plan XXX query after replacing subqueries and CTEs: SELECT 1 AS res FROM
 (1 row)
 
 ROLLBACK;
+SELECT citus_set_coordinator_host('localhost'); -- https://github.com/citusdata/citus/issues/6958
+ citus_set_coordinator_host
+---------------------------------------------------------------------
+
+(1 row)
+
 RESET client_min_messages;
 \set VERBOSITY terse
 DROP SCHEMA local_table_join CASCADE;
-NOTICE:  drop cascades to 22 other objects
+NOTICE:  drop cascades to 23 other objects

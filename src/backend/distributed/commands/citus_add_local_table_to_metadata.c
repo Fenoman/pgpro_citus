@@ -19,34 +19,37 @@
 
 #include "postgres.h"
 
+#include "miscadmin.h"
+
 #include "access/genam.h"
 #include "access/htup_details.h"
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_statistic_ext.h"
 #include "catalog/pg_trigger.h"
-#include "distributed/coordinator_protocol.h"
+#include "foreign/foreign.h"
+#include "utils/builtins.h"
+#include "utils/fmgroids.h"
+#include "utils/lsyscache.h"
+#include "utils/ruleutils.h"
+#include "utils/syscache.h"
+
 #include "distributed/citus_ruleutils.h"
 #include "distributed/colocation_utils.h"
 #include "distributed/commands.h"
 #include "distributed/commands/sequence.h"
 #include "distributed/commands/utility_hook.h"
-#include "distributed/metadata/distobject.h"
-#include "distributed/metadata/dependency.h"
+#include "distributed/coordinator_protocol.h"
 #include "distributed/foreign_key_relationship.h"
 #include "distributed/listutils.h"
 #include "distributed/local_executor.h"
+#include "distributed/metadata/dependency.h"
+#include "distributed/metadata/distobject.h"
 #include "distributed/metadata_sync.h"
 #include "distributed/multi_partitioning_utils.h"
 #include "distributed/namespace_utils.h"
 #include "distributed/reference_table_utils.h"
 #include "distributed/worker_protocol.h"
 #include "distributed/worker_shard_visibility.h"
-#include "utils/builtins.h"
-#include "utils/fmgroids.h"
-#include "utils/lsyscache.h"
-#include "utils/ruleutils.h"
-#include "utils/syscache.h"
-#include "foreign/foreign.h"
 
 
 /*
@@ -54,7 +57,7 @@
  * This is used after every CREATE TABLE statement in utility_hook.c
  * If this variable is set to true, we add all created tables to metadata.
  */
-bool AddAllLocalTablesToMetadata = true;
+bool AddAllLocalTablesToMetadata = false;
 
 static void citus_add_local_table_to_metadata_internal(Oid relationId,
 													   bool cascadeViaForeignKeys);
@@ -891,7 +894,7 @@ GetConstraintNameList(Oid relationId)
 	Relation pgConstraint = table_open(ConstraintRelationId, AccessShareLock);
 
 	ScanKeyInit(&scanKey[0], Anum_pg_constraint_conrelid,
-				BTEqualStrategyNumber, F_OIDEQ, relationId);
+				BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(relationId));
 
 	bool useIndex = true;
 	SysScanDesc scanDescriptor = systable_beginscan(pgConstraint,
@@ -1477,11 +1480,20 @@ InsertMetadataForCitusLocalTable(Oid citusLocalTableId, uint64 shardId,
 static void
 FinalizeCitusLocalTableCreation(Oid relationId)
 {
+#if PG_VERSION_NUM >= PG_VERSION_16
+
+	/*
+	 * PG16+ supports truncate triggers on foreign tables
+	 */
+	if (RegularTable(relationId) || IsForeignTable(relationId))
+#else
+
 	/*
 	 * If it is a foreign table, then skip creating citus truncate trigger
 	 * as foreign tables do not support truncate triggers.
 	 */
 	if (RegularTable(relationId))
+#endif
 	{
 		CreateTruncateTrigger(relationId);
 	}
@@ -1499,4 +1511,39 @@ FinalizeCitusLocalTableCreation(Oid relationId)
 	{
 		InvalidateForeignKeyGraph();
 	}
+}
+
+
+/*
+ * ShouldAddNewTableToMetadata takes a relationId and returns true if we need to add a
+ * newly created table to metadata, false otherwise.
+ * For partitions and temporary tables, ShouldAddNewTableToMetadata returns false.
+ * For other tables created, returns true, if we are on a coordinator that is added
+ * as worker, and ofcourse, if the GUC use_citus_managed_tables is set to on.
+ */
+bool
+ShouldAddNewTableToMetadata(Oid relationId)
+{
+	if (get_rel_persistence(relationId) == RELPERSISTENCE_TEMP ||
+		PartitionTableNoLock(relationId))
+	{
+		/*
+		 * Shouldn't add table to metadata if it's a temp table, or a partition.
+		 * Creating partitions of a table that is added to metadata is already handled.
+		 */
+		return false;
+	}
+
+	if (AddAllLocalTablesToMetadata && !IsBinaryUpgrade &&
+		IsCoordinator() && CoordinatorAddedAsWorkerNode())
+	{
+		/*
+		 * We have verified that the GUC is set to true, and we are not upgrading,
+		 * and we are on the coordinator that is added as worker node.
+		 * So return true here, to add this newly created table to metadata.
+		 */
+		return true;
+	}
+
+	return false;
 }

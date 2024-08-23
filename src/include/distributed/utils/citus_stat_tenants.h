@@ -15,20 +15,30 @@
 #include "executor/executor.h"
 #include "storage/lwlock.h"
 #include "utils/datetime.h"
+#include "utils/hsearch.h"
+
+#include "distributed/hash_helpers.h"
 
 #define MAX_TENANT_ATTRIBUTE_LENGTH 100
+
+/*
+ * Hashtable key that defines the identity of a hashtable entry.
+ * The key is the attribute value, e.g distribution column and the colocation group id of the tenant.
+ */
+typedef struct TenantStatsHashKey
+{
+	char tenantAttribute[MAX_TENANT_ATTRIBUTE_LENGTH];
+	int colocationGroupId;
+} TenantStatsHashKey;
+assert_valid_hash_key2(TenantStatsHashKey, tenantAttribute, colocationGroupId);
 
 /*
  * TenantStats is the struct that keeps statistics about one tenant.
  */
 typedef struct TenantStats
 {
-	/*
-	 * The attribute value, e.g distribution column, and colocation group id
-	 * of the tenant.
-	 */
-	char tenantAttribute[MAX_TENANT_ATTRIBUTE_LENGTH];
-	int colocationGroupId;
+	TenantStatsHashKey key;   /* hash key of entry - MUST BE FIRST */
+
 
 	/*
 	 * Number of SELECT queries this tenant ran in this and last periods.
@@ -70,8 +80,7 @@ typedef struct TenantStats
 	/*
 	 * Locks needed to update this tenant's statistics.
 	 */
-	NamedLWLockTranche namedLockTranche;
-	LWLock lock;
+	slock_t lock;
 } TenantStats;
 
 /*
@@ -89,12 +98,9 @@ typedef struct MultiTenantMonitor
 	LWLock lock;
 
 	/*
-	 * tenantCount is the number of items in the tenants array.
-	 * The total length of tenants array is set up at CreateSharedMemoryForMultiTenantMonitor
-	 * and is 3 * citus.stat_tenants_limit
+	 * The max length of tenants hashtable is 3 * citus.stat_tenants_limit
 	 */
-	int tenantCount;
-	TenantStats tenants[FLEXIBLE_ARRAY_MEMBER];
+	HTAB *tenants;
 } MultiTenantMonitor;
 
 typedef enum
@@ -116,5 +122,6 @@ extern int StatTenantsLogLevel;
 extern int StatTenantsPeriod;
 extern int StatTenantsLimit;
 extern int StatTenantsTrack;
+extern double StatTenantsSampleRateForNewTenants;
 
 #endif /*CITUS_ATTRIBUTE_H */

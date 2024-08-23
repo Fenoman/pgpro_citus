@@ -11,9 +11,10 @@
 #define QUERY_COLOCATION_CHECKER_H
 
 
-#include "distributed/distributed_planner.h"
 #include "nodes/parsenodes.h"
 #include "nodes/primnodes.h"
+
+#include "distributed/distributed_planner.h"
 
 
 /*
@@ -35,7 +36,8 @@ extern ColocatedJoinChecker CreateColocatedJoinChecker(Query *subquery,
 													   restrictionContext);
 extern bool SubqueryColocated(Query *subquery, ColocatedJoinChecker *context);
 extern Query * WrapRteRelationIntoSubquery(RangeTblEntry *rteRelation,
-										   List *requiredAttributes);
+										   List *requiredAttributes,
+										   RTEPermissionInfo *perminfo);
 extern List * CreateAllTargetListForRelation(Oid relationId, List *requiredAttributes);
 
 #endif /* QUERY_COLOCATION_CHECKER_H */

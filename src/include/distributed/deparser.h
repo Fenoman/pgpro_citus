@@ -15,10 +15,10 @@
 
 #include "postgres.h"
 
-#include "nodes/nodes.h"
-#include "nodes/parsenodes.h"
 #include "catalog/objectaddress.h"
 #include "lib/stringinfo.h"
+#include "nodes/nodes.h"
+#include "nodes/parsenodes.h"
 
 /* forward declarations for format_collate.c */
 /* Control flags for FormatCollateExtended, compatible with format_type_extended */
@@ -105,9 +105,24 @@ extern char * DeparseCreateSchemaStmt(Node *node);
 extern char * DeparseDropSchemaStmt(Node *node);
 extern char * DeparseGrantOnSchemaStmt(Node *stmt);
 extern char * DeparseAlterSchemaRenameStmt(Node *stmt);
+extern char * DeparseAlterSchemaOwnerStmt(Node *node);
 
 extern void AppendGrantPrivileges(StringInfo buf, GrantStmt *stmt);
 extern void AppendGrantGrantees(StringInfo buf, GrantStmt *stmt);
+extern void AppendWithGrantOption(StringInfo buf, GrantStmt *stmt);
+extern void AppendGrantOptionFor(StringInfo buf, GrantStmt *stmt);
+extern void AppendGrantRestrictAndCascadeForRoleSpec(StringInfo buf, DropBehavior
+													 behavior, bool isGrant);
+extern void AppendGrantRestrictAndCascade(StringInfo buf, GrantStmt *stmt);
+extern void AppendGrantedByInGrantForRoleSpec(StringInfo buf, RoleSpec *grantor, bool
+											  isGrant);
+extern void AppendGrantedByInGrant(StringInfo buf, GrantStmt *stmt);
+
+extern void AppendGrantSharedPrefix(StringInfo buf, GrantStmt *stmt);
+extern void AppendGrantSharedSuffix(StringInfo buf, GrantStmt *stmt);
+
+extern void AppendColumnNameList(StringInfo buf, List *columns);
+
 
 /* forward declarations for deparse_statistics_stmts.c */
 extern char * DeparseCreateStatisticsStmt(Node *node);
@@ -209,6 +224,9 @@ extern char * DeparseAlterExtensionStmt(Node *stmt);
 
 /* forward declarations for deparse_database_stmts.c */
 extern char * DeparseAlterDatabaseOwnerStmt(Node *node);
+extern char * DeparseGrantOnDatabaseStmt(Node *node);
+extern char * DeparseAlterDatabaseStmt(Node *node);
+extern char * DeparseAlterDatabaseRefreshCollStmt(Node *node);
 
 /* forward declaration for deparse_publication_stmts.c */
 extern char * DeparseCreatePublicationStmt(Node *stmt);

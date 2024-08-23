@@ -5,61 +5,62 @@
  * Copyright (c) Citus Data, Inc.
  */
 #include "postgres.h"
-#include "miscadmin.h"
-#include "funcapi.h"
-#include "utils/plancache.h"
 
+#include "funcapi.h"
+#include "miscadmin.h"
 
 #include "access/genam.h"
 #include "access/heapam.h"
 #include "access/htup.h"
 #include "access/htup_details.h"
 #include "access/skey.h"
-#include "access/skey.h"
 #include "access/tupmacs.h"
 #include "access/xact.h"
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
 #include "commands/sequence.h"
+#include "executor/spi.h"
+#include "lib/stringinfo.h"
+#include "postmaster/postmaster.h"
+#include "storage/bufmgr.h"
+#include "storage/fd.h"
+#include "storage/lmgr.h"
+#include "storage/lock.h"
+#include "utils/builtins.h"
+#include "utils/fmgroids.h"
+#include "utils/lsyscache.h"
+#include "utils/plancache.h"
+#include "utils/rel.h"
+#include "utils/relcache.h"
+
 #include "distributed/citus_acquire_lock.h"
 #include "distributed/citus_safe_lib.h"
 #include "distributed/colocation_utils.h"
 #include "distributed/commands.h"
 #include "distributed/commands/utility_hook.h"
 #include "distributed/connection_management.h"
-#include "distributed/maintenanced.h"
 #include "distributed/coordinator_protocol.h"
-#include "distributed/metadata_utility.h"
+#include "distributed/maintenanced.h"
 #include "distributed/metadata/distobject.h"
+#include "distributed/metadata/pg_dist_object.h"
 #include "distributed/metadata_cache.h"
 #include "distributed/metadata_sync.h"
+#include "distributed/metadata_utility.h"
 #include "distributed/multi_join_order.h"
+#include "distributed/multi_partitioning_utils.h"
 #include "distributed/multi_router_planner.h"
 #include "distributed/pg_dist_node.h"
+#include "distributed/pg_dist_node_metadata.h"
 #include "distributed/reference_table_utils.h"
 #include "distributed/remote_commands.h"
 #include "distributed/resource_lock.h"
 #include "distributed/shardinterval_utils.h"
-#include "distributed/multi_partitioning_utils.h"
 #include "distributed/shared_connection_stats.h"
 #include "distributed/string_utils.h"
-#include "distributed/metadata/pg_dist_object.h"
 #include "distributed/transaction_recovery.h"
 #include "distributed/version_compat.h"
 #include "distributed/worker_manager.h"
 #include "distributed/worker_transaction.h"
-#include "executor/spi.h"
-#include "lib/stringinfo.h"
-#include "postmaster/postmaster.h"
-#include "storage/bufmgr.h"
-#include "storage/lmgr.h"
-#include "storage/lock.h"
-#include "storage/fd.h"
-#include "utils/builtins.h"
-#include "utils/fmgroids.h"
-#include "utils/lsyscache.h"
-#include "utils/rel.h"
-#include "utils/relcache.h"
 
 #define INVALID_GROUP_ID -1
 
@@ -101,8 +102,8 @@ static HeapTuple GetNodeByNodeId(int32 nodeId);
 static int32 GetNextGroupId(void);
 static int GetNextNodeId(void);
 static void InsertPlaceholderCoordinatorRecord(void);
-static void InsertNodeRow(int nodeid, char *nodename, int32 nodeport, NodeMetadata
-						  *nodeMetadata);
+static void InsertNodeRow(int nodeid, char *nodename, int32 nodeport,
+						  NodeMetadata *nodeMetadata);
 static void DeleteNodeRow(char *nodename, int32 nodeport);
 static void BlockDistributedQueriesOnMetadataNodes(void);
 static WorkerNode * TupleToWorkerNode(TupleDesc tupleDescriptor, HeapTuple heapTuple);
@@ -119,7 +120,6 @@ static char * NodeMetadataSyncedUpdateCommand(uint32 nodeId, bool metadataSynced
 static void ErrorIfCoordinatorMetadataSetFalse(WorkerNode *workerNode, Datum value,
 											   char *field);
 static WorkerNode * SetShouldHaveShards(WorkerNode *workerNode, bool shouldHaveShards);
-static int FindCoordinatorNodeId(void);
 static WorkerNode * FindNodeAnyClusterByNodeId(uint32 nodeId);
 static void ErrorIfAnyNodeNotExist(List *nodeList);
 static void UpdateLocalGroupIdsViaMetadataContext(MetadataSyncContext *context);
@@ -134,6 +134,13 @@ static void MarkNodesNotSyncedInLoopBackConnection(MetadataSyncContext *context,
 static void EnsureParentSessionHasExclusiveLockOnPgDistNode(pid_t parentSessionPid);
 static void SetNodeMetadata(MetadataSyncContext *context, bool localOnly);
 static void EnsureTransactionalMetadataSyncMode(void);
+static void LockShardsInWorkerPlacementList(WorkerNode *workerNode, LOCKMODE
+											lockMode);
+static BackgroundWorkerHandle * CheckBackgroundWorkerToObtainLocks(int32 lock_cooldown);
+static BackgroundWorkerHandle * LockPlacementsWithBackgroundWorkersInPrimaryNode(
+	WorkerNode *workerNode, bool force, int32 lock_cooldown);
+
+/* Function definitions go here */
 
 /* declarations for dynamic loading */
 PG_FUNCTION_INFO_V1(citus_set_coordinator_host);
@@ -152,6 +159,7 @@ PG_FUNCTION_INFO_V1(master_disable_node);
 PG_FUNCTION_INFO_V1(citus_activate_node);
 PG_FUNCTION_INFO_V1(master_activate_node);
 PG_FUNCTION_INFO_V1(citus_update_node);
+PG_FUNCTION_INFO_V1(citus_pause_node_within_txn);
 PG_FUNCTION_INFO_V1(master_update_node);
 PG_FUNCTION_INFO_V1(get_shard_id_for_distribution_column);
 PG_FUNCTION_INFO_V1(citus_nodename_for_nodeid);
@@ -159,7 +167,6 @@ PG_FUNCTION_INFO_V1(citus_nodeport_for_nodeid);
 PG_FUNCTION_INFO_V1(citus_coordinator_nodeid);
 PG_FUNCTION_INFO_V1(citus_is_coordinator);
 PG_FUNCTION_INFO_V1(citus_internal_mark_node_not_synced);
-
 
 /*
  * DefaultNodeMetadata creates a NodeMetadata struct with the fields set to
@@ -500,7 +507,13 @@ citus_disable_node(PG_FUNCTION_ARGS)
 {
 	text *nodeNameText = PG_GETARG_TEXT_P(0);
 	int32 nodePort = PG_GETARG_INT32(1);
-	bool synchronousDisableNode = PG_GETARG_BOOL(2);
+
+	bool synchronousDisableNode = 1;
+	Assert(PG_NARGS() == 2 || PG_NARGS() == 3);
+	if (PG_NARGS() == 3)
+	{
+		synchronousDisableNode = PG_GETARG_BOOL(2);
+	}
 
 	char *nodeName = text_to_cstring(nodeNameText);
 	WorkerNode *workerNode = ModifiableWorkerNode(nodeName, nodePort);
@@ -544,7 +557,8 @@ citus_disable_node(PG_FUNCTION_ARGS)
 							   "metadata is not allowed"),
 						errhint("You can force disabling node, SELECT "
 								"citus_disable_node('%s', %d, "
-								"synchronous:=true);", workerNode->workerName,
+								"synchronous:=true);",
+								workerNode->workerName,
 								nodePort),
 						errdetail("Citus uses the first worker node in the "
 								  "metadata for certain internal operations when "
@@ -693,8 +707,7 @@ citus_set_node_property(PG_FUNCTION_ARGS)
 	else
 	{
 		ereport(ERROR, (errmsg(
-							"only the 'shouldhaveshards' property can be set using this function"
-							)));
+							"only the 'shouldhaveshards' property can be set using this function")));
 	}
 
 	TransactionModifiedNodeMetadata = true;
@@ -1161,6 +1174,100 @@ ActivateNodeList(MetadataSyncContext *context)
 
 
 /*
+ * Acquires shard metadata locks on all shards residing in the given worker node
+ *
+ * TODO: This function is not compatible with query from any node feature.
+ * To ensure proper behavior, it is essential to acquire locks on placements across all nodes
+ * rather than limiting it to just the coordinator (or the specific node from which this function is called)
+ */
+void
+LockShardsInWorkerPlacementList(WorkerNode *workerNode, LOCKMODE lockMode)
+{
+	List *placementList = AllShardPlacementsOnNodeGroup(workerNode->groupId);
+	LockShardsInPlacementListMetadata(placementList, lockMode);
+}
+
+
+/*
+ * This function is used to start a background worker to kill backends holding conflicting
+ * locks with this backend. It returns NULL if the background worker could not be started.
+ */
+BackgroundWorkerHandle *
+CheckBackgroundWorkerToObtainLocks(int32 lock_cooldown)
+{
+	BackgroundWorkerHandle *handle = StartLockAcquireHelperBackgroundWorker(MyProcPid,
+																			lock_cooldown);
+	if (!handle)
+	{
+		/*
+		 * We failed to start a background worker, which probably means that we exceeded
+		 * max_worker_processes, and this is unlikely to be resolved by retrying. We do not want
+		 * to repeatedly throw an error because if citus_update_node is called to complete a
+		 * failover then finishing is the only way to bring the cluster back up. Therefore we
+		 * give up on killing other backends and simply wait for the lock. We do set
+		 * lock_timeout to lock_cooldown, because we don't want to wait forever to get a lock.
+		 */
+		SetLockTimeoutLocally(lock_cooldown);
+		ereport(WARNING, (errmsg(
+							  "could not start background worker to kill backends with conflicting"
+							  " locks to force the update. Degrading to acquiring locks "
+							  "with a lock time out."),
+						  errhint(
+							  "Increasing max_worker_processes might help.")));
+	}
+	return handle;
+}
+
+
+/*
+ * This function is used to lock shards in a primary node.
+ * If force is true, we start a background worker to kill backends holding
+ * conflicting locks with this backend.
+ *
+ * If the node is a primary node we block reads and writes.
+ *
+ * This lock has two purposes:
+ *
+ * - Ensure buggy code in Citus doesn't cause failures when the
+ *   nodename/nodeport of a node changes mid-query
+ *
+ * - Provide fencing during failover, after this function returns all
+ *   connections will use the new node location.
+ *
+ * Drawback:
+ *
+ * - This function blocks until all previous queries have finished. This
+ *   means that long-running queries will prevent failover.
+ *
+ *   In case of node failure said long-running queries will fail in the end
+ *   anyway as they will be unable to commit successfully on the failed
+ *   machine. To cause quick failure of these queries use force => true
+ *   during the invocation of citus_update_node to terminate conflicting
+ *   backends proactively.
+ *
+ * It might be worth blocking reads to a secondary for the same reasons,
+ * though we currently only query secondaries on follower clusters
+ * where these locks will have no effect.
+ */
+BackgroundWorkerHandle *
+LockPlacementsWithBackgroundWorkersInPrimaryNode(WorkerNode *workerNode, bool force, int32
+												 lock_cooldown)
+{
+	BackgroundWorkerHandle *handle = NULL;
+
+	if (NodeIsPrimary(workerNode))
+	{
+		if (force)
+		{
+			handle = CheckBackgroundWorkerToObtainLocks(lock_cooldown);
+		}
+		LockShardsInWorkerPlacementList(workerNode, AccessExclusiveLock);
+	}
+	return handle;
+}
+
+
+/*
  * citus_update_node moves the requested node to a different nodename and nodeport. It
  * locks to ensure no queries are running concurrently; and is intended for customers who
  * are running their own failover solution.
@@ -1188,8 +1295,6 @@ citus_update_node(PG_FUNCTION_ARGS)
 	int32 lock_cooldown = PG_GETARG_INT32(4);
 
 	char *newNodeNameString = text_to_cstring(newNodeName);
-	List *placementList = NIL;
-	BackgroundWorkerHandle *handle = NULL;
 
 	WorkerNode *workerNodeWithSameAddress = FindWorkerNodeAnyCluster(newNodeNameString,
 																	 newNodePort);
@@ -1226,64 +1331,9 @@ citus_update_node(PG_FUNCTION_ARGS)
 		EnsureTransactionalMetadataSyncMode();
 	}
 
-	/*
-	 * If the node is a primary node we block reads and writes.
-	 *
-	 * This lock has two purposes:
-	 *
-	 * - Ensure buggy code in Citus doesn't cause failures when the
-	 *   nodename/nodeport of a node changes mid-query
-	 *
-	 * - Provide fencing during failover, after this function returns all
-	 *   connections will use the new node location.
-	 *
-	 * Drawback:
-	 *
-	 * - This function blocks until all previous queries have finished. This
-	 *   means that long-running queries will prevent failover.
-	 *
-	 *   In case of node failure said long-running queries will fail in the end
-	 *   anyway as they will be unable to commit successfully on the failed
-	 *   machine. To cause quick failure of these queries use force => true
-	 *   during the invocation of citus_update_node to terminate conflicting
-	 *   backends proactively.
-	 *
-	 * It might be worth blocking reads to a secondary for the same reasons,
-	 * though we currently only query secondaries on follower clusters
-	 * where these locks will have no effect.
-	 */
-	if (NodeIsPrimary(workerNode))
-	{
-		/*
-		 * before acquiring the locks check if we want a background worker to help us to
-		 * aggressively obtain the locks.
-		 */
-		if (force)
-		{
-			handle = StartLockAcquireHelperBackgroundWorker(MyProcPid, lock_cooldown);
-			if (!handle)
-			{
-				/*
-				 * We failed to start a background worker, which probably means that we exceeded
-				 * max_worker_processes, and this is unlikely to be resolved by retrying. We do not want
-				 * to repeatedly throw an error because if citus_update_node is called to complete a
-				 * failover then finishing is the only way to bring the cluster back up. Therefore we
-				 * give up on killing other backends and simply wait for the lock. We do set
-				 * lock_timeout to lock_cooldown, because we don't want to wait forever to get a lock.
-				 */
-				SetLockTimeoutLocally(lock_cooldown);
-				ereport(WARNING, (errmsg(
-									  "could not start background worker to kill backends with conflicting"
-									  " locks to force the update. Degrading to acquiring locks "
-									  "with a lock time out."),
-								  errhint(
-									  "Increasing max_worker_processes might help.")));
-			}
-		}
-
-		placementList = AllShardPlacementsOnNodeGroup(workerNode->groupId);
-		LockShardsInPlacementListMetadata(placementList, AccessExclusiveLock);
-	}
+	BackgroundWorkerHandle *handle = LockPlacementsWithBackgroundWorkersInPrimaryNode(
+		workerNode, force,
+		lock_cooldown);
 
 	/*
 	 * if we have planned statements such as prepared statements, we should clear the cache so that
@@ -1325,6 +1375,34 @@ citus_update_node(PG_FUNCTION_ARGS)
 	}
 
 	TransactionModifiedNodeMetadata = true;
+
+	PG_RETURN_VOID();
+}
+
+
+/*
+ * This function is designed to obtain locks for all the shards in a worker placement list.
+ * Once the transaction is committed, the acquired locks will be automatically released.
+ * Therefore, it is essential to invoke this function within a transaction.
+ * This function proves beneficial when there is a need to temporarily disable writes to a specific node within a transaction.
+ */
+Datum
+citus_pause_node_within_txn(PG_FUNCTION_ARGS)
+{
+	CheckCitusVersion(ERROR);
+
+	int32 nodeId = PG_GETARG_INT32(0);
+	bool force = PG_GETARG_BOOL(1);
+	int32 lock_cooldown = PG_GETARG_INT32(2);
+
+	WorkerNode *workerNode = FindNodeAnyClusterByNodeId(nodeId);
+	if (workerNode == NULL)
+	{
+		ereport(ERROR, (errcode(ERRCODE_NO_DATA_FOUND),
+						errmsg("node %u not found", nodeId)));
+	}
+
+	LockPlacementsWithBackgroundWorkersInPrimaryNode(workerNode, force, lock_cooldown);
 
 	PG_RETURN_VOID();
 }
@@ -1800,7 +1878,7 @@ FindNodeWithNodeId(int nodeId, bool missingOk)
 /*
  * FindCoordinatorNodeId returns the node id of the coordinator node
  */
-static int
+int
 FindCoordinatorNodeId()
 {
 	bool includeNodesFromOtherClusters = false;
@@ -1947,7 +2025,8 @@ ErrorIfNodeContainsNonRemovablePlacements(WorkerNode *workerNode)
 			ereport(ERROR, (errmsg("cannot remove or disable the node "
 								   "%s:%d because because it contains "
 								   "the only shard placement for "
-								   "shard " UINT64_FORMAT, workerNode->workerName,
+								   "shard " UINT64_FORMAT,
+								   workerNode->workerName,
 								   workerNode->workerPort, placement->shardId),
 							errdetail("One of the table(s) that prevents the operation "
 									  "complete successfully is %s",
@@ -2499,7 +2578,8 @@ ErrorIfCoordinatorMetadataSetFalse(WorkerNode *workerNode, Datum value, char *fi
 	if (!valueBool && workerNode->groupId == COORDINATOR_GROUP_ID)
 	{
 		ereport(ERROR, (errmsg("cannot change \"%s\" field of the "
-							   "coordinator node", field)));
+							   "coordinator node",
+							   field)));
 	}
 }
 
@@ -2871,15 +2951,15 @@ TupleToWorkerNode(TupleDesc tupleDescriptor, HeapTuple heapTuple)
 	 */
 	heap_deform_tuple(heapTuple, tupleDescriptor, datumArray, isNullArray);
 
-	char *nodeName = DatumGetCString(datumArray[Anum_pg_dist_node_nodename - 1]);
-	char *nodeRack = DatumGetCString(datumArray[Anum_pg_dist_node_noderack - 1]);
+	char *nodeName = TextDatumGetCString(datumArray[Anum_pg_dist_node_nodename - 1]);
+	char *nodeRack = TextDatumGetCString(datumArray[Anum_pg_dist_node_noderack - 1]);
 
 	WorkerNode *workerNode = (WorkerNode *) palloc0(sizeof(WorkerNode));
 	workerNode->nodeId = DatumGetUInt32(datumArray[Anum_pg_dist_node_nodeid - 1]);
 	workerNode->workerPort = DatumGetUInt32(datumArray[Anum_pg_dist_node_nodeport - 1]);
 	workerNode->groupId = DatumGetInt32(datumArray[Anum_pg_dist_node_groupid - 1]);
-	strlcpy(workerNode->workerName, TextDatumGetCString(nodeName), WORKER_LENGTH);
-	strlcpy(workerNode->workerRack, TextDatumGetCString(nodeRack), WORKER_LENGTH);
+	strlcpy(workerNode->workerName, nodeName, WORKER_LENGTH);
+	strlcpy(workerNode->workerRack, nodeRack, WORKER_LENGTH);
 	workerNode->hasMetadata = DatumGetBool(datumArray[Anum_pg_dist_node_hasmetadata - 1]);
 	workerNode->metadataSynced =
 		DatumGetBool(datumArray[Anum_pg_dist_node_metadatasynced - 1]);

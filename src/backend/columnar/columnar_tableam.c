@@ -1,41 +1,38 @@
-#include "citus_version.h"
+#include <math.h>
 
 #include "postgres.h"
 
-#include <math.h>
-
 #include "miscadmin.h"
+#include "pgstat.h"
+#include "safe_lib.h"
 
+#include "access/detoast.h"
 #include "access/genam.h"
 #include "access/heapam.h"
 #include "access/multixact.h"
 #include "access/rewriteheap.h"
 #include "access/tableam.h"
 #include "access/tsmapi.h"
-#include "access/detoast.h"
 #include "access/xact.h"
 #include "catalog/catalog.h"
 #include "catalog/index.h"
 #include "catalog/namespace.h"
 #include "catalog/objectaccess.h"
 #include "catalog/pg_am.h"
+#include "catalog/pg_extension.h"
 #include "catalog/pg_publication.h"
 #include "catalog/pg_trigger.h"
-#include "catalog/pg_extension.h"
 #include "catalog/storage.h"
 #include "catalog/storage_xlog.h"
 #include "commands/defrem.h"
+#include "commands/extension.h"
 #include "commands/progress.h"
 #include "commands/vacuum.h"
-#include "commands/extension.h"
 #include "executor/executor.h"
 #include "nodes/makefuncs.h"
 #include "optimizer/plancat.h"
-#include "pgstat.h"
-#include "safe_lib.h"
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
-#include "storage/bufmgr.h"
 #include "storage/lmgr.h"
 #include "storage/predicate.h"
 #include "storage/procarray.h"
@@ -43,17 +40,22 @@
 #include "tcop/utility.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
+#include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/pg_rusage.h"
 #include "utils/rel.h"
 #include "utils/relcache.h"
-#include "utils/lsyscache.h"
 #include "utils/syscache.h"
+
+#include "citus_version.h"
+#include "pg_version_compat.h"
+
 #include "columnar/columnar.h"
 #include "columnar/columnar_customscan.h"
 #include "columnar/columnar_storage.h"
 #include "columnar/columnar_tableam.h"
 #include "columnar/columnar_version_compat.h"
+
 #include "distributed/listutils.h"
 
 /*
@@ -115,9 +117,7 @@ static RangeVar * ColumnarProcessAlterTable(AlterTableStmt *alterTableStmt,
 											List **columnarOptions);
 static void ColumnarProcessUtility(PlannedStmt *pstmt,
 								   const char *queryString,
-#if PG_VERSION_NUM >= PG_VERSION_14
 								   bool readOnlyTree,
-#endif
 								   ProcessUtilityContext context,
 								   ParamListInfo params,
 								   struct QueryEnvironment *queryEnv,
@@ -208,7 +208,8 @@ columnar_beginscan_extended(Relation relation, Snapshot snapshot,
 							uint32 flags, Bitmapset *attr_needed, List *scanQual)
 {
 	CheckCitusColumnarVersion(ERROR);
-	Oid relfilenode = relation->rd_node.relNode;
+	RelFileNumber relfilenumber = RelationPhysicalIdentifierNumber_compat(
+		RelationPhysicalIdentifier_compat(relation));
 
 	/*
 	 * A memory context to use for scan-wide data, including the lazily
@@ -238,7 +239,7 @@ columnar_beginscan_extended(Relation relation, Snapshot snapshot,
 	scan->scanQual = copyObject(scanQual);
 	scan->scanContext = scanContext;
 
-	if (PendingWritesInUpperTransactions(relfilenode, GetCurrentSubTransactionId()))
+	if (PendingWritesInUpperTransactions(relfilenumber, GetCurrentSubTransactionId()))
 	{
 		elog(ERROR,
 			 "cannot read from table when there is unflushed data in upper transactions");
@@ -434,8 +435,9 @@ columnar_index_fetch_begin(Relation rel)
 {
 	CheckCitusColumnarVersion(ERROR);
 
-	Oid relfilenode = rel->rd_node.relNode;
-	if (PendingWritesInUpperTransactions(relfilenode, GetCurrentSubTransactionId()))
+	RelFileNumber relfilenumber = RelationPhysicalIdentifierNumber_compat(
+		RelationPhysicalIdentifier_compat(rel));
+	if (PendingWritesInUpperTransactions(relfilenumber, GetCurrentSubTransactionId()))
 	{
 		/* XXX: maybe we can just flush the data and continue */
 		elog(ERROR, "cannot read from index when there is unflushed data in "
@@ -665,7 +667,6 @@ columnar_tuple_satisfies_snapshot(Relation rel, TupleTableSlot *slot,
 }
 
 
-#if PG_VERSION_NUM >= PG_VERSION_14
 static TransactionId
 columnar_index_delete_tuples(Relation rel,
 							 TM_IndexDeleteOp *delstate)
@@ -712,19 +713,6 @@ columnar_index_delete_tuples(Relation rel,
 		elog(ERROR, "columnar_index_delete_tuples not implemented for simple deletion");
 	}
 }
-
-
-#else
-static TransactionId
-columnar_compute_xid_horizon_for_tuples(Relation rel,
-										ItemPointerData *tids,
-										int nitems)
-{
-	elog(ERROR, "columnar_compute_xid_horizon_for_tuples not implemented");
-}
-
-
-#endif
 
 
 static void
@@ -831,7 +819,7 @@ static TM_Result
 columnar_tuple_update(Relation relation, ItemPointer otid, TupleTableSlot *slot,
 					  CommandId cid, Snapshot snapshot, Snapshot crosscheck,
 					  bool wait, TM_FailureData *tmfd,
-					  LockTupleMode *lockmode, bool *update_indexes)
+					  LockTupleMode *lockmode, TU_UpdateIndexes *update_indexes)
 {
 	elog(ERROR, "columnar_tuple_update not implemented");
 }
@@ -857,11 +845,11 @@ columnar_finish_bulk_insert(Relation relation, int options)
 
 
 static void
-columnar_relation_set_new_filenode(Relation rel,
-								   const RelFileNode *newrnode,
-								   char persistence,
-								   TransactionId *freezeXid,
-								   MultiXactId *minmulti)
+columnar_relation_set_new_filelocator(Relation rel,
+									  const RelFileLocator *newrlocator,
+									  char persistence,
+									  TransactionId *freezeXid,
+									  MultiXactId *minmulti)
 {
 	CheckCitusColumnarVersion(ERROR);
 
@@ -877,16 +865,19 @@ columnar_relation_set_new_filenode(Relation rel,
 	 * state. If they are equal, this is a new relation object and we don't
 	 * need to clean anything.
 	 */
-	if (rel->rd_node.relNode != newrnode->relNode)
+	if (RelationPhysicalIdentifierNumber_compat(RelationPhysicalIdentifier_compat(rel)) !=
+		RelationPhysicalIdentifierNumberPtr_compat(newrlocator))
 	{
-		MarkRelfilenodeDropped(rel->rd_node.relNode, GetCurrentSubTransactionId());
+		MarkRelfilenumberDropped(RelationPhysicalIdentifierNumber_compat(
+									 RelationPhysicalIdentifier_compat(rel)),
+								 GetCurrentSubTransactionId());
 
-		DeleteMetadataRows(rel->rd_node);
+		DeleteMetadataRows(RelationPhysicalIdentifier_compat(rel));
 	}
 
 	*freezeXid = RecentXmin;
 	*minmulti = GetOldestMultiXactId();
-	SMgrRelation srel = RelationCreateStorage_compat(*newrnode, persistence, true);
+	SMgrRelation srel = RelationCreateStorage_compat(*newrlocator, persistence, true);
 
 	ColumnarStorageInit(srel, ColumnarMetadataNewStorageId());
 	InitColumnarOptions(rel->rd_id);
@@ -901,12 +892,12 @@ static void
 columnar_relation_nontransactional_truncate(Relation rel)
 {
 	CheckCitusColumnarVersion(ERROR);
-	RelFileNode relfilenode = rel->rd_node;
+	RelFileLocator relfilelocator = RelationPhysicalIdentifier_compat(rel);
 
-	NonTransactionDropWriteState(relfilenode.relNode);
+	NonTransactionDropWriteState(RelationPhysicalIdentifierNumber_compat(relfilelocator));
 
 	/* Delete old relfilenode metadata */
-	DeleteMetadataRows(relfilenode);
+	DeleteMetadataRows(relfilelocator);
 
 	/*
 	 * No need to set new relfilenode, since the table was created in this
@@ -923,7 +914,7 @@ columnar_relation_nontransactional_truncate(Relation rel)
 
 
 static void
-columnar_relation_copy_data(Relation rel, const RelFileNode *newrnode)
+columnar_relation_copy_data(Relation rel, const RelFileLocator *newrnode)
 {
 	elog(ERROR, "columnar_relation_copy_data not implemented");
 }
@@ -969,7 +960,8 @@ columnar_relation_copy_for_cluster(Relation OldHeap, Relation NewHeap,
 	ColumnarOptions columnarOptions = { 0 };
 	ReadColumnarOptions(OldHeap->rd_id, &columnarOptions);
 
-	ColumnarWriteState *writeState = ColumnarBeginWrite(NewHeap->rd_node,
+	ColumnarWriteState *writeState = ColumnarBeginWrite(RelationPhysicalIdentifier_compat(
+															NewHeap),
 														columnarOptions,
 														targetDesc);
 
@@ -1044,7 +1036,8 @@ NeededColumnsList(TupleDesc tupdesc, Bitmapset *attr_needed)
 static uint64
 ColumnarTableTupleCount(Relation relation)
 {
-	List *stripeList = StripesForRelfilenode(relation->rd_node);
+	List *stripeList = StripesForRelfilelocator(RelationPhysicalIdentifier_compat(
+													relation));
 	uint64 tupleCount = 0;
 
 	ListCell *lc = NULL;
@@ -1107,12 +1100,38 @@ columnar_vacuum_rel(Relation rel, VacuumParams *params,
 	List *indexList = RelationGetIndexList(rel);
 	int nindexes = list_length(indexList);
 
+#if PG_VERSION_NUM >= PG_VERSION_16
+	struct VacuumCutoffs cutoffs;
+	vacuum_get_cutoffs(rel, params, &cutoffs);
+
+	Assert(MultiXactIdPrecedesOrEquals(cutoffs.MultiXactCutoff, cutoffs.OldestMxact));
+	Assert(TransactionIdPrecedesOrEquals(cutoffs.FreezeLimit, cutoffs.OldestXmin));
+
+	/*
+	 * Columnar storage doesn't hold any transaction IDs, so we can always
+	 * just advance to the most aggressive value.
+	 */
+	TransactionId newRelFrozenXid = cutoffs.OldestXmin;
+	MultiXactId newRelminMxid = cutoffs.OldestMxact;
+	double new_live_tuples = ColumnarTableTupleCount(rel);
+
+	/* all visible pages are always 0 */
+	BlockNumber new_rel_allvisible = 0;
+
+	bool frozenxid_updated;
+	bool minmulti_updated;
+
+	vac_update_relstats(rel, new_rel_pages, new_live_tuples,
+						new_rel_allvisible, nindexes > 0,
+						newRelFrozenXid, newRelminMxid,
+						&frozenxid_updated, &minmulti_updated, false);
+#else
 	TransactionId oldestXmin;
 	TransactionId freezeLimit;
 	MultiXactId multiXactCutoff;
 
 	/* initialize xids */
-#if PG_VERSION_NUM >= PG_VERSION_15
+#if (PG_VERSION_NUM >= PG_VERSION_15) && (PG_VERSION_NUM < PG_VERSION_16)
 	MultiXactId oldestMxact;
 	vacuum_set_xid_limits(rel,
 						  params->freeze_min_age,
@@ -1142,7 +1161,7 @@ columnar_vacuum_rel(Relation rel, VacuumParams *params,
 	 * just advance to the most aggressive value.
 	 */
 	TransactionId newRelFrozenXid = oldestXmin;
-#if PG_VERSION_NUM >= PG_VERSION_15
+#if (PG_VERSION_NUM >= PG_VERSION_15) && (PG_VERSION_NUM < PG_VERSION_16)
 	MultiXactId newRelminMxid = oldestMxact;
 #else
 	MultiXactId newRelminMxid = multiXactCutoff;
@@ -1153,7 +1172,7 @@ columnar_vacuum_rel(Relation rel, VacuumParams *params,
 	/* all visible pages are always 0 */
 	BlockNumber new_rel_allvisible = 0;
 
-#if PG_VERSION_NUM >= PG_VERSION_15
+#if (PG_VERSION_NUM >= PG_VERSION_15) && (PG_VERSION_NUM < PG_VERSION_16)
 	bool frozenxid_updated;
 	bool minmulti_updated;
 
@@ -1166,11 +1185,12 @@ columnar_vacuum_rel(Relation rel, VacuumParams *params,
 						new_rel_allvisible, nindexes > 0,
 						newRelFrozenXid, newRelminMxid, false);
 #endif
-	ExtVacReport vac;
+#endif
+
 	pgstat_report_vacuum(RelationGetRelid(rel),
 						 rel->rd_rel->relisshared,
 						 Max(new_live_tuples, 0),
-						 0, &vac);
+						 0);
 	pgstat_progress_end_command();
 }
 
@@ -1182,7 +1202,7 @@ static void
 LogRelationStats(Relation rel, int elevel)
 {
 	ListCell *stripeMetadataCell = NULL;
-	RelFileNode relfilenode = rel->rd_node;
+	RelFileLocator relfilelocator = RelationPhysicalIdentifier_compat(rel);
 	StringInfo infoBuf = makeStringInfo();
 
 	int compressionStats[COMPRESSION_COUNT] = { 0 };
@@ -1193,13 +1213,13 @@ LogRelationStats(Relation rel, int elevel)
 	uint64 droppedChunksWithData = 0;
 	uint64 totalDecompressedLength = 0;
 
-	List *stripeList = StripesForRelfilenode(relfilenode);
+	List *stripeList = StripesForRelfilelocator(relfilelocator);
 	int stripeCount = list_length(stripeList);
 
 	foreach(stripeMetadataCell, stripeList)
 	{
 		StripeMetadata *stripe = lfirst(stripeMetadataCell);
-		StripeSkipList *skiplist = ReadStripeSkipList(relfilenode, stripe->id,
+		StripeSkipList *skiplist = ReadStripeSkipList(relfilelocator, stripe->id,
 													  RelationGetDescr(rel),
 													  stripe->chunkCount,
 													  GetTransactionSnapshot());
@@ -1335,7 +1355,8 @@ TruncateColumnar(Relation rel, int elevel)
 	 * new stripes be added beyond highestPhysicalAddress while
 	 * we're truncating.
 	 */
-	uint64 newDataReservation = Max(GetHighestUsedAddress(rel->rd_node) + 1,
+	uint64 newDataReservation = Max(GetHighestUsedAddress(
+										RelationPhysicalIdentifier_compat(rel)) + 1,
 									ColumnarFirstLogicalOffset);
 
 	BlockNumber old_rel_pages = smgrnblocks(RelationGetSmgr(rel), MAIN_FORKNUM);
@@ -1484,8 +1505,7 @@ columnar_index_build_range_scan(Relation columnarRelation,
 	if (!IsBootstrapProcessingMode() && !indexInfo->ii_Concurrent)
 	{
 		/* ignore lazy VACUUM's */
-		OldestXmin = GetOldestNonRemovableTransactionId_compat(columnarRelation,
-															   PROCARRAY_FLAGS_VACUUM);
+		OldestXmin = GetOldestNonRemovableTransactionId(columnarRelation);
 	}
 
 	Snapshot snapshot = { 0 };
@@ -1813,8 +1833,8 @@ ColumnarReadMissingRowsIntoIndex(TableScanDesc scan, Relation indexRelation,
 		Relation columnarRelation = scan->rs_rd;
 		IndexUniqueCheck indexUniqueCheck =
 			indexInfo->ii_Unique ? UNIQUE_CHECK_YES : UNIQUE_CHECK_NO;
-		index_insert_compat(indexRelation, indexValues, indexNulls, columnarItemPointer,
-							columnarRelation, indexUniqueCheck, false, indexInfo);
+		index_insert(indexRelation, indexValues, indexNulls, columnarItemPointer,
+					 columnarRelation, indexUniqueCheck, false, indexInfo);
 
 		validateIndexState->tups_inserted += 1;
 	}
@@ -1843,8 +1863,8 @@ TupleSortSkipSmallerItemPointers(Tuplesortstate *tupleSort, ItemPointer targetIt
 		Datum *abbrev = NULL;
 		Datum tsDatum;
 		bool tsDatumIsNull;
-		if (!tuplesort_getdatum(tupleSort, forwardDirection, &tsDatum,
-								&tsDatumIsNull, abbrev))
+		if (!tuplesort_getdatum_compat(tupleSort, forwardDirection, false,
+									   &tsDatum, &tsDatumIsNull, abbrev))
 		{
 			ItemPointerSetInvalid(&tsItemPointerData);
 			break;
@@ -2018,7 +2038,7 @@ columnar_tableam_init()
 		&EnableVersionChecksColumnar,
 		true,
 		PGC_USERSET,
-		GUC_NO_SHOW_ALL,
+		GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE,
 		NULL, NULL, NULL);
 }
 
@@ -2085,12 +2105,13 @@ ColumnarTableDropHook(Oid relid)
 		 * tableam tables storage is managed by postgres.
 		 */
 		Relation rel = table_open(relid, AccessExclusiveLock);
-		RelFileNode relfilenode = rel->rd_node;
+		RelFileLocator relfilelocator = RelationPhysicalIdentifier_compat(rel);
 
-		DeleteMetadataRows(relfilenode);
+		DeleteMetadataRows(relfilelocator);
 		DeleteColumnarTableOptions(rel->rd_id, true);
 
-		MarkRelfilenodeDropped(relfilenode.relNode, GetCurrentSubTransactionId());
+		MarkRelfilenumberDropped(RelationPhysicalIdentifierNumber_compat(relfilelocator),
+								 GetCurrentSubTransactionId());
 
 		/* keep the lock since we did physical changes to the relation */
 		table_close(rel, NoLock);
@@ -2240,21 +2261,17 @@ ColumnarProcessAlterTable(AlterTableStmt *alterTableStmt, List **columnarOptions
 static void
 ColumnarProcessUtility(PlannedStmt *pstmt,
 					   const char *queryString,
-#if PG_VERSION_NUM >= PG_VERSION_14
 					   bool readOnlyTree,
-#endif
 					   ProcessUtilityContext context,
 					   ParamListInfo params,
 					   struct QueryEnvironment *queryEnv,
 					   DestReceiver *dest,
 					   QueryCompletion *completionTag)
 {
-#if PG_VERSION_NUM >= PG_VERSION_14
 	if (readOnlyTree)
 	{
 		pstmt = copyObject(pstmt);
 	}
-#endif
 
 	Node *parsetree = pstmt->utilityStmt;
 
@@ -2371,8 +2388,8 @@ ColumnarProcessUtility(PlannedStmt *pstmt,
 		CheckCitusColumnarAlterExtensionStmt(parsetree);
 	}
 
-	PrevProcessUtilityHook_compat(pstmt, queryString, false, context,
-								  params, queryEnv, dest, completionTag);
+	PrevProcessUtilityHook(pstmt, queryString, false, context,
+						   params, queryEnv, dest, completionTag);
 
 	if (columnarOptions != NIL)
 	{
@@ -2500,11 +2517,7 @@ static const TableAmRoutine columnar_am_methods = {
 	.tuple_get_latest_tid = columnar_get_latest_tid,
 	.tuple_tid_valid = columnar_tuple_tid_valid,
 	.tuple_satisfies_snapshot = columnar_tuple_satisfies_snapshot,
-#if PG_VERSION_NUM >= PG_VERSION_14
 	.index_delete_tuples = columnar_index_delete_tuples,
-#else
-	.compute_xid_horizon_for_tuples = columnar_compute_xid_horizon_for_tuples,
-#endif
 
 	.tuple_insert = columnar_tuple_insert,
 	.tuple_insert_speculative = columnar_tuple_insert_speculative,
@@ -2515,7 +2528,11 @@ static const TableAmRoutine columnar_am_methods = {
 	.tuple_lock = columnar_tuple_lock,
 	.finish_bulk_insert = columnar_finish_bulk_insert,
 
-	.relation_set_new_filenode = columnar_relation_set_new_filenode,
+#if PG_VERSION_NUM >= PG_VERSION_16
+	.relation_set_new_filelocator = columnar_relation_set_new_filelocator,
+#else
+	.relation_set_new_filenode = columnar_relation_set_new_filelocator,
+#endif
 	.relation_nontransactional_truncate = columnar_relation_nontransactional_truncate,
 	.relation_copy_data = columnar_relation_copy_data,
 	.relation_copy_for_cluster = columnar_relation_copy_for_cluster,
@@ -2929,7 +2946,7 @@ MajorVersionsCompatibleColumnar(char *leftVersion, char *rightVersion)
 	}
 	else
 	{
-		rightComparisionLimit = strlen(leftVersion);
+		rightComparisionLimit = strlen(rightVersion);
 	}
 
 	/* we can error out early if hypens are not in the same position */

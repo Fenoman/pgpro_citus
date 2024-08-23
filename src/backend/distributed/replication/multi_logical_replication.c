@@ -10,61 +10,61 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
-#include "miscadmin.h"
-#include "fmgr.h"
-#include "pgstat.h"
-#include "libpq-fe.h"
 
-#include "distributed/pg_version_constants.h"
+#include "fmgr.h"
+#include "libpq-fe.h"
+#include "miscadmin.h"
+#include "pgstat.h"
 
 #include "access/genam.h"
-
-#include "postmaster/interrupt.h"
-
 #include "access/htup_details.h"
 #include "access/sysattr.h"
 #include "access/xact.h"
-#include "commands/dbcommands.h"
-#include "common/hashfn.h"
-#include "catalog/pg_subscription_rel.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_constraint.h"
-#include "distributed/adaptive_executor.h"
-#include "distributed/citus_safe_lib.h"
-#include "distributed/colocation_utils.h"
-#include "distributed/connection_management.h"
-#include "distributed/hash_helpers.h"
-#include "distributed/listutils.h"
-#include "distributed/coordinator_protocol.h"
-#include "distributed/metadata_cache.h"
-#include "distributed/metadata_sync.h"
-#include "distributed/multi_join_order.h"
-#include "distributed/multi_logical_replication.h"
-#include "distributed/multi_partitioning_utils.h"
-#include "distributed/priority.h"
-#include "distributed/distributed_planner.h"
-#include "distributed/remote_commands.h"
-#include "distributed/resource_lock.h"
-#include "distributed/shard_cleaner.h"
-#include "distributed/shard_rebalancer.h"
-#include "distributed/shard_transfer.h"
-#include "distributed/version_compat.h"
+#include "catalog/pg_subscription_rel.h"
+#include "commands/dbcommands.h"
+#include "common/hashfn.h"
 #include "nodes/bitmapset.h"
 #include "parser/scansup.h"
+#include "postmaster/interrupt.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
 #include "storage/lock.h"
-#include "utils/guc.h"
 #include "utils/builtins.h"
-#include "utils/fmgrprotos.h"
 #include "utils/fmgroids.h"
+#include "utils/fmgrprotos.h"
 #include "utils/formatting.h"
+#include "utils/guc.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/pg_lsn.h"
 #include "utils/rel.h"
 #include "utils/ruleutils.h"
 #include "utils/syscache.h"
+
+#include "pg_version_constants.h"
+
+#include "distributed/adaptive_executor.h"
+#include "distributed/citus_safe_lib.h"
+#include "distributed/colocation_utils.h"
+#include "distributed/connection_management.h"
+#include "distributed/coordinator_protocol.h"
+#include "distributed/distributed_planner.h"
+#include "distributed/hash_helpers.h"
+#include "distributed/listutils.h"
+#include "distributed/metadata_cache.h"
+#include "distributed/metadata_sync.h"
+#include "distributed/multi_join_order.h"
+#include "distributed/multi_logical_replication.h"
+#include "distributed/multi_partitioning_utils.h"
+#include "distributed/priority.h"
+#include "distributed/remote_commands.h"
+#include "distributed/resource_lock.h"
+#include "distributed/shard_cleaner.h"
+#include "distributed/shard_rebalancer.h"
+#include "distributed/shard_transfer.h"
+#include "distributed/version_compat.h"
 
 #define CURRENT_LOG_POSITION_COMMAND "SELECT pg_current_wal_lsn()"
 
@@ -1530,13 +1530,29 @@ CreateSubscriptions(MultiConnection *sourceConnection,
 		appendStringInfo(createSubscriptionCommand,
 						 "CREATE SUBSCRIPTION %s CONNECTION %s PUBLICATION %s "
 						 "WITH (citus_use_authinfo=true, create_slot=false, "
+#if PG_VERSION_NUM >= PG_VERSION_16
+
+		                 /*
+		                  * password_required specifies whether connections to the publisher
+		                  * made as a result of this subscription must use password authentication.
+		                  * However, this setting is ignored when the subscription is owned
+		                  * by a superuser.
+		                  * Given that this command is executed below with superuser
+		                  * ExecuteCriticalRemoteCommand(target->superuserConnection,
+		                  *                              createSubscriptionCommand->data);
+		                  * We are safe to pass password_required as false because
+		                  * it will be ignored anyway
+		                  */
+						 "copy_data=false, enabled=false, slot_name=%s, password_required=false",
+#else
 						 "copy_data=false, enabled=false, slot_name=%s",
+#endif
 						 quote_identifier(target->subscriptionName),
 						 quote_literal_cstr(conninfo->data),
 						 quote_identifier(target->publication->name),
 						 quote_identifier(target->replicationSlot->name));
 
-		if (EnableBinaryProtocol && PG_VERSION_NUM >= PG_VERSION_14)
+		if (EnableBinaryProtocol)
 		{
 			appendStringInfoString(createSubscriptionCommand, ", binary=true)");
 		}

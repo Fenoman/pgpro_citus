@@ -1,11 +1,3 @@
-SHOW server_version \gset
-SELECT substring(:'server_version', '\d+')::int >= 14 AS server_version_ge_14
-\gset
-\if :server_version_ge_14
-\else
-\q
-\endif
-
 create schema pg14;
 set search_path to pg14;
 SET citus.shard_replication_factor TO 1;
@@ -517,7 +509,9 @@ SELECT create_distributed_table('J2_TBL','i');
 -- test join using aliases
 SELECT * FROM J1_TBL JOIN J2_TBL USING (i) WHERE J1_TBL.t = 'one' ORDER BY 1,2,3,4;  -- ok
 SELECT * FROM J1_TBL JOIN J2_TBL USING (i) AS x WHERE J1_TBL.t = 'one' ORDER BY 1,2,3,4;  -- ok
+\set VERBOSITY terse
 SELECT * FROM (J1_TBL JOIN J2_TBL USING (i)) AS x WHERE J1_TBL.t = 'one' ORDER BY 1,2,3,4;  -- error
+\set VERBOSITY default
 SELECT * FROM J1_TBL JOIN J2_TBL USING (i) AS x WHERE x.i = 1 ORDER BY 1,2,3,4;  -- ok
 SELECT * FROM J1_TBL JOIN J2_TBL USING (i) AS x WHERE x.t = 'one' ORDER BY 1,2,3,4;  -- error
 SELECT * FROM (J1_TBL JOIN J2_TBL USING (i) AS x) AS xx WHERE x.i = 1 ORDER BY 1,2,3,4;  -- error (XXX could use better hint)
@@ -671,8 +665,6 @@ drop schema pg14 cascade;
 create schema pg14;
 set search_path to pg14;
 
-select 1 from citus_add_node('localhost',:master_port,groupid=>0);
-
 -- test adding foreign table to metadata with the guc
 -- will test truncating foreign tables later
 CREATE TABLE foreign_table_test (id integer NOT NULL, data text, a bigserial);
@@ -786,4 +778,3 @@ set client_min_messages to error;
 drop extension postgres_fdw cascade;
 drop schema pg14 cascade;
 reset client_min_messages;
-select 1 from citus_remove_node('localhost',:master_port);

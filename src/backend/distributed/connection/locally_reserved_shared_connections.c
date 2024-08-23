@@ -14,7 +14,7 @@
  *               (b) Reserving connections, the logic that this
  *                   file implements.
  *
- *   Finally, as the name already implies, once a node has reserved a  shared
+ *   Finally, as the name already implies, once a node has reserved a shared
  *   connection, it is guaranteed to have the right to establish a connection
  *   to the given remote node when needed.
  *
@@ -33,12 +33,15 @@
 
 #include "postgres.h"
 
-#include "distributed/pg_version_constants.h"
-
 #include "miscadmin.h"
 
 #include "access/hash.h"
 #include "commands/dbcommands.h"
+#include "common/hashfn.h"
+#include "utils/builtins.h"
+
+#include "pg_version_constants.h"
+
 #include "distributed/listutils.h"
 #include "distributed/locally_reserved_shared_connections.h"
 #include "distributed/metadata_cache.h"
@@ -47,8 +50,6 @@
 #include "distributed/shared_connection_stats.h"
 #include "distributed/tuplestore.h"
 #include "distributed/worker_manager.h"
-#include "utils/builtins.h"
-#include "common/hashfn.h"
 
 
 #define RESERVED_CONNECTION_COLUMNS 4
@@ -505,7 +506,7 @@ IsReservationPossible(void)
 
 
 /*
- * AllocateReservedConectionEntry allocates the required entry in the hash
+ * AllocateOrGetReservedConnectionEntry allocates the required entry in the hash
  * map by HASH_ENTER. The function throws an error if it cannot allocate
  * the entry.
  */

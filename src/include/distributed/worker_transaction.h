@@ -12,9 +12,10 @@
 #ifndef WORKER_TRANSACTION_H
 #define WORKER_TRANSACTION_H
 
+#include "storage/lockdefs.h"
+
 #include "distributed/connection_management.h"
 #include "distributed/worker_manager.h"
-#include "storage/lockdefs.h"
 
 
 /*
@@ -73,6 +74,7 @@ extern bool SendOptionalMetadataCommandListToWorkerInCoordinatedTransaction(cons
 																			commandList);
 extern void SendCommandToWorkersWithMetadata(const char *command);
 extern void SendCommandToWorkersWithMetadataViaSuperUser(const char *command);
+extern void SendCommandListToWorkersWithMetadata(List *commands);
 extern void SendBareCommandListToMetadataWorkers(List *commandList);
 extern void EnsureNoModificationsHaveBeenDone(void);
 extern void SendCommandListToWorkerOutsideTransaction(const char *nodeName,

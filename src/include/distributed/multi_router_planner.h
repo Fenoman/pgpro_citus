@@ -14,12 +14,13 @@
 
 #include "c.h"
 
+#include "nodes/parsenodes.h"
+
+#include "distributed/distributed_planner.h"
 #include "distributed/errormessage.h"
 #include "distributed/log_utils.h"
 #include "distributed/multi_logical_planner.h"
 #include "distributed/multi_physical_planner.h"
-#include "distributed/distributed_planner.h"
-#include "nodes/parsenodes.h"
 
 
 /* reserved alias name for UPSERTs */
@@ -117,5 +118,7 @@ extern bool HasDangerousJoinUsing(List *rtableList, Node *jtnode);
 extern Job * RouterJob(Query *originalQuery,
 					   PlannerRestrictionContext *plannerRestrictionContext,
 					   DeferredErrorMessage **planningError);
+extern bool ContainsOnlyLocalTables(RTEListProperties *rteProperties);
+extern RangeTblEntry * ExtractSourceResultRangeTableEntry(Query *query);
 
 #endif /* MULTI_ROUTER_PLANNER_H */

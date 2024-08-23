@@ -14,11 +14,12 @@
 #include "postgres.h"
 
 #include "catalog/namespace.h"
-#include "distributed/deparser.h"
-#include "distributed/version_compat.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
+
+#include "distributed/deparser.h"
+#include "distributed/version_compat.h"
 
 
 /* forward declaration for deparse functions */
@@ -193,7 +194,7 @@ DeparseAlterSequenceOwnerStmt(Node *node)
 	StringInfoData str = { 0 };
 	initStringInfo(&str);
 
-	Assert(AlterTableStmtObjType_compat(stmt) == OBJECT_SEQUENCE);
+	Assert(stmt->objtype == OBJECT_SEQUENCE);
 
 	AppendAlterSequenceOwnerStmt(&str, stmt);
 
@@ -208,7 +209,7 @@ DeparseAlterSequenceOwnerStmt(Node *node)
 static void
 AppendAlterSequenceOwnerStmt(StringInfo buf, AlterTableStmt *stmt)
 {
-	Assert(AlterTableStmtObjType_compat(stmt) == OBJECT_SEQUENCE);
+	Assert(stmt->objtype == OBJECT_SEQUENCE);
 	RangeVar *seq = stmt->relation;
 	char *qualifiedSequenceName = quote_qualified_identifier(seq->schemaname,
 															 seq->relname);
@@ -274,7 +275,7 @@ DeparseAlterSequencePersistenceStmt(Node *node)
 	StringInfoData str = { 0 };
 	initStringInfo(&str);
 
-	Assert(AlterTableStmtObjType_compat(stmt) == OBJECT_SEQUENCE);
+	Assert(stmt->objtype == OBJECT_SEQUENCE);
 
 	AppendAlterSequencePersistenceStmt(&str, stmt);
 
@@ -289,7 +290,7 @@ DeparseAlterSequencePersistenceStmt(Node *node)
 static void
 AppendAlterSequencePersistenceStmt(StringInfo buf, AlterTableStmt *stmt)
 {
-	Assert(AlterTableStmtObjType_compat(stmt) == OBJECT_SEQUENCE);
+	Assert(stmt->objtype == OBJECT_SEQUENCE);
 
 	RangeVar *seq = stmt->relation;
 	char *qualifiedSequenceName = quote_qualified_identifier(seq->schemaname,
@@ -389,35 +390,11 @@ AppendGrantOnSequenceStmt(StringInfo buf, GrantStmt *stmt)
 			 "GRANT .. ALL SEQUENCES IN SCHEMA is not supported for formatting.");
 	}
 
-	appendStringInfoString(buf, stmt->is_grant ? "GRANT " : "REVOKE ");
-
-	if (!stmt->is_grant && stmt->grant_option)
-	{
-		appendStringInfoString(buf, "GRANT OPTION FOR ");
-	}
-
-	AppendGrantPrivileges(buf, stmt);
+	AppendGrantSharedPrefix(buf, stmt);
 
 	AppendGrantOnSequenceSequences(buf, stmt);
 
-	AppendGrantGrantees(buf, stmt);
-
-	if (stmt->is_grant && stmt->grant_option)
-	{
-		appendStringInfoString(buf, " WITH GRANT OPTION");
-	}
-	if (!stmt->is_grant)
-	{
-		if (stmt->behavior == DROP_RESTRICT)
-		{
-			appendStringInfoString(buf, " RESTRICT");
-		}
-		else if (stmt->behavior == DROP_CASCADE)
-		{
-			appendStringInfoString(buf, " CASCADE");
-		}
-	}
-	appendStringInfoString(buf, ";");
+	AppendGrantSharedSuffix(buf, stmt);
 }
 
 

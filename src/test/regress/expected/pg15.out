@@ -218,6 +218,9 @@ BEGIN;
 NOTICE:  drop cascades to 2 other objects
 DETAIL:  drop cascades to column col_3 of table generated_stored_ref
 drop cascades to column col_5 of table generated_stored_ref
+NOTICE:  drop cascades to 2 other objects
+DETAIL:  drop cascades to column col_3 of table generated_stored_ref_960016
+drop cascades to column col_5 of table generated_stored_ref_960016
   ALTER TABLE generated_stored_ref DROP COLUMN col_4;
   -- show that undistribute_table works fine
   SELECT undistribute_table('generated_stored_ref');
@@ -269,15 +272,6 @@ CREATE TABLE tbl2
 -- on local tables works fine
 MERGE INTO tbl1 USING tbl2 ON (true)
 WHEN MATCHED THEN DELETE;
--- add coordinator node as a worker
-SET client_min_messages to ERROR;
-SELECT 1 FROM master_add_node('localhost', :master_port, groupId => 0);
- ?column?
----------------------------------------------------------------------
-        1
-(1 row)
-
-RESET client_min_messages;
 -- one table is Citus local table, fails
 SELECT citus_add_local_table_to_metadata('tbl1');
  citus_add_local_table_to_metadata
@@ -306,7 +300,7 @@ SELECT citus_add_local_table_to_metadata('tbl2');
 
 MERGE INTO tbl1 USING tbl2 ON (true)
 WHEN MATCHED THEN DELETE;
--- one table is reference, the other local, not supported
+-- source table is reference, the target is local, supported
 SELECT create_reference_table('tbl2');
  create_reference_table
 ---------------------------------------------------------------------
@@ -315,8 +309,7 @@ SELECT create_reference_table('tbl2');
 
 MERGE INTO tbl1 USING tbl2 ON (true)
 WHEN MATCHED THEN DELETE;
-ERROR:  MERGE command is not supported on reference tables yet
--- now, both are reference, still not supported
+-- now, both are reference, not supported
 SELECT create_reference_table('tbl1');
  create_reference_table
 ---------------------------------------------------------------------
@@ -325,7 +318,7 @@ SELECT create_reference_table('tbl1');
 
 MERGE INTO tbl1 USING tbl2 ON (true)
 WHEN MATCHED THEN DELETE;
-ERROR:  MERGE command is not supported on reference tables yet
+ERROR:  Reference table as target is not allowed in MERGE command
 -- now, both distributed, not works
 SELECT undistribute_table('tbl1');
 NOTICE:  creating a new table for pg15.tbl1
@@ -399,12 +392,6 @@ SET search_path TO pg15;
 SET client_min_messages to ERROR;
 DROP TABLE FKTABLE_local, PKTABLE_local;
 RESET client_min_messages;
-SELECT 1 FROM citus_remove_node('localhost', :master_port);
- ?column?
----------------------------------------------------------------------
-        1
-(1 row)
-
 SELECT create_distributed_table('tbl1', 'x');
  create_distributed_table
 ---------------------------------------------------------------------
@@ -419,14 +406,16 @@ SELECT create_distributed_table('tbl2', 'x');
 
 MERGE INTO tbl1 USING tbl2 ON (true)
 WHEN MATCHED THEN DELETE;
-ERROR:  MERGE command is only supported when all distributed tables are co-located and joined on their distribution columns
--- also, not inside subqueries & ctes
+ERROR:  The required join operation is missing between the target's distribution column and any expression originating from the source. The issue may arise from a non-equi-join.
+DETAIL:  Without a equi-join condition on the target's distribution column, the source rows cannot be efficiently redistributed, and the NOT-MATCHED condition cannot be evaluated unambiguously. This can result in incorrect or unexpected results when attempting to merge tables in a distributed setting
+-- also, inside subqueries & ctes
 WITH targq AS (
     SELECT * FROM tbl2
 )
 MERGE INTO tbl1 USING targq ON (true)
 WHEN MATCHED THEN DELETE;
-ERROR:  MERGE command is only supported when all distributed tables are co-located and joined on their distribution columns
+ERROR:  The required join operation is missing between the target's distribution column and any expression originating from the source. The issue may arise from a non-equi-join.
+DETAIL:  Without a equi-join condition on the target's distribution column, the source rows cannot be efficiently redistributed, and the NOT-MATCHED condition cannot be evaluated unambiguously. This can result in incorrect or unexpected results when attempting to merge tables in a distributed setting
 WITH foo AS (
   MERGE INTO tbl1 USING tbl2 ON (true)
   WHEN MATCHED THEN DELETE
@@ -442,7 +431,8 @@ USING tbl2
 ON (true)
 WHEN MATCHED THEN
     DO NOTHING;
-ERROR:  MERGE command is only supported when all distributed tables are co-located and joined on their distribution columns
+ERROR:  The required join operation is missing between the target's distribution column and any expression originating from the source. The issue may arise from a non-equi-join.
+DETAIL:  Without a equi-join condition on the target's distribution column, the source rows cannot be efficiently redistributed, and the NOT-MATCHED condition cannot be evaluated unambiguously. This can result in incorrect or unexpected results when attempting to merge tables in a distributed setting
 MERGE INTO tbl1 t
 USING tbl2
 ON (true)
@@ -878,11 +868,11 @@ SELECT create_reference_table('FKTABLE');
 (1 row)
 
 -- show that the definition is expected
-SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'fktable'::regclass::oid ORDER BY oid;
+SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'fktable'::regclass::oid ORDER BY 1;
                                                 pg_get_constraintdef
 ---------------------------------------------------------------------
- FOREIGN KEY (tid, fk_id_del_set_null) REFERENCES pktable(tid, id) ON DELETE SET NULL (fk_id_del_set_null)
  FOREIGN KEY (tid, fk_id_del_set_default) REFERENCES pktable(tid, id) ON DELETE SET DEFAULT (fk_id_del_set_default)
+ FOREIGN KEY (tid, fk_id_del_set_null) REFERENCES pktable(tid, id) ON DELETE SET NULL (fk_id_del_set_null)
 (2 rows)
 
 \c - - - :worker_1_port
@@ -891,8 +881,8 @@ SET search_path TO pg15;
 SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'fktable'::regclass::oid ORDER BY oid;
                                                 pg_get_constraintdef
 ---------------------------------------------------------------------
- FOREIGN KEY (tid, fk_id_del_set_default) REFERENCES pktable(tid, id) ON DELETE SET DEFAULT (fk_id_del_set_default)
  FOREIGN KEY (tid, fk_id_del_set_null) REFERENCES pktable(tid, id) ON DELETE SET NULL (fk_id_del_set_null)
+ FOREIGN KEY (tid, fk_id_del_set_default) REFERENCES pktable(tid, id) ON DELETE SET DEFAULT (fk_id_del_set_default)
 (2 rows)
 
 -- also, make sure that it works as expected
@@ -1275,6 +1265,7 @@ SELECT create_reference_table('set_on_default_test_referenced');
 
 (1 row)
 
+-- should error since col_3 defaults to a sequence
 CREATE TABLE set_on_default_test_referencing(
     col_1 int, col_2 int, col_3 serial, col_4 int,
     FOREIGN KEY(col_1, col_3)
@@ -1282,10 +1273,7 @@ CREATE TABLE set_on_default_test_referencing(
     ON DELETE SET DEFAULT (col_1)
     ON UPDATE SET DEFAULT
 );
--- should error since col_3 defaults to a sequence
-SELECT create_reference_table('set_on_default_test_referencing');
 ERROR:  cannot create foreign key constraint since Citus does not support ON DELETE / UPDATE SET DEFAULT actions on the columns that default to sequences
-DROP TABLE set_on_default_test_referencing;
 CREATE TABLE set_on_default_test_referencing(
     col_1 int, col_2 int, col_3 serial, col_4 int,
     FOREIGN KEY(col_1, col_3)
@@ -1448,12 +1436,6 @@ NOTICE:  renaming the new table to pg15.foreign_table_test
 
 (1 row)
 
-SELECT 1 FROM citus_remove_node('localhost', :master_port);
- ?column?
----------------------------------------------------------------------
-        1
-(1 row)
-
 DROP SERVER foreign_server CASCADE;
 NOTICE:  drop cascades to 2 other objects
 -- PG15 now supports specifying oid on CREATE DATABASE
@@ -1491,6 +1473,63 @@ SELECT run_command_on_workers($$DROP ACCESS METHOD heap2$$);
  (localhost,57638,t,"DROP ACCESS METHOD")
 (2 rows)
 
+CREATE TABLE referenced (int_col integer PRIMARY KEY);
+CREATE TABLE referencing (text_col text);
+SET citus.shard_replication_factor TO 1;
+SELECT create_distributed_table('referenced', null);
+ create_distributed_table
+---------------------------------------------------------------------
+
+(1 row)
+
+SELECT create_distributed_table('referencing', null);
+ create_distributed_table
+---------------------------------------------------------------------
+
+(1 row)
+
+RESET citus.shard_replication_factor;
+CREATE OR REPLACE FUNCTION my_random(numeric)
+  RETURNS numeric AS
+$$
+BEGIN
+  RETURN 7 * $1;
+END;
+$$
+LANGUAGE plpgsql IMMUTABLE;
+ALTER TABLE referencing ADD COLUMN test_2 integer UNIQUE NULLS DISTINCT REFERENCES referenced(int_col);
+ALTER TABLE referencing ADD COLUMN test_3 integer GENERATED ALWAYS AS (text_col::int * my_random(1)) STORED UNIQUE NULLS NOT DISTINCT;
+SELECT (groupid = 0) AS is_coordinator, result FROM run_command_on_all_nodes(
+  $$SELECT get_grouped_fkey_constraints FROM get_grouped_fkey_constraints('pg15.referencing')$$
+)
+JOIN pg_dist_node USING (nodeid)
+ORDER BY is_coordinator DESC, result;
+ is_coordinator |                                                                                                                                                                                                                  result
+---------------------------------------------------------------------
+ t              | [{"deferred": false, "deferable": false, "on_delete": "a", "on_update": "a", "match_type": "s", "constraint_names": ["referencing__fkey"], "referenced_tables": ["pg15.referenced"], "referenced_columns": ["int_col"], "referencing_tables": ["pg15.referencing"], "referencing_columns": ["test_2"], "referencing_columns_set_null_or_default": null}]
+ f              | [{"deferred": false, "deferable": false, "on_delete": "a", "on_update": "a", "match_type": "s", "constraint_names": ["referencing__fkey", "referencing__fkey_960207"], "referenced_tables": ["pg15.referenced", "pg15.referenced_960206"], "referenced_columns": ["int_col"], "referencing_tables": ["pg15.referencing", "pg15.referencing_960207"], "referencing_columns": ["test_2"], "referencing_columns_set_null_or_default": null}]
+ f              | [{"deferred": false, "deferable": false, "on_delete": "a", "on_update": "a", "match_type": "s", "constraint_names": ["referencing__fkey"], "referenced_tables": ["pg15.referenced"], "referenced_columns": ["int_col"], "referencing_tables": ["pg15.referencing"], "referencing_columns": ["test_2"], "referencing_columns_set_null_or_default": null}]
+(3 rows)
+
+SELECT (groupid = 0) AS is_coordinator, result FROM run_command_on_all_nodes(
+  $$SELECT get_index_defs FROM get_index_defs('pg15', 'referencing')$$
+)
+JOIN pg_dist_node USING (nodeid)
+ORDER BY is_coordinator DESC, result;
+ is_coordinator |                                                                                                                                                                                                                                                                                   result
+---------------------------------------------------------------------
+ t              | [{"indexdefs": ["CREATE UNIQUE INDEX referencing__key ON pg15.referencing USING btree (test_2)"], "indexnames": ["referencing__key"]}, {"indexdefs": ["CREATE UNIQUE INDEX referencing__key1 ON pg15.referencing USING btree (test_3) NULLS NOT DISTINCT"], "indexnames": ["referencing__key1"]}]
+ f              | [{"indexdefs": ["CREATE UNIQUE INDEX referencing__key ON pg15.referencing USING btree (test_2)", "CREATE UNIQUE INDEX referencing__key_960207 ON pg15.referencing_960207 USING btree (test_2)"], "indexnames": ["referencing__key", "referencing__key_960207"]}, {"indexdefs": ["CREATE UNIQUE INDEX referencing__key1 ON pg15.referencing USING btree (test_3) NULLS NOT DISTINCT", "CREATE UNIQUE INDEX referencing__key1_960207 ON pg15.referencing_960207 USING btree (test_3) NULLS NOT DISTINCT"], "indexnames": ["referencing__key1", "referencing__key1_960207"]}]
+ f              | [{"indexdefs": ["CREATE UNIQUE INDEX referencing__key ON pg15.referencing USING btree (test_2)"], "indexnames": ["referencing__key"]}, {"indexdefs": ["CREATE UNIQUE INDEX referencing__key1 ON pg15.referencing USING btree (test_3) NULLS NOT DISTINCT"], "indexnames": ["referencing__key1"]}]
+(3 rows)
+
+set citus.log_remote_commands = true;
+set citus.grep_remote_commands = '%ALTER DATABASE%';
+alter database regression REFRESH COLLATION VERSION;
+NOTICE:  version has not changed
+NOTICE:  issuing ALTER DATABASE regression REFRESH COLLATION VERSION;
+NOTICE:  issuing ALTER DATABASE regression REFRESH COLLATION VERSION;
+set citus.log_remote_commands = false;
 -- Clean up
 \set VERBOSITY terse
 SET client_min_messages TO ERROR;

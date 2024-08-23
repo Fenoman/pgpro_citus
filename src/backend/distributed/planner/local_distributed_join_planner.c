@@ -71,53 +71,52 @@
 
 #include "postgres.h"
 
-#include "distributed/pg_version_constants.h"
-
 #include "funcapi.h"
 
-#include "catalog/pg_type.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_index.h"
-#include "distributed/citus_nodes.h"
-#include "distributed/citus_ruleutils.h"
-#include "distributed/commands.h"
-#include "distributed/commands/multi_copy.h"
-#include "distributed/distributed_planner.h"
-#include "distributed/errormessage.h"
-#include "distributed/local_distributed_join_planner.h"
-#include "distributed/listutils.h"
-#include "distributed/log_utils.h"
-#include "distributed/metadata_cache.h"
-#include "distributed/multi_logical_planner.h"
-#include "distributed/multi_logical_optimizer.h"
-#include "distributed/multi_router_planner.h"
-#include "distributed/multi_physical_planner.h"
-#include "distributed/multi_server_executor.h"
-#include "distributed/multi_router_planner.h"
-#include "distributed/coordinator_protocol.h"
-#include "distributed/query_colocation_checker.h"
-#include "distributed/query_pushdown_planning.h"
-#include "distributed/recursive_planning.h"
-#include "distributed/relation_restriction_equivalence.h"
-#include "distributed/log_utils.h"
-#include "distributed/shard_pruning.h"
-#include "distributed/version_compat.h"
+#include "catalog/pg_type.h"
 #include "lib/stringinfo.h"
+#include "nodes/makefuncs.h"
+#include "nodes/nodeFuncs.h"
+#include "nodes/nodes.h"
+#include "nodes/pathnodes.h"
+#include "nodes/pg_list.h"
+#include "nodes/primnodes.h"
 #include "optimizer/clauses.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/planner.h"
 #include "optimizer/prep.h"
+#include "parser/parse_relation.h"
 #include "parser/parsetree.h"
-#include "nodes/makefuncs.h"
-#include "nodes/nodeFuncs.h"
-#include "nodes/nodes.h"
-#include "nodes/nodeFuncs.h"
-#include "nodes/pg_list.h"
-#include "nodes/primnodes.h"
-#include "nodes/pathnodes.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
+
+#include "pg_version_constants.h"
+
+#include "distributed/citus_nodes.h"
+#include "distributed/citus_ruleutils.h"
+#include "distributed/commands.h"
+#include "distributed/commands/multi_copy.h"
+#include "distributed/coordinator_protocol.h"
+#include "distributed/distributed_planner.h"
+#include "distributed/errormessage.h"
+#include "distributed/listutils.h"
+#include "distributed/local_distributed_join_planner.h"
+#include "distributed/log_utils.h"
+#include "distributed/metadata_cache.h"
+#include "distributed/multi_logical_optimizer.h"
+#include "distributed/multi_logical_planner.h"
+#include "distributed/multi_physical_planner.h"
+#include "distributed/multi_router_planner.h"
+#include "distributed/multi_server_executor.h"
+#include "distributed/query_colocation_checker.h"
+#include "distributed/query_pushdown_planning.h"
+#include "distributed/recursive_planning.h"
+#include "distributed/relation_restriction_equivalence.h"
+#include "distributed/shard_pruning.h"
+#include "distributed/version_compat.h"
 
 #define INVALID_RTE_IDENTITY -1
 
@@ -136,6 +135,9 @@ typedef struct RangeTableEntryDetails
 	RangeTblEntry *rangeTableEntry;
 	List *requiredAttributeNumbers;
 	bool hasConstantFilterOnUniqueColumn;
+#if PG_VERSION_NUM >= PG_VERSION_16
+	RTEPermissionInfo *perminfo;
+#endif
 } RangeTableEntryDetails;
 
 /*
@@ -176,7 +178,8 @@ static bool HasConstantFilterOnUniqueColumn(RangeTblEntry *rangeTableEntry,
 static ConversionCandidates * CreateConversionCandidates(PlannerRestrictionContext *
 														 plannerRestrictionContext,
 														 List *rangeTableList,
-														 int resultRTEIdentity);
+														 int resultRTEIdentity,
+														 List *rteperminfos);
 static void AppendUniqueIndexColumnsToList(Form_pg_index indexForm, List **uniqueIndexes,
 										   int flags);
 static ConversionChoice GetConversionChoice(ConversionCandidates *
@@ -205,10 +208,17 @@ RecursivelyPlanLocalTableJoins(Query *query,
 		GetPlannerRestrictionContext(context);
 
 	List *rangeTableList = query->rtable;
+#if PG_VERSION_NUM >= PG_VERSION_16
+	List *rteperminfos = query->rteperminfos;
+#endif
 	int resultRTEIdentity = ResultRTEIdentity(query);
 	ConversionCandidates *conversionCandidates =
 		CreateConversionCandidates(plannerRestrictionContext,
-								   rangeTableList, resultRTEIdentity);
+#if PG_VERSION_NUM >= PG_VERSION_16
+								   rangeTableList, resultRTEIdentity, rteperminfos);
+#else
+								   rangeTableList, resultRTEIdentity, NIL);
+#endif
 
 	ConversionChoice conversionChoise =
 		GetConversionChoice(conversionCandidates, plannerRestrictionContext);
@@ -323,7 +333,12 @@ ConvertRTEsToSubquery(List *rangeTableEntryDetailsList, RecursivePlanningContext
 		RangeTblEntry *rangeTableEntry = rangeTableEntryDetails->rangeTableEntry;
 		List *requiredAttributeNumbers = rangeTableEntryDetails->requiredAttributeNumbers;
 		ReplaceRTERelationWithRteSubquery(rangeTableEntry,
-										  requiredAttributeNumbers, context);
+#if PG_VERSION_NUM >= PG_VERSION_16
+										  requiredAttributeNumbers, context,
+										  rangeTableEntryDetails->perminfo);
+#else
+										  requiredAttributeNumbers, context, NULL);
+#endif
 	}
 }
 
@@ -485,6 +500,8 @@ RequiredAttrNumbersForRelation(RangeTblEntry *rangeTableEntry,
 
 	PlannerInfo *plannerInfo = relationRestriction->plannerInfo;
 
+	int rteIndex = relationRestriction->index;
+
 	/*
 	 * Here we used the query from plannerInfo because it has the optimizations
 	 * so that it doesn't have unnecessary columns. The original query doesn't have
@@ -492,8 +509,18 @@ RequiredAttrNumbersForRelation(RangeTblEntry *rangeTableEntry,
 	 * 'required' attributes.
 	 */
 	Query *queryToProcess = plannerInfo->parse;
-	int rteIndex = relationRestriction->index;
 
+	return RequiredAttrNumbersForRelationInternal(queryToProcess, rteIndex);
+}
+
+
+/*
+ * RequiredAttrNumbersForRelationInternal returns the required attribute numbers
+ * for the input range-table-index in the query parameter.
+ */
+List *
+RequiredAttrNumbersForRelationInternal(Query *queryToProcess, int rteIndex)
+{
 	List *allVarsInQuery = pull_vars_of_level((Node *) queryToProcess, 0);
 
 	List *requiredAttrNumbers = NIL;
@@ -518,7 +545,9 @@ RequiredAttrNumbersForRelation(RangeTblEntry *rangeTableEntry,
  */
 static ConversionCandidates *
 CreateConversionCandidates(PlannerRestrictionContext *plannerRestrictionContext,
-						   List *rangeTableList, int resultRTEIdentity)
+						   List *rangeTableList,
+						   int resultRTEIdentity,
+						   List *rteperminfos)
 {
 	ConversionCandidates *conversionCandidates =
 		palloc0(sizeof(ConversionCandidates));
@@ -552,6 +581,14 @@ CreateConversionCandidates(PlannerRestrictionContext *plannerRestrictionContext,
 			RequiredAttrNumbersForRelation(rangeTableEntry, plannerRestrictionContext);
 		rangeTableEntryDetails->hasConstantFilterOnUniqueColumn =
 			HasConstantFilterOnUniqueColumn(rangeTableEntry, relationRestriction);
+#if PG_VERSION_NUM >= PG_VERSION_16
+		rangeTableEntryDetails->perminfo = NULL;
+		if (rangeTableEntry->perminfoindex)
+		{
+			rangeTableEntryDetails->perminfo = getRTEPermissionInfo(rteperminfos,
+																	rangeTableEntry);
+		}
+#endif
 
 		bool referenceOrDistributedTable =
 			IsCitusTableType(rangeTableEntry->relid, REFERENCE_TABLE) ||

@@ -10,27 +10,29 @@
  */
 
 #include "postgres.h"
+
 #include "miscadmin.h"
+
 #include "access/genam.h"
 #include "access/xact.h"
 #include "catalog/namespace.h"
 #include "commands/dbcommands.h"
 #include "commands/sequence.h"
-#include "postmaster/postmaster.h"
 #include "nodes/makefuncs.h"
+#include "postmaster/postmaster.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 
 #include "distributed/citus_safe_lib.h"
-#include "distributed/listutils.h"
 #include "distributed/coordinator_protocol.h"
+#include "distributed/listutils.h"
 #include "distributed/metadata_cache.h"
-#include "distributed/shard_cleaner.h"
-#include "distributed/shard_rebalancer.h"
+#include "distributed/pg_dist_cleanup.h"
 #include "distributed/remote_commands.h"
 #include "distributed/resource_lock.h"
+#include "distributed/shard_cleaner.h"
+#include "distributed/shard_rebalancer.h"
 #include "distributed/worker_transaction.h"
-#include "distributed/pg_dist_cleanup.h"
 
 #define REPLICATION_SLOT_CATALOG_TABLE_NAME "pg_replication_slots"
 #define STR_ERRCODE_OBJECT_IN_USE "55006"
@@ -450,7 +452,7 @@ CompareCleanupRecordsByObjectType(const void *leftElement, const void *rightElem
 
 
 /*
- * InsertCleanupRecordInCurrentTransaction inserts a new pg_dist_cleanup_record entry
+ * InsertCleanupRecordInCurrentTransaction inserts a new pg_dist_cleanup entry
  * as part of the current transaction. This is primarily useful for deferred drop scenarios,
  * since these records would roll back in case of operation failure.
  */
@@ -497,8 +499,8 @@ InsertCleanupRecordInCurrentTransaction(CleanupObject objectType,
 
 
 /*
- * InsertCleanupRecordInSubtransaction inserts a new pg_dist_cleanup_record entry
- * in a separate transaction to ensure the record persists after rollback. We should
+ * InsertCleanupRecordInSubtransaction inserts a new pg_dist_cleanup entry in a
+ * separate transaction to ensure the record persists after rollback. We should
  * delete these records if the operation completes successfully.
  *
  * For failure scenarios, use a subtransaction (direct insert via localhost).
@@ -541,7 +543,7 @@ InsertCleanupRecordInSubtransaction(CleanupObject objectType,
 
 
 /*
- * DeleteCleanupRecordByRecordId deletes a cleanup record by record id.
+ * DeleteCleanupRecordByRecordIdOutsideTransaction deletes a cleanup record by record id.
  */
 static void
 DeleteCleanupRecordByRecordIdOutsideTransaction(uint64 recordId)
@@ -1005,7 +1007,7 @@ ListCleanupRecordsForCurrentOperation(void)
 
 	ScanKeyData scanKey[1];
 	ScanKeyInit(&scanKey[0], Anum_pg_dist_cleanup_operation_id, BTEqualStrategyNumber,
-				F_INT8EQ, UInt64GetDatum(CurrentOperationId));
+				F_INT8EQ, Int64GetDatum(CurrentOperationId));
 
 	int scanKeyCount = 1;
 	Oid scanIndexId = InvalidOid;
@@ -1106,7 +1108,7 @@ TupleToCleanupRecord(HeapTuple heapTuple, TupleDesc tupleDescriptor)
 
 /*
  * CleanupRecordExists returns whether a cleanup record with the given
- * record ID exists in pg_dist_cleanup_record.
+ * record ID exists in pg_dist_cleanup.
  */
 static bool
 CleanupRecordExists(uint64 recordId)
@@ -1119,7 +1121,7 @@ CleanupRecordExists(uint64 recordId)
 	bool indexOK = true;
 
 	ScanKeyInit(&scanKey[0], Anum_pg_dist_cleanup_record_id,
-				BTEqualStrategyNumber, F_INT8EQ, UInt64GetDatum(recordId));
+				BTEqualStrategyNumber, F_INT8EQ, Int64GetDatum(recordId));
 
 	SysScanDesc scanDescriptor = systable_beginscan(pgDistCleanup,
 													DistCleanupPrimaryKeyIndexId(),
@@ -1139,7 +1141,7 @@ CleanupRecordExists(uint64 recordId)
 
 
 /*
- * DeleteCleanupRecordByRecordId deletes a single pg_dist_cleanup_record entry.
+ * DeleteCleanupRecordByRecordId deletes a single pg_dist_cleanup entry.
  */
 static void
 DeleteCleanupRecordByRecordId(uint64 recordId)
@@ -1152,7 +1154,7 @@ DeleteCleanupRecordByRecordId(uint64 recordId)
 	bool indexOK = true;
 
 	ScanKeyInit(&scanKey[0], Anum_pg_dist_cleanup_record_id,
-				BTEqualStrategyNumber, F_INT8EQ, UInt64GetDatum(recordId));
+				BTEqualStrategyNumber, F_INT8EQ, Int64GetDatum(recordId));
 
 	SysScanDesc scanDescriptor = systable_beginscan(pgDistCleanup,
 													DistCleanupPrimaryKeyIndexId(),

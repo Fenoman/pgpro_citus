@@ -18,7 +18,7 @@
 
 #include "postgres.h"
 
-#include "distributed/pg_version_constants.h"
+#include "pg_version_constants.h"
 
 #include <ctype.h>
 
@@ -192,7 +192,9 @@ OutDistributedPlan(OUTFUNC_ARGS)
 	WRITE_UINT64_FIELD(queryId);
 	WRITE_NODE_FIELD(relationIdList);
 	WRITE_OID_FIELD(targetRelationId);
-	WRITE_NODE_FIELD(insertSelectQuery);
+	WRITE_NODE_FIELD(modifyQueryViaCoordinatorOrRepartition);
+	WRITE_NODE_FIELD(selectPlanForModifyViaCoordinatorOrRepartition);
+	WRITE_ENUM_FIELD(modifyWithSelectMethod, ModifyWithSelectMethod);
 	WRITE_STRING_FIELD(intermediateResultIdPrefix);
 
 	WRITE_NODE_FIELD(subPlanList);

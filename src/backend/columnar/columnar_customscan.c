@@ -10,18 +10,17 @@
  *-------------------------------------------------------------------------
  */
 
-#include "citus_version.h"
+#include <math.h>
 
 #include "postgres.h"
 
-#include <math.h>
+#include "miscadmin.h"
 
 #include "access/amapi.h"
 #include "access/skey.h"
 #include "catalog/pg_am.h"
 #include "catalog/pg_statistic.h"
 #include "commands/defrem.h"
-#include "miscadmin.h"
 #include "nodes/extensible.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
@@ -33,6 +32,12 @@
 #include "optimizer/paths.h"
 #include "optimizer/plancat.h"
 #include "optimizer/restrictinfo.h"
+
+#include "citus_version.h"
+#if PG_VERSION_NUM >= PG_VERSION_16
+#include "parser/parse_relation.h"
+#include "parser/parsetree.h"
+#endif
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/relcache.h"
@@ -44,6 +49,7 @@
 #include "columnar/columnar_customscan.h"
 #include "columnar/columnar_metadata.h"
 #include "columnar/columnar_tableam.h"
+
 #include "distributed/listutils.h"
 
 /*
@@ -127,6 +133,9 @@ static List * set_deparse_context_planstate(List *dpcontext, Node *node,
 /* other helpers */
 static List * ColumnarVarNeeded(ColumnarScanState *columnarScanState);
 static Bitmapset * ColumnarAttrNeeded(ScanState *ss);
+#if PG_VERSION_NUM >= PG_VERSION_16
+static Bitmapset * fixup_inherited_columns(Oid parentId, Oid childId, Bitmapset *columns);
+#endif
 
 /* saved hook value in case of unload */
 static set_rel_pathlist_hook_type PreviousSetRelPathlistHook = NULL;
@@ -198,7 +207,7 @@ columnar_customscan_init()
 		&EnableColumnarCustomScan,
 		true,
 		PGC_USERSET,
-		GUC_NO_SHOW_ALL,
+		GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE,
 		NULL, NULL, NULL);
 	DefineCustomBoolVariable(
 		"columnar.enable_qual_pushdown",
@@ -208,7 +217,7 @@ columnar_customscan_init()
 		&EnableColumnarQualPushdown,
 		true,
 		PGC_USERSET,
-		GUC_NO_SHOW_ALL,
+		GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE,
 		NULL, NULL, NULL);
 	DefineCustomRealVariable(
 		"columnar.qual_pushdown_correlation_threshold",
@@ -222,7 +231,7 @@ columnar_customscan_init()
 		0.0,
 		1.0,
 		PGC_USERSET,
-		GUC_NO_SHOW_ALL,
+		GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE,
 		NULL, NULL, NULL);
 	DefineCustomIntVariable(
 		"columnar.max_custom_scan_paths",
@@ -234,7 +243,7 @@ columnar_customscan_init()
 		1,
 		1024,
 		PGC_USERSET,
-		GUC_NO_SHOW_ALL,
+		GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE,
 		NULL, NULL, NULL);
 	DefineCustomEnumVariable(
 		"columnar.planner_debug_level",
@@ -535,7 +544,7 @@ ColumnarIndexScanAdditionalCost(PlannerInfo *root, RelOptInfo *rel,
 	 * "anti-correlated" (-1) since both help us avoiding from reading the
 	 * same stripe again and again.
 	 */
-	double absIndexCorrelation = Abs(indexCorrelation);
+	double absIndexCorrelation = float_abs(indexCorrelation);
 
 	/*
 	 * To estimate the number of stripes that we need to read, we do linear
@@ -654,7 +663,7 @@ CheckVarStats(PlannerInfo *root, Var *var, Oid sortop, float4 *absVarCorrelation
 	 * If the Var is not highly correlated, then the chunk's min/max bounds
 	 * will be nearly useless.
 	 */
-	if (Abs(varCorrelation) < ColumnarQualPushdownCorrelationThreshold)
+	if (float_abs(varCorrelation) < ColumnarQualPushdownCorrelationThreshold)
 	{
 		if (absVarCorrelation)
 		{
@@ -662,7 +671,7 @@ CheckVarStats(PlannerInfo *root, Var *var, Oid sortop, float4 *absVarCorrelation
 			 * Report absVarCorrelation if caller wants to know why given
 			 * var is rejected.
 			 */
-			*absVarCorrelation = Abs(varCorrelation);
+			*absVarCorrelation = float_abs(varCorrelation);
 		}
 		return false;
 	}
@@ -1371,7 +1380,43 @@ AddColumnarScanPath(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 		cpath->custom_private = list_make2(NIL, NIL);
 	}
 
-	int numberOfColumnsRead = bms_num_members(rte->selectedCols);
+	int numberOfColumnsRead = 0;
+#if PG_VERSION_NUM >= PG_VERSION_16
+	if (rte->perminfoindex > 0)
+	{
+		/*
+		 * If perminfoindex > 0, that means that this relation's permission info
+		 * is directly found in the list of rteperminfos of the Query(root->parse)
+		 * So, all we have to do here is retrieve that info.
+		 */
+		RTEPermissionInfo *perminfo = getRTEPermissionInfo(root->parse->rteperminfos,
+														   rte);
+		numberOfColumnsRead = bms_num_members(perminfo->selectedCols);
+	}
+	else
+	{
+		/*
+		 * If perminfoindex = 0, that means we are skipping the check for permission info
+		 * for this relation, which means that it's either a partition or an inheritance child.
+		 * In these cases, we need to access the permission info of the top parent of this relation.
+		 * After thorough checking, we found that the index of the top parent pointing to the correct
+		 * range table entry in Query's range tables (root->parse->rtable) is found under
+		 * RelOptInfo rel->top_parent->relid.
+		 * For reference, check expand_partitioned_rtentry and expand_inherited_rtentry PG functions
+		 */
+		Assert(rel->top_parent);
+		RangeTblEntry *parent_rte = rt_fetch(rel->top_parent->relid, root->parse->rtable);
+		RTEPermissionInfo *perminfo = getRTEPermissionInfo(root->parse->rteperminfos,
+														   parent_rte);
+		numberOfColumnsRead = bms_num_members(fixup_inherited_columns(perminfo->relid,
+																	  rte->relid,
+																	  perminfo->
+																	  selectedCols));
+	}
+#else
+	numberOfColumnsRead = bms_num_members(rte->selectedCols);
+#endif
+
 	int numberOfClausesPushed = list_length(allClauses);
 
 	CostColumnarScan(root, rel, rte->relid, cpath, numberOfColumnsRead,
@@ -1389,6 +1434,69 @@ AddColumnarScanPath(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 
 	add_path(rel, path);
 }
+
+
+#if PG_VERSION_NUM >= PG_VERSION_16
+
+/*
+ * fixup_inherited_columns
+ *
+ * Exact function Copied from PG16 as it's static.
+ *
+ * When user is querying on a table with children, it implicitly accesses
+ * child tables also. So, we also need to check security label of child
+ * tables and columns, but there is no guarantee attribute numbers are
+ * same between the parent and children.
+ * It returns a bitmapset which contains attribute number of the child
+ * table based on the given bitmapset of the parent.
+ */
+static Bitmapset *
+fixup_inherited_columns(Oid parentId, Oid childId, Bitmapset *columns)
+{
+	Bitmapset *result = NULL;
+
+	/*
+	 * obviously, no need to do anything here
+	 */
+	if (parentId == childId)
+	{
+		return columns;
+	}
+
+	int index = -1;
+	while ((index = bms_next_member(columns, index)) >= 0)
+	{
+		/* bit numbers are offset by FirstLowInvalidHeapAttributeNumber */
+		AttrNumber attno = index + FirstLowInvalidHeapAttributeNumber;
+
+		/*
+		 * whole-row-reference shall be fixed-up later
+		 */
+		if (attno == InvalidAttrNumber)
+		{
+			result = bms_add_member(result, index);
+			continue;
+		}
+
+		char *attname = get_attname(parentId, attno, false);
+		attno = get_attnum(childId, attname);
+		if (attno == InvalidAttrNumber)
+		{
+			elog(ERROR, "cache lookup failed for attribute %s of relation %u",
+				 attname, childId);
+		}
+
+		result = bms_add_member(result,
+								attno - FirstLowInvalidHeapAttributeNumber);
+
+		pfree(attname);
+	}
+
+	return result;
+}
+
+
+#endif
 
 
 /*
@@ -1435,7 +1543,8 @@ ColumnarPerStripeScanCost(RelOptInfo *rel, Oid relationId, int numberOfColumnsRe
 		ereport(ERROR, (errmsg("could not open relation with OID %u", relationId)));
 	}
 
-	List *stripeList = StripesForRelfilenode(relation->rd_node);
+	List *stripeList = StripesForRelfilelocator(RelationPhysicalIdentifier_compat(
+													relation));
 	RelationClose(relation);
 
 	uint32 maxColumnCount = 0;
@@ -1492,7 +1601,8 @@ ColumnarTableStripeCount(Oid relationId)
 		ereport(ERROR, (errmsg("could not open relation with OID %u", relationId)));
 	}
 
-	List *stripeList = StripesForRelfilenode(relation->rd_node);
+	List *stripeList = StripesForRelfilelocator(RelationPhysicalIdentifier_compat(
+													relation));
 	int stripeCount = list_length(stripeList);
 	RelationClose(relation);
 

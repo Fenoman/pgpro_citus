@@ -275,7 +275,7 @@ id_title AS (SELECT id, title from articles_hash_mx WHERE author_id = 2)
 SELECT * FROM id_author, id_title WHERE id_author.id = id_title.id;
 DEBUG:  CTE id_author is going to be inlined via distributed planning
 DEBUG:  CTE id_title is going to be inlined via distributed planning
-DEBUG:  cannot run command which targets multiple shards
+DEBUG:  router planner does not support queries that reference non-colocated distributed tables
 DEBUG:  Creating router plan
 DEBUG:  query has a single distribution column value: 2
 DEBUG:  generating subplan XXX_1 for subquery SELECT id, title FROM public.articles_hash_mx WHERE (author_id OPERATOR(pg_catalog.=) 2)
@@ -370,7 +370,7 @@ WITH RECURSIVE hierarchy as (
 				h.company_id = ce.company_id))
 SELECT * FROM hierarchy WHERE LEVEL <= 2;
 DEBUG:  Router planner cannot handle multi-shard select queries
-ERROR:  recursive CTEs are not supported in distributed queries
+ERROR:  recursive CTEs are only supported when they contain a filter on the distribution column
 -- logically wrong query, query involves different shards
 -- from the same table, but still router plannable due to
 -- shard being placed on the same worker.
@@ -385,8 +385,8 @@ WITH RECURSIVE hierarchy as (
 				h.company_id = ce.company_id AND
 				ce.company_id = 2))
 SELECT * FROM hierarchy WHERE LEVEL <= 2;
-DEBUG:  cannot run command which targets multiple shards
-ERROR:  recursive CTEs are not supported in distributed queries
+DEBUG:  router planner does not support queries that reference non-colocated distributed tables
+ERROR:  recursive CTEs are only supported when they contain a filter on the distribution column
 -- grouping sets are supported on single shard
 SELECT
 	id, substring(title, 2, 1) AS subtitle, count(*)

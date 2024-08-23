@@ -8,7 +8,13 @@
  */
 
 #include "postgres.h"
+
+#include "utils/array.h"
+#include "utils/builtins.h"
+#include "utils/lsyscache.h"
+
 #include "pg_version_compat.h"
+
 #include "distributed/citus_ruleutils.h"
 #include "distributed/distribution_column.h"
 #include "distributed/intermediate_results.h"
@@ -16,9 +22,6 @@
 #include "distributed/multi_executor.h"
 #include "distributed/utils/array_type.h"
 #include "distributed/worker_shard_copy.h"
-#include "utils/lsyscache.h"
-#include "utils/array.h"
-#include "utils/builtins.h"
 
 PG_FUNCTION_INFO_V1(worker_split_copy);
 
@@ -52,7 +55,7 @@ static char * TraceWorkerSplitCopyUdf(char *sourceShardToCopySchemaName,
  * worker_split_copy(source_shard_id bigint, splitCopyInfo pg_catalog.split_copy_info[])
  * UDF to split copy shard to list of destination shards.
  * 'source_shard_id' : Source ShardId to split copy.
- * 'splitCopyInfos'   : Array of Split Copy Info (destination_shard's id, min/max ranges and node_id)
+ * 'splitCopyInfos'  : Array of Split Copy Info (destination_shard's id, min/max ranges and node_id)
  */
 Datum
 worker_split_copy(PG_FUNCTION_ARGS)
@@ -139,7 +142,7 @@ TraceWorkerSplitCopyUdf(char *sourceShardToCopySchemaName,
 	appendStringInfo(splitCopyTrace, "performing copy from shard %s to [",
 					 sourceShardToCopyQualifiedName);
 
-	/* split copy always has atleast two destinations */
+	/* split copy always has at least two destinations */
 	int index = 1;
 	int splitWayCount = list_length(splitCopyInfoList);
 	SplitCopyInfo *splitCopyInfo = NULL;

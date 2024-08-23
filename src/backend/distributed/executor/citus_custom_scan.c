@@ -9,42 +9,45 @@
  */
 #include "postgres.h"
 
-#include "distributed/pg_version_constants.h"
-
 #include "miscadmin.h"
 
 #include "commands/copy.h"
+#include "executor/executor.h"
+#include "nodes/makefuncs.h"
+#include "optimizer/clauses.h"
+#include "optimizer/optimizer.h"
+#include "utils/datum.h"
+#include "utils/lsyscache.h"
+#include "utils/memutils.h"
+#include "utils/rel.h"
+
+#include "pg_version_constants.h"
+
 #include "distributed/backend_data.h"
 #include "distributed/citus_clauses.h"
 #include "distributed/citus_custom_scan.h"
 #include "distributed/citus_nodefuncs.h"
 #include "distributed/citus_ruleutils.h"
+#include "distributed/colocation_utils.h"
 #include "distributed/connection_management.h"
 #include "distributed/deparse_shard_query.h"
 #include "distributed/distributed_execution_locks.h"
+#include "distributed/function_call_delegation.h"
 #include "distributed/insert_select_executor.h"
 #include "distributed/insert_select_planner.h"
 #include "distributed/listutils.h"
 #include "distributed/local_executor.h"
 #include "distributed/local_plan_cache.h"
+#include "distributed/merge_executor.h"
+#include "distributed/merge_planner.h"
 #include "distributed/multi_executor.h"
-#include "distributed/multi_server_executor.h"
 #include "distributed/multi_router_planner.h"
+#include "distributed/multi_server_executor.h"
 #include "distributed/query_stats.h"
 #include "distributed/shard_utils.h"
 #include "distributed/subplan_execution.h"
 #include "distributed/worker_log_messages.h"
 #include "distributed/worker_protocol.h"
-#include "distributed/colocation_utils.h"
-#include "distributed/function_call_delegation.h"
-#include "executor/executor.h"
-#include "nodes/makefuncs.h"
-#include "optimizer/optimizer.h"
-#include "optimizer/clauses.h"
-#include "utils/lsyscache.h"
-#include "utils/memutils.h"
-#include "utils/rel.h"
-#include "utils/datum.h"
 
 
 extern AllowedDistributionColumn AllowedDistributionColumnValue;
@@ -53,6 +56,7 @@ extern AllowedDistributionColumn AllowedDistributionColumnValue;
 static Node * AdaptiveExecutorCreateScan(CustomScan *scan);
 static Node * NonPushableInsertSelectCreateScan(CustomScan *scan);
 static Node * DelayedErrorCreateScan(CustomScan *scan);
+static Node * NonPushableMergeCommandCreateScan(CustomScan *scan);
 
 /* functions that are common to different scans */
 static void CitusBeginScan(CustomScanState *node, EState *estate, int eflags);
@@ -88,6 +92,11 @@ CustomScanMethods DelayedErrorCustomScanMethods = {
 	DelayedErrorCreateScan
 };
 
+CustomScanMethods NonPushableMergeCommandCustomScanMethods = {
+	"Citus MERGE INTO ...",
+	NonPushableMergeCommandCreateScan
+};
+
 
 /*
  * Define executor methods for the different executor types.
@@ -111,6 +120,16 @@ static CustomExecMethods NonPushableInsertSelectCustomExecMethods = {
 };
 
 
+static CustomExecMethods NonPushableMergeCommandCustomExecMethods = {
+	.CustomName = "NonPushableMergeCommandScan",
+	.BeginCustomScan = CitusBeginScan,
+	.ExecCustomScan = NonPushableMergeCommandExecScan,
+	.EndCustomScan = CitusEndScan,
+	.ReScanCustomScan = CitusReScan,
+	.ExplainCustomScan = NonPushableMergeCommandExplainScan
+};
+
+
 /*
  * IsCitusCustomState returns if a given PlanState node is a CitusCustomState node.
  */
@@ -124,7 +143,8 @@ IsCitusCustomState(PlanState *planState)
 
 	CustomScanState *css = castNode(CustomScanState, planState);
 	if (css->methods == &AdaptiveExecutorCustomExecMethods ||
-		css->methods == &NonPushableInsertSelectCustomExecMethods)
+		css->methods == &NonPushableInsertSelectCustomExecMethods ||
+		css->methods == &NonPushableMergeCommandCustomExecMethods)
 	{
 		return true;
 	}
@@ -142,6 +162,7 @@ RegisterCitusCustomScanMethods(void)
 	RegisterCustomScanMethods(&AdaptiveExecutorCustomScanMethods);
 	RegisterCustomScanMethods(&NonPushableInsertSelectCustomScanMethods);
 	RegisterCustomScanMethods(&DelayedErrorCustomScanMethods);
+	RegisterCustomScanMethods(&NonPushableMergeCommandCustomScanMethods);
 }
 
 
@@ -182,7 +203,7 @@ CitusBeginScan(CustomScanState *node, EState *estate, int eflags)
 	node->ss.ps.qual = ExecInitQual(node->ss.ps.plan->qual, (PlanState *) node);
 
 	DistributedPlan *distributedPlan = scanState->distributedPlan;
-	if (distributedPlan->insertSelectQuery != NULL)
+	if (distributedPlan->modifyQueryViaCoordinatorOrRepartition != NULL)
 	{
 		/*
 		 * INSERT..SELECT via coordinator or re-partitioning are special because
@@ -724,6 +745,26 @@ DelayedErrorCreateScan(CustomScan *scan)
 
 
 /*
+ * NonPushableMergeCommandCreateScan creates the scan state for executing
+ * MERGE INTO ... into a distributed table with repartition of source rows.
+ */
+static Node *
+NonPushableMergeCommandCreateScan(CustomScan *scan)
+{
+	CitusScanState *scanState = palloc0(sizeof(CitusScanState));
+
+	scanState->executorType = MULTI_EXECUTOR_NON_PUSHABLE_MERGE_QUERY;
+	scanState->customScanState.ss.ps.type = T_CustomScanState;
+	scanState->distributedPlan = GetDistributedPlan(scan);
+	scanState->customScanState.methods = &NonPushableMergeCommandCustomExecMethods;
+	scanState->finishedPreScan = false;
+	scanState->finishedRemoteScan = false;
+
+	return (Node *) scanState;
+}
+
+
+/*
  * CitusEndScan is used to clean up tuple store of the given custom scan state.
  */
 static void
@@ -780,7 +821,19 @@ CitusEndScan(CustomScanState *node)
  */
 static void
 CitusReScan(CustomScanState *node)
-{ }
+{
+	if (node->ss.ps.ps_ResultTupleSlot)
+	{
+		ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
+	}
+	ExecScanReScan(&node->ss);
+
+	CitusScanState *scanState = (CitusScanState *) node;
+	if (scanState->tuplestorestate)
+	{
+		tuplestore_rescan(scanState->tuplestorestate);
+	}
+}
 
 
 /*
@@ -895,12 +948,6 @@ void
 SetJobColocationId(Job *job)
 {
 	uint32 jobColocationId = INVALID_COLOCATION_ID;
-
-	if (!job->partitionKeyValue)
-	{
-		/* if the Job has no shard key, nothing to do */
-		return;
-	}
 
 	List *rangeTableList = ExtractRangeTableEntryList(job->jobQuery);
 	ListCell *rangeTableCell = NULL;

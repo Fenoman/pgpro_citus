@@ -10,8 +10,6 @@
 
 #include "postgres.h"
 
-#include "distributed/pg_version_constants.h"
-
 #include "miscadmin.h"
 
 #include "access/genam.h"
@@ -26,19 +24,7 @@
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
-#include "citus_version.h"
 #include "commands/extension.h"
-#include "distributed/listutils.h"
-#include "distributed/colocation_utils.h"
-#include "distributed/commands.h"
-#include "distributed/commands/utility_hook.h"
-#include "distributed/metadata/dependency.h"
-#include "distributed/metadata/distobject.h"
-#include "distributed/metadata/pg_dist_object.h"
-#include "distributed/metadata_cache.h"
-#include "distributed/metadata_sync.h"
-#include "distributed/version_compat.h"
-#include "distributed/worker_transaction.h"
 #include "executor/spi.h"
 #include "nodes/makefuncs.h"
 #include "nodes/pg_list.h"
@@ -48,6 +34,21 @@
 #include "utils/lsyscache.h"
 #include "utils/regproc.h"
 #include "utils/rel.h"
+
+#include "citus_version.h"
+#include "pg_version_constants.h"
+
+#include "distributed/colocation_utils.h"
+#include "distributed/commands.h"
+#include "distributed/commands/utility_hook.h"
+#include "distributed/listutils.h"
+#include "distributed/metadata/dependency.h"
+#include "distributed/metadata/distobject.h"
+#include "distributed/metadata/pg_dist_object.h"
+#include "distributed/metadata_cache.h"
+#include "distributed/metadata_sync.h"
+#include "distributed/version_compat.h"
+#include "distributed/worker_transaction.h"
 
 
 static char * CreatePgDistObjectEntryCommand(const ObjectAddress *objectAddress);
@@ -85,12 +86,12 @@ citus_unmark_object_distributed(PG_FUNCTION_ARGS)
 	{
 		ereport(ERROR, (errmsg("object still exists"),
 						errdetail("the %s \"%s\" still exists",
-								  getObjectTypeDescription_compat(&address,
+								  getObjectTypeDescription(&address,
 
-		                                                          /* missingOk: */ false),
-								  getObjectIdentity_compat(&address,
+		                                                   /* missingOk: */ false),
+								  getObjectIdentity(&address,
 
-		                                                   /* missingOk: */ false)),
+		                                            /* missingOk: */ false)),
 						errhint("drop the object via a DROP command")));
 	}
 
@@ -510,7 +511,7 @@ UpdateDistributedObjectColocationId(uint32 oldColocationId,
 	/* scan pg_dist_object for colocationId equal to old colocationId */
 	ScanKeyInit(&scanKey[0], Anum_pg_dist_object_colocationid,
 				BTEqualStrategyNumber,
-				F_INT4EQ, UInt32GetDatum(oldColocationId));
+				F_INT4EQ, Int32GetDatum(oldColocationId));
 
 	SysScanDesc scanDescriptor = systable_beginscan(pgDistObjectRel,
 													InvalidOid,

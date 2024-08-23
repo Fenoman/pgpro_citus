@@ -14,10 +14,12 @@
 #include "postgres.h"
 
 #include "fmgr.h"
+
+#include "utils/hsearch.h"
+
 #include "distributed/metadata_utility.h"
 #include "distributed/pg_dist_partition.h"
 #include "distributed/worker_manager.h"
-#include "utils/hsearch.h"
 
 extern bool EnableVersionChecks;
 
@@ -123,6 +125,7 @@ typedef enum
 	HASH_DISTRIBUTED,
 	APPEND_DISTRIBUTED,
 	RANGE_DISTRIBUTED,
+	SINGLE_SHARD_DISTRIBUTED,
 
 	/* hash, range or append distributed table */
 	DISTRIBUTED_TABLE,
@@ -136,8 +139,11 @@ typedef enum
 	ANY_CITUS_TABLE_TYPE
 } CitusTableType;
 
+void InvalidateDistRelationCacheCallback(Datum argument, Oid relationId);
+
 extern List * AllCitusTableIds(void);
 extern bool IsCitusTableType(Oid relationId, CitusTableType tableType);
+extern CitusTableType GetCitusTableType(CitusTableCacheEntry *tableEntry);
 extern bool IsCitusTableTypeCacheEntry(CitusTableCacheEntry *tableEtnry,
 									   CitusTableType tableType);
 bool HasDistributionKey(Oid relationId);
@@ -157,6 +163,8 @@ extern uint32 ColocationIdViaCatalog(Oid relationId);
 bool IsReferenceTableByDistParams(char partitionMethod, char replicationModel);
 extern bool IsCitusLocalTableByDistParams(char partitionMethod, char replicationModel,
 										  uint32 colocationId);
+extern bool IsSingleShardTableByDistParams(char partitionMethod, char replicationModel,
+										   uint32 colocationId);
 extern List * CitusTableList(void);
 extern ShardInterval * LoadShardInterval(uint64 shardId);
 extern bool ShardExists(uint64 shardId);
@@ -193,6 +201,8 @@ extern bool HasOverlappingShardInterval(ShardInterval **shardIntervalArray,
 										Oid shardIntervalCollation,
 										FmgrInfo *shardIntervalSortCompareFunction);
 
+extern ShardPlacement * ShardPlacementForFunctionColocatedWithSingleShardTable(
+	CitusTableCacheEntry *cacheEntry);
 extern ShardPlacement * ShardPlacementForFunctionColocatedWithReferenceTable(
 	CitusTableCacheEntry *cacheEntry);
 extern ShardPlacement * ShardPlacementForFunctionColocatedWithDistTable(
@@ -238,6 +248,7 @@ extern Oid DistRebalanceStrategyRelationId(void);
 extern Oid DistLocalGroupIdRelationId(void);
 extern Oid DistObjectRelationId(void);
 extern Oid DistEnabledCustomAggregatesId(void);
+extern Oid DistTenantSchemaRelationId(void);
 
 /* index oids */
 extern Oid DistNodeNodeIdIndexId(void);
@@ -260,6 +271,8 @@ extern Oid DistTransactionGroupIndexId(void);
 extern Oid DistPlacementGroupidIndexId(void);
 extern Oid DistObjectPrimaryKeyIndexId(void);
 extern Oid DistCleanupPrimaryKeyIndexId(void);
+extern Oid DistTenantSchemaPrimaryKeyIndexId(void);
+extern Oid DistTenantSchemaUniqueColocationIdIndexId(void);
 
 /* sequence oids */
 extern Oid DistBackgroundJobJobIdSequenceId(void);
@@ -312,6 +325,6 @@ extern const char * CurrentDatabaseName(void);
 
 /* connection-related functions */
 extern char * GetAuthinfoViaCatalog(const char *roleName, int64 nodeId);
-extern char * GetPoolinfoViaCatalog(int64 nodeId);
+extern char * GetPoolinfoViaCatalog(int32 nodeId);
 
 #endif /* METADATA_CACHE_H */

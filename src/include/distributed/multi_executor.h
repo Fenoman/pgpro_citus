@@ -11,8 +11,8 @@
 #define MULTI_EXECUTOR_H
 
 #include "executor/execdesc.h"
-#include "nodes/parsenodes.h"
 #include "nodes/execnodes.h"
+#include "nodes/parsenodes.h"
 
 #include "distributed/citus_custom_scan.h"
 #include "distributed/multi_physical_planner.h"
@@ -114,6 +114,9 @@ typedef struct ExecutionParams
 	/* isUtilityCommand is true if the current execution is for a utility
 	 * command such as a DDL command.*/
 	bool isUtilityCommand;
+
+	/* pass bind parameters to the distributed executor for parameterized plans */
+	ParamListInfo paramListInfo;
 } ExecutionParams;
 
 ExecutionParams * CreateBasicExecutionParams(RowModifyLevel modLevel,
@@ -122,6 +125,11 @@ ExecutionParams * CreateBasicExecutionParams(RowModifyLevel modLevel,
 											 bool localExecutionSupported);
 
 extern uint64 ExecuteTaskListExtended(ExecutionParams *executionParams);
+extern uint64 ExecuteTaskListIntoTupleDestWithParam(RowModifyLevel modLevel,
+													List *taskList,
+													TupleDestination *tupleDest,
+													bool expectResults,
+													ParamListInfo paramListInfo);
 extern uint64 ExecuteTaskListIntoTupleDest(RowModifyLevel modLevel, List *taskList,
 										   TupleDestination *tupleDest,
 										   bool expectResults);

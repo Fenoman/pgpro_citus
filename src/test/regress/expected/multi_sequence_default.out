@@ -9,13 +9,6 @@ SET citus.shard_replication_factor TO 1;
 CREATE SCHEMA sequence_default;
 SET search_path = sequence_default, public;
 -- test both distributed and citus local tables
-SELECT 1 FROM citus_add_node('localhost', :master_port, groupId => 0);
-NOTICE:  localhost:xxxxx is the coordinator and already contains metadata, skipping syncing the metadata
- ?column?
----------------------------------------------------------------------
-        1
-(1 row)
-
 -- Cannot add a column involving DEFAULT nextval('..') because the table is not empty
 CREATE SEQUENCE seq_0;
 CREATE SEQUENCE seq_0_local_table;
@@ -150,6 +143,8 @@ SELECT create_distributed_table('seq_test_4','x');
 
 CREATE SEQUENCE seq_4;
 ALTER TABLE seq_test_4 ADD COLUMN a bigint DEFAULT nextval('seq_4');
+ALTER TABLE seq_test_4 ADD COLUMN IF NOT EXISTS a bigint DEFAULT nextval('seq_4');
+NOTICE:  column "a" of relation "seq_test_4" already exists, skipping
 DROP SEQUENCE seq_4 CASCADE;
 NOTICE:  drop cascades to default value for column a of table seq_test_4
 TRUNCATE seq_test_4;
@@ -675,8 +670,12 @@ ERROR:  nextval(sequence) calls in worker nodes are not supported for column def
 -- nextval from worker should fail for int and smallint sequences
 SELECT nextval('seq_12');
 ERROR:  nextval: reached maximum value of sequence "seq_12" (32767)
+DETAIL:  nextval(sequence) calls in worker nodes are not supported for column defaults of type int or smallint
+HINT:  If the command was issued from a worker node, try issuing it from the coordinator node instead.
 SELECT nextval('seq_13');
 ERROR:  nextval: reached maximum value of sequence "seq_13" (2147483647)
+DETAIL:  nextval(sequence) calls in worker nodes are not supported for column defaults of type int or smallint
+HINT:  If the command was issued from a worker node, try issuing it from the coordinator node instead.
 -- nextval from worker should work for bigint sequences
 SELECT nextval('seq_14');
      nextval
@@ -745,8 +744,12 @@ SELECT nextval('seq_12');
 -- nextval from worker should fail for int and smallint sequences
 SELECT nextval('seq_13');
 ERROR:  nextval: reached maximum value of sequence "seq_13" (2147483647)
+DETAIL:  nextval(sequence) calls in worker nodes are not supported for column defaults of type int or smallint
+HINT:  If the command was issued from a worker node, try issuing it from the coordinator node instead.
 SELECT nextval('seq_14');
 ERROR:  nextval: reached maximum value of sequence "seq_14" (32767)
+DETAIL:  nextval(sequence) calls in worker nodes are not supported for column defaults of type int or smallint
+HINT:  If the command was issued from a worker node, try issuing it from the coordinator node instead.
 \c - - - :master_port
 SET citus.shard_replication_factor TO 1;
 SET search_path = sequence_default, public;
@@ -811,8 +814,12 @@ SELECT nextval('seq_12');
 -- nextval from worker should fail for int and smallint sequences
 SELECT nextval('seq_13');
 ERROR:  nextval: reached maximum value of sequence "seq_13" (2147483647)
+DETAIL:  nextval(sequence) calls in worker nodes are not supported for column defaults of type int or smallint
+HINT:  If the command was issued from a worker node, try issuing it from the coordinator node instead.
 SELECT nextval('seq_14');
 ERROR:  nextval: reached maximum value of sequence "seq_14" (32767)
+DETAIL:  nextval(sequence) calls in worker nodes are not supported for column defaults of type int or smallint
+HINT:  If the command was issued from a worker node, try issuing it from the coordinator node instead.
 \c - - - :master_port
 -- Show that sequence and its dependency schema will be propagated if a distributed
 -- table with default column is added
@@ -874,7 +881,7 @@ ROLLBACK;
 -- Show that existing sequence has been renamed and a new sequence with the same name
 -- created for another type
 \c - - - :worker_1_port
-SELECT seqrelid::regclass, seqtypid::regtype, seqmax, seqmin FROM pg_sequence WHERE seqrelid::regclass::text like '%sequence_rollback%' ORDER BY 1,2;
+SELECT seqrelid::regclass, seqtypid::regtype, seqmax, seqmin FROM pg_sequence WHERE seqrelid::regclass::text in ('sequence_rollback', '"sequence_rollback(citus_backup_0)"') ORDER BY 1,2;
               seqrelid               | seqtypid |     seqmax      |     seqmin
 ---------------------------------------------------------------------
  "sequence_rollback(citus_backup_0)" | integer  |      2147483647 |               1
@@ -891,10 +898,4 @@ DROP TABLE test_seq_dist;
 DROP TABLE sequence_default.seq_test_7_par;
 SET client_min_messages TO error; -- suppress cascading objects dropping
 DROP SCHEMA sequence_default CASCADE;
-SELECT master_remove_node('localhost', :master_port);
- master_remove_node
----------------------------------------------------------------------
-
-(1 row)
-
 SET search_path TO public;

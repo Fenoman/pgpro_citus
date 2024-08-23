@@ -10,25 +10,15 @@
  *-------------------------------------------------------------------------
  */
 
-#include "postgres.h"
+#include <string.h>
 
-#include "distributed/pg_version_constants.h"
+#include "postgres.h"
 
 #include "c.h"
 #include "fmgr.h"
 
-#include <string.h>
-
 #include "access/stratnum.h"
 #include "catalog/pg_type.h"
-#include "distributed/listutils.h"
-#include "distributed/metadata_cache.h"
-#include "distributed/metadata_utility.h"
-#include "distributed/multi_join_order.h"
-#include "distributed/multi_physical_planner.h"
-#include "distributed/resource_lock.h"
-#include "distributed/shard_pruning.h"
-#include "distributed/utils/array_type.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/nodes.h"
@@ -37,6 +27,17 @@
 #include "optimizer/clauses.h"
 #include "utils/array.h"
 #include "utils/palloc.h"
+
+#include "pg_version_constants.h"
+
+#include "distributed/listutils.h"
+#include "distributed/metadata_cache.h"
+#include "distributed/metadata_utility.h"
+#include "distributed/multi_join_order.h"
+#include "distributed/multi_physical_planner.h"
+#include "distributed/resource_lock.h"
+#include "distributed/shard_pruning.h"
+#include "distributed/utils/array_type.h"
 
 
 /* local function forward declarations */
@@ -139,6 +140,10 @@ debug_equality_expression(PG_FUNCTION_ARGS)
 {
 	Oid distributedTableId = PG_GETARG_OID(0);
 	uint32 rangeTableId = 1;
+	if (!IsCitusTableType(distributedTableId, HASH_DISTRIBUTED))
+	{
+		ereport(ERROR, (errmsg("table needs to be hash distributed")));
+	}
 	Var *partitionColumn = PartitionColumn(distributedTableId, rangeTableId);
 	OpExpr *equalityExpression = MakeOpExpression(partitionColumn, BTEqualStrategyNumber);
 

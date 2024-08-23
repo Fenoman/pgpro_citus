@@ -11,16 +11,14 @@
  *-------------------------------------------------------------------------
  */
 
-#include "postgres.h"
+#include <string.h>
 
-#include "distributed/pg_version_constants.h"
+#include "postgres.h"
 
 #include "c.h"
 #include "fmgr.h"
 #include "funcapi.h"
 #include "miscadmin.h"
-
-#include <string.h>
 
 #include "access/attnum.h"
 #include "access/genam.h"
@@ -37,20 +35,9 @@
 #include "catalog/pg_class.h"
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_index.h"
-#include "catalog/pg_type.h"
 #include "catalog/pg_namespace.h"
+#include "catalog/pg_type.h"
 #include "commands/sequence.h"
-#include "distributed/citus_ruleutils.h"
-#include "distributed/commands.h"
-#include "distributed/listutils.h"
-#include "distributed/coordinator_protocol.h"
-#include "distributed/metadata_cache.h"
-#include "distributed/metadata_sync.h"
-#include "distributed/namespace_utils.h"
-#include "distributed/pg_dist_shard.h"
-#include "distributed/shared_library_init.h"
-#include "distributed/version_compat.h"
-#include "distributed/worker_manager.h"
 #include "foreign/foreign.h"
 #include "lib/stringinfo.h"
 #include "nodes/pg_list.h"
@@ -64,6 +51,20 @@
 #include "utils/relcache.h"
 #include "utils/ruleutils.h"
 #include "utils/varlena.h"
+
+#include "pg_version_constants.h"
+
+#include "distributed/citus_ruleutils.h"
+#include "distributed/commands.h"
+#include "distributed/coordinator_protocol.h"
+#include "distributed/listutils.h"
+#include "distributed/metadata_cache.h"
+#include "distributed/metadata_sync.h"
+#include "distributed/namespace_utils.h"
+#include "distributed/pg_dist_shard.h"
+#include "distributed/shared_library_init.h"
+#include "distributed/version_compat.h"
+#include "distributed/worker_manager.h"
 
 /* Shard related configuration */
 int ShardCount = 32;
@@ -277,7 +278,7 @@ master_get_new_placementid(PG_FUNCTION_ARGS)
 /*
  * GetNextPlacementId allocates and returns a unique placementId for
  * the placement to be created. This allocation occurs both in shared memory
- * and in write ahead logs; writing to logs avoids the risk of having shardId
+ * and in write ahead logs; writing to logs avoids the risk of having placementId
  * collisions.
  *
  * NB: This can be called by any user; for now we have decided that that's
@@ -612,7 +613,7 @@ GetPreLoadTableCreationCommands(Oid relationId,
 {
 	List *tableDDLEventList = NIL;
 
-	PushOverrideEmptySearchPath(CurrentMemoryContext);
+	int saveNestLevel = PushEmptySearchPath();
 
 	/* fetch table schema and column option definitions */
 	char *tableSchemaDef = pg_get_tableschemadef_string(relationId,
@@ -665,7 +666,7 @@ GetPreLoadTableCreationCommands(Oid relationId,
 	tableDDLEventList = list_concat(tableDDLEventList, policyCommands);
 
 	/* revert back to original search_path */
-	PopOverrideSearchPath();
+	PopEmptySearchPath(saveNestLevel);
 
 	return tableDDLEventList;
 }
@@ -754,7 +755,7 @@ GatherIndexAndConstraintDefinitionList(Form_pg_index indexForm, List **indexDDLE
 									   int indexFlags)
 {
 	/* generate fully-qualified names */
-	PushOverrideEmptySearchPath(CurrentMemoryContext);
+	int saveNestLevel = PushEmptySearchPath();
 
 	Oid indexId = indexForm->indexrelid;
 	bool indexImpliedByConstraint = IndexImpliedByAConstraint(indexForm);
@@ -805,7 +806,7 @@ GatherIndexAndConstraintDefinitionList(Form_pg_index indexForm, List **indexDDLE
 	}
 
 	/* revert back to original search_path */
-	PopOverrideSearchPath();
+	PopEmptySearchPath(saveNestLevel);
 }
 
 

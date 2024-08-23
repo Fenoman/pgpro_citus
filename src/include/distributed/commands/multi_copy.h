@@ -13,13 +13,14 @@
 #define MULTI_COPY_H
 
 
-#include "distributed/metadata_utility.h"
-#include "distributed/metadata_cache.h"
-#include "distributed/version_compat.h"
 #include "nodes/execnodes.h"
 #include "nodes/parsenodes.h"
 #include "parser/parse_coerce.h"
 #include "tcop/dest.h"
+
+#include "distributed/metadata_cache.h"
+#include "distributed/metadata_utility.h"
+#include "distributed/version_compat.h"
 
 
 #define INVALID_PARTITION_COLUMN_INDEX -1
@@ -31,12 +32,7 @@
 typedef enum CitusCopyDest
 {
 	COPY_FILE,                  /* to/from file (or a piped program) */
-#if PG_VERSION_NUM >= PG_VERSION_14
 	COPY_FRONTEND,              /* to frontend */
-#else
-	COPY_OLD_FE,                /* to/from frontend (2.0 protocol) */
-	COPY_NEW_FE,                /* to/from frontend (3.0 protocol) */
-#endif
 	COPY_CALLBACK               /* to/from callback function */
 } CitusCopyDest;
 
@@ -152,6 +148,12 @@ typedef struct CitusCopyDestReceiver
 	 * upfront.
 	 */
 	uint64 appendShardId;
+
+	/*
+	 * When copying to intermediate files, we can skip coercions and run them
+	 * when merging into the target tables.
+	 */
+	bool skipCoercions;
 } CitusCopyDestReceiver;
 
 
@@ -181,7 +183,7 @@ extern void AppendCopyRowData(Datum *valueArray, bool *isNullArray,
 extern void AppendCopyBinaryHeaders(CopyOutState headerOutputState);
 extern void AppendCopyBinaryFooters(CopyOutState footerOutputState);
 extern void EndRemoteCopy(int64 shardId, List *connectionList);
-extern List * CreateRangeTable(Relation rel, AclMode requiredAccess);
+extern List * CreateRangeTable(Relation rel);
 extern Node * ProcessCopyStmt(CopyStmt *copyStatement,
 							  QueryCompletion *completionTag,
 							  const char *queryString);

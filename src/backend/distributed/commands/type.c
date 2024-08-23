@@ -43,7 +43,7 @@
 
 #include "postgres.h"
 
-#include "distributed/pg_version_constants.h"
+#include "miscadmin.h"
 
 #include "access/genam.h"
 #include "access/htup_details.h"
@@ -52,6 +52,18 @@
 #include "catalog/pg_enum.h"
 #include "catalog/pg_type.h"
 #include "commands/extension.h"
+#include "nodes/makefuncs.h"
+#include "parser/parse_type.h"
+#include "storage/lmgr.h"
+#include "utils/builtins.h"
+#include "utils/fmgroids.h"
+#include "utils/lsyscache.h"
+#include "utils/regproc.h"
+#include "utils/syscache.h"
+#include "utils/typcache.h"
+
+#include "pg_version_constants.h"
+
 #include "distributed/citus_safe_lib.h"
 #include "distributed/commands.h"
 #include "distributed/commands/utility_hook.h"
@@ -64,20 +76,10 @@
 #include "distributed/relation_access_tracking.h"
 #include "distributed/remote_commands.h"
 #include "distributed/transaction_management.h"
-#include "distributed/worker_create_or_replace.h"
 #include "distributed/version_compat.h"
+#include "distributed/worker_create_or_replace.h"
 #include "distributed/worker_manager.h"
 #include "distributed/worker_transaction.h"
-#include "miscadmin.h"
-#include "nodes/makefuncs.h"
-#include "parser/parse_type.h"
-#include "storage/lmgr.h"
-#include "utils/builtins.h"
-#include "utils/fmgroids.h"
-#include "utils/lsyscache.h"
-#include "utils/regproc.h"
-#include "utils/syscache.h"
-#include "utils/typcache.h"
 
 #define AlterEnumIsRename(stmt) (stmt->oldVal != NULL)
 #define AlterEnumIsAddValue(stmt) (stmt->oldVal == NULL)
@@ -187,7 +189,7 @@ RecreateCompositeTypeStmt(Oid typeOid)
 	Assert(get_typtype(typeOid) == TYPTYPE_COMPOSITE);
 
 	CompositeTypeStmt *stmt = makeNode(CompositeTypeStmt);
-	List *names = stringToQualifiedNameList(format_type_be_qualified(typeOid));
+	List *names = stringToQualifiedNameList_compat(format_type_be_qualified(typeOid));
 	stmt->typevar = makeRangeVarFromNameList(names);
 	stmt->coldeflist = CompositeTypeColumnDefList(typeOid);
 
@@ -252,7 +254,7 @@ RecreateEnumStmt(Oid typeOid)
 	Assert(get_typtype(typeOid) == TYPTYPE_ENUM);
 
 	CreateEnumStmt *stmt = makeNode(CreateEnumStmt);
-	stmt->typeName = stringToQualifiedNameList(format_type_be_qualified(typeOid));
+	stmt->typeName = stringToQualifiedNameList_compat(format_type_be_qualified(typeOid));
 	stmt->vals = EnumValsList(typeOid);
 
 	return stmt;
@@ -350,7 +352,7 @@ List *
 AlterTypeStmtObjectAddress(Node *node, bool missing_ok, bool isPostprocess)
 {
 	AlterTableStmt *stmt = castNode(AlterTableStmt, node);
-	Assert(AlterTableStmtObjType_compat(stmt) == OBJECT_TYPE);
+	Assert(stmt->objtype == OBJECT_TYPE);
 
 	TypeName *typeName = MakeTypeNameFromRangeVar(stmt->relation);
 	Oid typeOid = LookupTypeNameOid(NULL, typeName, missing_ok);
@@ -549,7 +551,7 @@ CreateTypeDDLCommandsIdempotent(const ObjectAddress *typeAddress)
 	const char *username = GetUserNameFromId(GetTypeOwner(typeAddress->objectId), false);
 	initStringInfo(&buf);
 	appendStringInfo(&buf, ALTER_TYPE_OWNER_COMMAND,
-					 getObjectIdentity_compat(typeAddress, false),
+					 getObjectIdentity(typeAddress, false),
 					 quote_identifier(username));
 	ddlCommands = lappend(ddlCommands, buf.data);
 
@@ -565,7 +567,8 @@ CreateTypeDDLCommandsIdempotent(const ObjectAddress *typeAddress)
 char *
 GenerateBackupNameForTypeCollision(const ObjectAddress *address)
 {
-	List *names = stringToQualifiedNameList(format_type_be_qualified(address->objectId));
+	List *names = stringToQualifiedNameList_compat(format_type_be_qualified(
+													   address->objectId));
 	RangeVar *rel = makeRangeVarFromNameList(names);
 
 	char *newName = palloc0(NAMEDATALEN);

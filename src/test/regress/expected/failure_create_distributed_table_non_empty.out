@@ -28,7 +28,7 @@ SELECT citus.mitmproxy('conn.kill()');
 (1 row)
 
 SELECT create_distributed_table('test_table', 'id');
-ERROR:  connection to the remote node localhost:xxxxx failed with the following error: connection not open
+ERROR:  connection to the remote node postgres@localhost:xxxxx failed with the following error: connection not open
 SELECT count(*) FROM pg_dist_shard WHERE logicalrelid='create_distributed_table_non_empty_failure.test_table'::regclass;
  count
 ---------------------------------------------------------------------
@@ -164,7 +164,7 @@ SELECT citus.mitmproxy('conn.onQuery(query="CREATE TABLE").kill()');
 (1 row)
 
 SELECT create_distributed_table('test_table', 'id');
-ERROR:  connection to the remote node localhost:xxxxx failed with the following error: connection not open
+ERROR:  connection to the remote node postgres@localhost:xxxxx failed with the following error: connection not open
 SELECT count(*) FROM pg_dist_shard WHERE logicalrelid='create_distributed_table_non_empty_failure.test_table'::regclass;
  count
 ---------------------------------------------------------------------
@@ -196,9 +196,6 @@ SELECT citus.mitmproxy('conn.onCommandComplete(command="COPY").kill()');
 
 SELECT create_distributed_table('test_table', 'id');
 NOTICE:  Copying data from local table...
-NOTICE:  copying the data has completed
-DETAIL:  The local data in the table is no longer visible, but is still on disk.
-HINT:  To remove the local data, run: SELECT truncate_local_data_after_distributing_table($$create_distributed_table_non_empty_failure.test_table$$)
 ERROR:  failed to COPY to shard xxxxx on localhost:xxxxx
 SELECT count(*) FROM pg_dist_shard WHERE logicalrelid='create_distributed_table_non_empty_failure.test_table'::regclass;
  count
@@ -231,9 +228,6 @@ SELECT citus.mitmproxy('conn.onCommandComplete(command="COPY").cancel(' ||  pg_b
 
 SELECT create_distributed_table('test_table', 'id');
 NOTICE:  Copying data from local table...
-NOTICE:  copying the data has completed
-DETAIL:  The local data in the table is no longer visible, but is still on disk.
-HINT:  To remove the local data, run: SELECT truncate_local_data_after_distributing_table($$create_distributed_table_non_empty_failure.test_table$$)
 ERROR:  canceling statement due to user request
 SELECT count(*) FROM pg_dist_shard WHERE logicalrelid='create_distributed_table_non_empty_failure.test_table'::regclass;
  count
@@ -442,7 +436,7 @@ SELECT citus.mitmproxy('conn.onQuery(query="^BEGIN TRANSACTION ISOLATION LEVEL R
 (1 row)
 
 SELECT create_distributed_table('test_table', 'id', colocate_with => 'colocated_table');
-ERROR:  connection to the remote node localhost:xxxxx failed with the following error: connection not open
+ERROR:  connection to the remote node postgres@localhost:xxxxx failed with the following error: connection not open
 SELECT count(*) FROM pg_dist_shard WHERE logicalrelid='create_distributed_table_non_empty_failure.test_table'::regclass;
  count
 ---------------------------------------------------------------------
@@ -525,7 +519,7 @@ SELECT citus.mitmproxy('conn.onQuery(query="^SELECT worker_apply_shard_ddl_comma
 (1 row)
 
 SELECT create_distributed_table('test_table', 'id', colocate_with => 'colocated_table');
-ERROR:  connection to the remote node localhost:xxxxx failed with the following error: connection not open
+ERROR:  connection to the remote node postgres@localhost:xxxxx failed with the following error: connection not open
 SELECT count(*) FROM pg_dist_shard WHERE logicalrelid='create_distributed_table_non_empty_failure.test_table'::regclass;
  count
 ---------------------------------------------------------------------
@@ -686,7 +680,7 @@ SELECT citus.mitmproxy('conn.onQuery(query="CREATE TABLE").kill()');
 (1 row)
 
 SELECT create_distributed_table('test_table', 'id');
-ERROR:  connection to the remote node localhost:xxxxx failed with the following error: connection not open
+ERROR:  connection to the remote node postgres@localhost:xxxxx failed with the following error: connection not open
 SELECT count(*) FROM pg_dist_shard WHERE logicalrelid='create_distributed_table_non_empty_failure.test_table'::regclass;
  count
 ---------------------------------------------------------------------
@@ -907,7 +901,7 @@ SELECT citus.mitmproxy('conn.onQuery(query="^BEGIN TRANSACTION ISOLATION LEVEL R
 (1 row)
 
 SELECT create_distributed_table('test_table', 'id', colocate_with => 'colocated_table');
-ERROR:  connection to the remote node localhost:xxxxx failed with the following error: connection not open
+ERROR:  connection to the remote node postgres@localhost:xxxxx failed with the following error: connection not open
 SELECT count(*) FROM pg_dist_shard WHERE logicalrelid='create_distributed_table_non_empty_failure.test_table'::regclass;
  count
 ---------------------------------------------------------------------

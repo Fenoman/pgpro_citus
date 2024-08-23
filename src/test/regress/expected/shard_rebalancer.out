@@ -3,6 +3,23 @@
 --
 SET citus.next_shard_id TO 433000;
 SET citus.propagate_session_settings_for_loopback_connection TO ON;
+-- Because of historic reasons this test was written in a way that assumes that
+-- by_shard_count is the default strategy.
+SELECT citus_set_default_rebalance_strategy('by_shard_count');
+ citus_set_default_rebalance_strategy
+---------------------------------------------------------------------
+
+(1 row)
+
+-- Lower the minimum disk size that a shard group is considered as. Otherwise
+-- we need to create shards of more than 100MB.
+ALTER SYSTEM SET citus.rebalancer_by_disk_size_base_cost = 0;
+SELECT pg_reload_conf();
+ pg_reload_conf
+---------------------------------------------------------------------
+ t
+(1 row)
+
 CREATE TABLE ref_table_test(a int primary key);
 SELECT create_reference_table('ref_table_test');
  create_reference_table
@@ -110,7 +127,7 @@ SELECT pg_sleep(.1); -- wait to make sure the config has changed before running 
 (1 row)
 
 SELECT master_drain_node('localhost', :master_port);
-ERROR:  connection to the remote node foobar:57636 failed with the following error: could not translate host name "foobar" to address: <system specific error>
+ERROR:  connection to the remote node postgres@foobar:57636 failed with the following error: could not translate host name "foobar" to address: <system specific error>
 CALL citus_cleanup_orphaned_resources();
 ALTER SYSTEM RESET citus.local_hostname;
 SELECT pg_reload_conf();
@@ -180,7 +197,7 @@ SELECT pg_sleep(.1); -- wait to make sure the config has changed before running 
 (1 row)
 
 SELECT replicate_table_shards('dist_table_test_2',  max_shard_copies := 4,  shard_transfer_mode:='block_writes');
-ERROR:  connection to the remote node foobar:57636 failed with the following error: could not translate host name "foobar" to address: <system specific error>
+ERROR:  connection to the remote node postgres@foobar:57636 failed with the following error: could not translate host name "foobar" to address: <system specific error>
 ALTER SYSTEM RESET citus.local_hostname;
 SELECT pg_reload_conf();
  pg_reload_conf
@@ -222,7 +239,7 @@ NOTICE:  issuing SET LOCAL citus.shard_count TO '4';
 DETAIL:  on server postgres@localhost:xxxxx connectionId: xxxxxxx
 NOTICE:  issuing SET LOCAL citus.shard_replication_factor TO '2';
 DETAIL:  on server postgres@localhost:xxxxx connectionId: xxxxxxx
-NOTICE:  issuing SELECT citus_copy_shard_placement(43xxxx,xx,xx,'block_writes')
+NOTICE:  issuing SELECT pg_catalog.citus_copy_shard_placement(43xxxx,xx,xx,'block_writes')
 DETAIL:  on server postgres@localhost:xxxxx connectionId: xxxxxxx
 NOTICE:  issuing COMMIT
 DETAIL:  on server postgres@localhost:xxxxx connectionId: xxxxxxx
@@ -245,7 +262,7 @@ NOTICE:  issuing SET LOCAL citus.shard_count TO '4';
 DETAIL:  on server postgres@localhost:xxxxx connectionId: xxxxxxx
 NOTICE:  issuing SET LOCAL citus.shard_replication_factor TO '2';
 DETAIL:  on server postgres@localhost:xxxxx connectionId: xxxxxxx
-NOTICE:  issuing SELECT citus_copy_shard_placement(43xxxx,xx,xx,'block_writes')
+NOTICE:  issuing SELECT pg_catalog.citus_copy_shard_placement(43xxxx,xx,xx,'block_writes')
 DETAIL:  on server postgres@localhost:xxxxx connectionId: xxxxxxx
 NOTICE:  issuing COMMIT
 DETAIL:  on server postgres@localhost:xxxxx connectionId: xxxxxxx
@@ -268,7 +285,7 @@ NOTICE:  issuing SET LOCAL citus.shard_count TO '4';
 DETAIL:  on server postgres@localhost:xxxxx connectionId: xxxxxxx
 NOTICE:  issuing SET LOCAL citus.shard_replication_factor TO '2';
 DETAIL:  on server postgres@localhost:xxxxx connectionId: xxxxxxx
-NOTICE:  issuing SELECT citus_copy_shard_placement(43xxxx,xx,xx,'block_writes')
+NOTICE:  issuing SELECT pg_catalog.citus_copy_shard_placement(43xxxx,xx,xx,'block_writes')
 DETAIL:  on server postgres@localhost:xxxxx connectionId: xxxxxxx
 NOTICE:  issuing COMMIT
 DETAIL:  on server postgres@localhost:xxxxx connectionId: xxxxxxx
@@ -291,7 +308,7 @@ NOTICE:  issuing SET LOCAL citus.shard_count TO '4';
 DETAIL:  on server postgres@localhost:xxxxx connectionId: xxxxxxx
 NOTICE:  issuing SET LOCAL citus.shard_replication_factor TO '2';
 DETAIL:  on server postgres@localhost:xxxxx connectionId: xxxxxxx
-NOTICE:  issuing SELECT citus_copy_shard_placement(43xxxx,xx,xx,'block_writes')
+NOTICE:  issuing SELECT pg_catalog.citus_copy_shard_placement(43xxxx,xx,xx,'block_writes')
 DETAIL:  on server postgres@localhost:xxxxx connectionId: xxxxxxx
 NOTICE:  issuing COMMIT
 DETAIL:  on server postgres@localhost:xxxxx connectionId: xxxxxxx
@@ -664,7 +681,7 @@ FROM (
          FROM pg_dist_shard
          WHERE logicalrelid = 'rebalance_test_table'::regclass
      ) T;
-ERROR:  connection to the remote node foobar:57636 failed with the following error: could not translate host name "foobar" to address: <system specific error>
+ERROR:  connection to the remote node postgres@foobar:57636 failed with the following error: could not translate host name "foobar" to address: <system specific error>
 CALL citus_cleanup_orphaned_resources();
 ALTER SYSTEM RESET citus.local_hostname;
 SELECT pg_reload_conf();
@@ -2182,7 +2199,7 @@ SELECT 1 FROM master_remove_node('localhost', :master_port);
         1
 (1 row)
 
-SELECT public.wait_until_metadata_sync(30000);
+SELECT public.wait_until_metadata_sync(60000);
  wait_until_metadata_sync
 ---------------------------------------------------------------------
 
@@ -2536,12 +2553,18 @@ SELECT public.wait_until_metadata_sync(30000);
 
 (1 row)
 
+-- errors out because shard replication factor > shard allowed node count
+SELECT rebalance_table_shards('test_rebalance_with_disabled_worker');
+ERROR:  Shard replication factor (2) cannot be greater than number of nodes with should_have_shards=true (1).
+-- set replication factor to one, and try again
+SET citus.shard_replication_factor TO 1;
 SELECT rebalance_table_shards('test_rebalance_with_disabled_worker');
  rebalance_table_shards
 ---------------------------------------------------------------------
 
 (1 row)
 
+SET citus.shard_replication_factor TO 2;
 SELECT 1 FROM citus_activate_node('localhost', :worker_2_port);
  ?column?
 ---------------------------------------------------------------------
@@ -2558,7 +2581,7 @@ SELECT create_distributed_table('test_with_all_shards_excluded', 'a', colocate_w
 
 (1 row)
 
-SELECT shardid FROM pg_dist_shard;
+SELECT shardid FROM pg_dist_shard ORDER BY shardid ASC;
  shardid
 ---------------------------------------------------------------------
   433504
@@ -2854,6 +2877,19 @@ select 1 from citus_add_node('localhost', :worker_2_port);
 select rebalance_table_shards();
 ERROR:  cannot use logical replication to transfer shards of the relation table_without_primary_key since it doesn't have a REPLICA IDENTITY or PRIMARY KEY
 DROP TABLE table_with_primary_key, table_without_primary_key;
+SELECT citus_set_default_rebalance_strategy('by_disk_size');
+ citus_set_default_rebalance_strategy
+---------------------------------------------------------------------
+
+(1 row)
+
+ALTER SYSTEM RESET citus.rebalancer_by_disk_size_base_cost;
+SELECT pg_reload_conf();
+ pg_reload_conf
+---------------------------------------------------------------------
+ t
+(1 row)
+
 \c - - - :worker_1_port
 SET citus.enable_ddl_propagation TO OFF;
 REVOKE ALL ON SCHEMA public FROM testrole;

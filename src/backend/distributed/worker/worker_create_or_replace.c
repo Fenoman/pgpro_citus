@@ -9,23 +9,24 @@
 
 #include "postgres.h"
 
+#include "fmgr.h"
+#include "funcapi.h"
+
 #include "access/htup_details.h"
 #include "catalog/dependency.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_ts_config.h"
 #include "catalog/pg_type.h"
-#include "fmgr.h"
-#include "funcapi.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodes.h"
 #include "parser/parse_type.h"
 #include "tcop/dest.h"
 #include "tcop/utility.h"
 #include "utils/builtins.h"
-#include "utils/syscache.h"
 #include "utils/lsyscache.h"
 #include "utils/regproc.h"
+#include "utils/syscache.h"
 
 #include "distributed/commands.h"
 #include "distributed/commands/utility_hook.h"
@@ -525,8 +526,8 @@ CreateRenameTypeStmt(const ObjectAddress *address, char *newName)
 	RenameStmt *stmt = makeNode(RenameStmt);
 
 	stmt->renameType = OBJECT_TYPE;
-	stmt->object = (Node *) stringToQualifiedNameList(format_type_be_qualified(
-														  address->objectId));
+	stmt->object = (Node *) stringToQualifiedNameList_compat(format_type_be_qualified(
+																 address->objectId));
 	stmt->newname = newName;
 
 

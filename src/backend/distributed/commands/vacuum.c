@@ -10,10 +10,16 @@
 
 #include "postgres.h"
 
-#include "distributed/pg_version_constants.h"
-
+#include "access/xact.h"
 #include "commands/defrem.h"
 #include "commands/vacuum.h"
+#include "postmaster/bgworker_internals.h"
+#include "storage/lmgr.h"
+#include "utils/builtins.h"
+#include "utils/lsyscache.h"
+
+#include "pg_version_constants.h"
+
 #include "distributed/adaptive_executor.h"
 #include "distributed/commands.h"
 #include "distributed/commands/utility_hook.h"
@@ -24,11 +30,6 @@
 #include "distributed/resource_lock.h"
 #include "distributed/transaction_management.h"
 #include "distributed/version_compat.h"
-#include "storage/lmgr.h"
-#include "utils/builtins.h"
-#include "utils/lsyscache.h"
-#include "postmaster/bgworker_internals.h"
-#include "access/xact.h"
 
 
 #define VACUUM_PARALLEL_NOTSET -2
@@ -42,6 +43,9 @@ typedef struct CitusVacuumParams
 	VacOptValue truncate;
 	VacOptValue index_cleanup;
 	int nworkers;
+#if PG_VERSION_NUM >= PG_VERSION_16
+	int ring_size;
+#endif
 } CitusVacuumParams;
 
 /* Local functions forward declarations for processing distributed table commands */
@@ -318,13 +322,26 @@ DeparseVacuumStmtPrefix(CitusVacuumParams vacuumParams)
 	}
 
 	/* if no flags remain, exit early */
-	if (vacuumFlags == 0 &&
-		vacuumParams.truncate == VACOPTVALUE_UNSPECIFIED &&
-		vacuumParams.index_cleanup == VACOPTVALUE_UNSPECIFIED &&
-		vacuumParams.nworkers == VACUUM_PARALLEL_NOTSET
-		)
+#if PG_VERSION_NUM >= PG_VERSION_16
+	if (vacuumFlags & VACOPT_PROCESS_TOAST &&
+		vacuumFlags & VACOPT_PROCESS_MAIN)
 	{
-		return vacuumPrefix->data;
+		/* process toast and process main are true by default */
+		if (((vacuumFlags & ~VACOPT_PROCESS_TOAST) & ~VACOPT_PROCESS_MAIN) == 0 &&
+			vacuumParams.ring_size == -1 &&
+#else
+	if (vacuumFlags & VACOPT_PROCESS_TOAST)
+	{
+		/* process toast is true by default */
+		if ((vacuumFlags & ~VACOPT_PROCESS_TOAST) == 0 &&
+#endif
+			vacuumParams.truncate == VACOPTVALUE_UNSPECIFIED &&
+			vacuumParams.index_cleanup == VACOPTVALUE_UNSPECIFIED &&
+			vacuumParams.nworkers == VACUUM_PARALLEL_NOTSET
+			)
+		{
+			return vacuumPrefix->data;
+		}
 	}
 
 	/* otherwise, handle options */
@@ -359,12 +376,34 @@ DeparseVacuumStmtPrefix(CitusVacuumParams vacuumParams)
 	{
 		appendStringInfoString(vacuumPrefix, "SKIP_LOCKED,");
 	}
-	#if PG_VERSION_NUM >= PG_VERSION_14
-	if (vacuumFlags & VACOPT_PROCESS_TOAST)
+
+	if (!(vacuumFlags & VACOPT_PROCESS_TOAST))
 	{
-		appendStringInfoString(vacuumPrefix, "PROCESS_TOAST,");
+		appendStringInfoString(vacuumPrefix, "PROCESS_TOAST FALSE,");
 	}
-	#endif
+
+#if PG_VERSION_NUM >= PG_VERSION_16
+	if (!(vacuumFlags & VACOPT_PROCESS_MAIN))
+	{
+		appendStringInfoString(vacuumPrefix, "PROCESS_MAIN FALSE,");
+	}
+
+	if (vacuumFlags & VACOPT_SKIP_DATABASE_STATS)
+	{
+		appendStringInfoString(vacuumPrefix, "SKIP_DATABASE_STATS,");
+	}
+
+	if (vacuumFlags & VACOPT_ONLY_DATABASE_STATS)
+	{
+		appendStringInfoString(vacuumPrefix, "ONLY_DATABASE_STATS,");
+	}
+
+	if (vacuumParams.ring_size != -1)
+	{
+		appendStringInfo(vacuumPrefix, "BUFFER_USAGE_LIMIT %d,", vacuumParams.ring_size);
+	}
+#endif
+
 	if (vacuumParams.truncate != VACOPTVALUE_UNSPECIFIED)
 	{
 		appendStringInfoString(vacuumPrefix,
@@ -389,13 +428,11 @@ DeparseVacuumStmtPrefix(CitusVacuumParams vacuumParams)
 				break;
 			}
 
-			#if PG_VERSION_NUM >= PG_VERSION_14
 			case VACOPTVALUE_AUTO:
 			{
 				appendStringInfoString(vacuumPrefix, "INDEX_CLEANUP auto,");
 				break;
 			}
-			#endif
 
 			default:
 			{
@@ -501,9 +538,14 @@ VacuumStmtParams(VacuumStmt *vacstmt)
 	bool freeze = false;
 	bool full = false;
 	bool disable_page_skipping = false;
-	#if PG_VERSION_NUM >= PG_VERSION_14
-	bool process_toast = false;
-	#endif
+	bool process_toast = true;
+
+#if PG_VERSION_NUM >= PG_VERSION_16
+	bool process_main = true;
+	bool skip_database_stats = false;
+	bool only_database_stats = false;
+	params.ring_size = -1;
+#endif
 
 	/* Set default value */
 	params.index_cleanup = VACOPTVALUE_UNSPECIFIED;
@@ -523,6 +565,13 @@ VacuumStmtParams(VacuumStmt *vacstmt)
 		{
 			skip_locked = defGetBoolean(opt);
 		}
+#if PG_VERSION_NUM >= PG_VERSION_16
+		else if (strcmp(opt->defname, "buffer_usage_limit") == 0)
+		{
+			char *vac_buffer_size = defGetString(opt);
+			parse_int(vac_buffer_size, &params.ring_size, GUC_UNIT_KB, NULL);
+		}
+#endif
 		else if (!vacstmt->is_vacuumcmd)
 		{
 			ereport(ERROR,
@@ -547,16 +596,26 @@ VacuumStmtParams(VacuumStmt *vacstmt)
 		{
 			disable_page_skipping = defGetBoolean(opt);
 		}
-		#if PG_VERSION_NUM >= PG_VERSION_14
+#if PG_VERSION_NUM >= PG_VERSION_16
+		else if (strcmp(opt->defname, "process_main") == 0)
+		{
+			process_main = defGetBoolean(opt);
+		}
+		else if (strcmp(opt->defname, "skip_database_stats") == 0)
+		{
+			skip_database_stats = defGetBoolean(opt);
+		}
+		else if (strcmp(opt->defname, "only_database_stats") == 0)
+		{
+			only_database_stats = defGetBoolean(opt);
+		}
+#endif
 		else if (strcmp(opt->defname, "process_toast") == 0)
 		{
 			process_toast = defGetBoolean(opt);
 		}
-		#endif
 		else if (strcmp(opt->defname, "index_cleanup") == 0)
 		{
-			#if PG_VERSION_NUM >= PG_VERSION_14
-
 			/* Interpret no string as the default, which is 'auto' */
 			if (!opt->arg)
 			{
@@ -577,10 +636,6 @@ VacuumStmtParams(VacuumStmt *vacstmt)
 										   VACOPTVALUE_DISABLED;
 				}
 			}
-			#else
-			params.index_cleanup = defGetBoolean(opt) ? VACOPTVALUE_ENABLED :
-								   VACOPTVALUE_DISABLED;
-			#endif
 		}
 		else if (strcmp(opt->defname, "truncate") == 0)
 		{
@@ -625,9 +680,12 @@ VacuumStmtParams(VacuumStmt *vacstmt)
 					 (analyze ? VACOPT_ANALYZE : 0) |
 					 (freeze ? VACOPT_FREEZE : 0) |
 					 (full ? VACOPT_FULL : 0) |
-					 #if PG_VERSION_NUM >= PG_VERSION_14
+#if PG_VERSION_NUM >= PG_VERSION_16
+					 (process_main ? VACOPT_PROCESS_MAIN : 0) |
+					 (skip_database_stats ? VACOPT_SKIP_DATABASE_STATS : 0) |
+					 (only_database_stats ? VACOPT_ONLY_DATABASE_STATS : 0) |
+#endif
 					 (process_toast ? VACOPT_PROCESS_TOAST : 0) |
-					 #endif
 					 (disable_page_skipping ? VACOPT_DISABLE_PAGE_SKIPPING : 0);
 	return params;
 }

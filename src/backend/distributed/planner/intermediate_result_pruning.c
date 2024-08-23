@@ -12,6 +12,11 @@
  *-------------------------------------------------------------------------
  */
 
+#include "postgres.h"
+
+#include "common/hashfn.h"
+#include "utils/builtins.h"
+
 #include "distributed/citus_custom_scan.h"
 #include "distributed/citus_ruleutils.h"
 #include "distributed/intermediate_result_pruning.h"
@@ -20,8 +25,6 @@
 #include "distributed/metadata_cache.h"
 #include "distributed/query_utils.h"
 #include "distributed/worker_manager.h"
-#include "utils/builtins.h"
-#include "common/hashfn.h"
 
 /* controlled via GUC, used mostly for testing */
 bool LogIntermediateResults = false;
@@ -69,7 +72,7 @@ FindSubPlanUsages(DistributedPlan *plan)
 												SUBPLAN_ACCESS_REMOTE);
 	}
 
-	if (plan->insertSelectQuery != NULL)
+	if (plan->modifyQueryViaCoordinatorOrRepartition != NULL)
 	{
 		/* INSERT..SELECT plans currently do not have a workerJob */
 		Assert(plan->workerJob == NULL);
@@ -79,8 +82,9 @@ FindSubPlanUsages(DistributedPlan *plan)
 		 * perform pruning. We therefore require all subplans used in the
 		 * INSERT..SELECT to be available all nodes.
 		 */
-		remoteSubPlans = FindSubPlansUsedInNode((Node *) plan->insertSelectQuery,
-												SUBPLAN_ACCESS_ANYWHERE);
+		remoteSubPlans =
+			FindSubPlansUsedInNode((Node *) plan->modifyQueryViaCoordinatorOrRepartition,
+								   SUBPLAN_ACCESS_ANYWHERE);
 	}
 
 	/* merge the used subplans */

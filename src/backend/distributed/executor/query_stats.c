@@ -9,32 +9,32 @@
  *-------------------------------------------------------------------------
  */
 
+#include <unistd.h>
+
 #include "postgres.h"
 
-#include "safe_lib.h"
-
+#include "funcapi.h"
 #include "miscadmin.h"
-
-#include "distributed/pg_version_constants.h"
+#include "safe_lib.h"
 
 #include "access/hash.h"
 #include "catalog/pg_authid.h"
+#include "storage/fd.h"
+#include "storage/ipc.h"
+#include "storage/spin.h"
+#include "tcop/utility.h"
+#include "utils/builtins.h"
+
+#include "pg_version_constants.h"
+
 #include "distributed/citus_safe_lib.h"
 #include "distributed/function_utils.h"
 #include "distributed/hash_helpers.h"
 #include "distributed/multi_executor.h"
 #include "distributed/multi_server_executor.h"
-#include "distributed/version_compat.h"
 #include "distributed/query_stats.h"
 #include "distributed/tuplestore.h"
-#include "funcapi.h"
-#include "storage/ipc.h"
-#include "storage/fd.h"
-#include "storage/spin.h"
-#include "tcop/utility.h"
-#include "utils/builtins.h"
-
-#include <unistd.h>
+#include "distributed/version_compat.h"
 
 #define CITUS_STATS_DUMP_FILE "pg_stat/citus_query_stats.stat"
 #define CITUS_STAT_STATEMENTS_COLS 6
@@ -797,11 +797,7 @@ BuildExistingQueryIdHash(void)
 {
 	const int userIdAttributeNumber = 1;
 	const int dbIdAttributeNumber = 2;
-#if PG_VERSION_NUM >= PG_VERSION_14
 	const int queryIdAttributeNumber = 4;
-#else
-	const int queryIdAttributeNumber = 3;
-#endif
 	Datum commandTypeDatum = (Datum) 0;
 	bool missingOK = true;
 

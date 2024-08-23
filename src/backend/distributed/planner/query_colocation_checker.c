@@ -21,25 +21,25 @@
 
 #include "postgres.h"
 
-#include "distributed/pg_version_constants.h"
-
 #include "access/relation.h"
-#include "distributed/multi_logical_planner.h"
-#include "distributed/query_colocation_checker.h"
-#include "distributed/pg_dist_partition.h"
-#include "distributed/relation_restriction_equivalence.h"
-#include "distributed/metadata_cache.h"
-#include "distributed/multi_logical_planner.h" /* only to access utility functions */
-
 #include "catalog/pg_type.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
-#include "parser/parsetree.h"
-#include "distributed/listutils.h"
-#include "parser/parse_relation.h"
 #include "optimizer/planner.h"
 #include "optimizer/prep.h"
+#include "parser/parse_relation.h"
+#include "parser/parsetree.h"
 #include "utils/rel.h"
+
+#include "pg_version_constants.h"
+
+#include "distributed/listutils.h"
+#include "distributed/metadata_cache.h"
+#include "distributed/multi_logical_planner.h"
+#include "distributed/multi_logical_planner.h" /* only to access utility functions */
+#include "distributed/pg_dist_partition.h"
+#include "distributed/query_colocation_checker.h"
+#include "distributed/relation_restriction_equivalence.h"
 
 
 static RangeTblEntry * AnchorRte(Query *subquery);
@@ -83,7 +83,16 @@ CreateColocatedJoinChecker(Query *subquery, PlannerRestrictionContext *restricti
 		 * functions (i.e., FilterPlannerRestrictionForQuery()) rely on queries
 		 * not relations.
 		 */
-		anchorSubquery = WrapRteRelationIntoSubquery(anchorRangeTblEntry, NIL);
+#if PG_VERSION_NUM >= PG_VERSION_16
+		RTEPermissionInfo *perminfo = NULL;
+		if (anchorRangeTblEntry->perminfoindex)
+		{
+			perminfo = getRTEPermissionInfo(subquery->rteperminfos, anchorRangeTblEntry);
+		}
+		anchorSubquery = WrapRteRelationIntoSubquery(anchorRangeTblEntry, NIL, perminfo);
+#else
+		anchorSubquery = WrapRteRelationIntoSubquery(anchorRangeTblEntry, NIL, NULL);
+#endif
 	}
 	else if (anchorRangeTblEntry->rtekind == RTE_SUBQUERY)
 	{
@@ -126,7 +135,7 @@ static RangeTblEntry *
 AnchorRte(Query *subquery)
 {
 	FromExpr *joinTree = subquery->jointree;
-	Relids joinRelIds = get_relids_in_jointree((Node *) joinTree, false);
+	Relids joinRelIds = get_relids_in_jointree_compat((Node *) joinTree, false, false);
 	int currentRTEIndex = -1;
 	RangeTblEntry *anchorRangeTblEntry = NULL;
 
@@ -168,11 +177,10 @@ AnchorRte(Query *subquery)
 		{
 			Oid relationId = currentRte->relid;
 
-			if (IsCitusTable(relationId) && !HasDistributionKey(relationId))
+			if (!IsCitusTableType(relationId, DISTRIBUTED_TABLE))
 			{
 				/*
-				 * Non-distributed tables should not be the anchor rte since they
-				 * don't have distribution key.
+				 * We're not interested in non distributed relations.
 				 */
 				continue;
 			}
@@ -267,7 +275,9 @@ SubqueryColocated(Query *subquery, ColocatedJoinChecker *checker)
  * designed for generating a stub query.
  */
 Query *
-WrapRteRelationIntoSubquery(RangeTblEntry *rteRelation, List *requiredAttributes)
+WrapRteRelationIntoSubquery(RangeTblEntry *rteRelation,
+							List *requiredAttributes,
+							RTEPermissionInfo *perminfo)
 {
 	Query *subquery = makeNode(Query);
 	RangeTblRef *newRangeTableRef = makeNode(RangeTblRef);
@@ -277,6 +287,14 @@ WrapRteRelationIntoSubquery(RangeTblEntry *rteRelation, List *requiredAttributes
 	/* we copy the input rteRelation to preserve the rteIdentity */
 	RangeTblEntry *newRangeTableEntry = copyObject(rteRelation);
 	subquery->rtable = list_make1(newRangeTableEntry);
+
+#if PG_VERSION_NUM >= PG_VERSION_16
+	if (perminfo)
+	{
+		newRangeTableEntry->perminfoindex = 1;
+		subquery->rteperminfos = list_make1(perminfo);
+	}
+#endif
 
 	/* set the FROM expression to the subquery */
 	newRangeTableRef = makeNode(RangeTblRef);
@@ -415,7 +433,7 @@ CreateTargetEntryForColumn(Form_pg_attribute attributeTuple, Index rteIndex,
 				attributeTuple->atttypmod, attributeTuple->attcollation, 0);
 	TargetEntry *targetEntry =
 		makeTargetEntry((Expr *) targetColumn, resno,
-						strdup(attributeTuple->attname.data), false);
+						pstrdup(attributeTuple->attname.data), false);
 	return targetEntry;
 }
 
@@ -431,7 +449,7 @@ CreateTargetEntryForNullCol(Form_pg_attribute attributeTuple, int resno)
 											attributeTuple->attcollation);
 	char *resName = attributeTuple->attname.data;
 	TargetEntry *targetEntry =
-		makeTargetEntry(nullExpr, resno, strdup(resName), false);
+		makeTargetEntry(nullExpr, resno, pstrdup(resName), false);
 	return targetEntry;
 }
 

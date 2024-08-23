@@ -16,23 +16,26 @@
  */
 
 #include "postgres.h"
+
 #include "miscadmin.h"
 
 #include "catalog/objectaddress.h"
 #include "catalog/pg_type.h"
-#include "distributed/citus_ruleutils.h"
-#include "distributed/citus_safe_lib.h"
-#include "distributed/metadata/dependency.h"
-#include "distributed/metadata/distobject.h"
-#include "distributed/pg_version_constants.h"
-#include "distributed/version_compat.h"
+#include "mb/pg_wchar.h"
 #include "nodes/value.h"
+#include "parser/parse_type.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/varlena.h"
-#include "mb/pg_wchar.h"
-#include "parser/parse_type.h"
+
+#include "pg_version_constants.h"
+
+#include "distributed/citus_ruleutils.h"
+#include "distributed/citus_safe_lib.h"
+#include "distributed/metadata/dependency.h"
+#include "distributed/metadata/distobject.h"
+#include "distributed/version_compat.h"
 
 static void ErrorIfCurrentUserCanNotDistributeObject(char *textType,
 													 ObjectType type,
@@ -93,7 +96,7 @@ PgGetObjectAddress(char *ttype, ArrayType *namearr, ArrayType *argsarr)
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("name or argument lists may not contain nulls")));
 		}
-		typename = typeStringToTypeName(TextDatumGetCString(elems[0]));
+		typename = typeStringToTypeName_compat(TextDatumGetCString(elems[0]), NULL);
 	}
 	else if (type == OBJECT_LARGEOBJECT)
 	{
@@ -160,7 +163,8 @@ PgGetObjectAddress(char *ttype, ArrayType *namearr, ArrayType *argsarr)
 						 errmsg("name or argument lists may not contain nulls")));
 			}
 			args = lappend(args,
-						   typeStringToTypeName(TextDatumGetCString(elems[i])));
+						   typeStringToTypeName_compat(TextDatumGetCString(elems[i]),
+													   NULL));
 		}
 	}
 	else

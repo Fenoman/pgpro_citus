@@ -17,7 +17,9 @@
 #include "postgres.h"
 
 #include "fmgr.h"
+
 #include "nodes/pg_list.h"
+
 #include "distributed/coordinator_protocol.h"
 #include "distributed/worker_manager.h"
 
@@ -188,6 +190,7 @@ typedef struct RebalancePlanFunctions
 
 extern char *VariablesToBePassedToNewConnections;
 extern int MaxRebalancerLoggedIgnoredMoves;
+extern int RebalancerByDiskSizeBaseCost;
 extern bool RunningUnderIsolationTest;
 extern bool PropagateSessionSettingsForLoopbackConnection;
 extern int MaxBackgroundTaskExecutorsPerNode;

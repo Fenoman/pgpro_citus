@@ -8,12 +8,6 @@
 
 #include "postgres.h"
 
-#include "distributed/citus_clauses.h"
-#include "distributed/insert_select_planner.h"
-#include "distributed/metadata_cache.h"
-#include "distributed/multi_router_planner.h"
-#include "distributed/version_compat.h"
-
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
 #include "executor/executor.h"
@@ -27,6 +21,12 @@
 #include "utils/datum.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
+
+#include "distributed/citus_clauses.h"
+#include "distributed/insert_select_planner.h"
+#include "distributed/metadata_cache.h"
+#include "distributed/multi_router_planner.h"
+#include "distributed/version_compat.h"
 
 
 /* private function declarations */
@@ -528,9 +528,9 @@ FixFunctionArgumentsWalker(Node *expr, void *context)
 			elog(ERROR, "cache lookup failed for function %u", funcExpr->funcid);
 		}
 
-		funcExpr->args = expand_function_arguments_compat(funcExpr->args, false,
-														  funcExpr->funcresulttype,
-														  func_tuple);
+		funcExpr->args = expand_function_arguments(funcExpr->args, false,
+												   funcExpr->funcresulttype,
+												   func_tuple);
 
 		ReleaseSysCache(func_tuple);
 	}

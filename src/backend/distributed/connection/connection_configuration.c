@@ -12,6 +12,10 @@
 
 #include "access/transam.h"
 #include "access/xact.h"
+#include "mb/pg_wchar.h"
+#include "postmaster/postmaster.h"
+#include "utils/builtins.h"
+
 #include "distributed/backend_data.h"
 #include "distributed/citus_safe_lib.h"
 #include "distributed/connection_management.h"
@@ -19,12 +23,20 @@
 #include "distributed/metadata_cache.h"
 #include "distributed/worker_manager.h"
 
-#include "postmaster/postmaster.h"
-#include "mb/pg_wchar.h"
-#include "utils/builtins.h"
-
 /* stores the string representation of our node connection GUC */
-char *NodeConninfo = "";
+#ifdef USE_SSL
+char *NodeConninfo = "sslmode=require";
+#else
+char *NodeConninfo = "sslmode=prefer";
+#endif
+
+/*
+ * Previously we would use an empty initial value for NodeConnInfo
+ * PG16 however requires same initial and boot values for configuration parameters
+ * Therefore we now use this flag in NodeConninfoGucAssignHook
+ */
+bool checkAtBootPassed = false;
+
 char *LocalHostName = "localhost";
 
 /* represents a list of libpq parameter settings */
@@ -111,6 +123,10 @@ AddConnParam(const char *keyword, const char *value)
 						errmsg("ConnParams arrays bound check failed")));
 	}
 
+	/*
+	 * Don't use pstrdup here to avoid being tied to a memory context, we free
+	 * these later using ResetConnParams
+	 */
 	ConnParams.keywords[ConnParams.size] = strdup(keyword);
 	ConnParams.values[ConnParams.size] = strdup(value);
 	ConnParams.size++;
@@ -183,7 +199,7 @@ CheckConninfo(const char *conninfo, const char **allowedConninfoKeywords,
 		const char *prev = allowedConninfoKeywords[keywordIdx - 1];
 		const char *curr = allowedConninfoKeywords[keywordIdx];
 
-		AssertArg(strcmp(prev, curr) < 0);
+		Assert(strcmp(prev, curr) < 0);
 	}
 #endif
 
@@ -255,9 +271,24 @@ GetConnParams(ConnectionHashKey *key, char ***keywords, char ***values,
 	 * We allocate everything in the provided context so as to facilitate using
 	 * pfree on all runtime parameters when connections using these entries are
 	 * invalidated during config reloads.
+	 *
+	 * Also, when "host" is already provided in global parameters, we use hostname
+	 * from the key as "hostaddr" instead of "host" to avoid host name lookup. In
+	 * that case, the value for "host" becomes useful only if the authentication
+	 * method requires it.
 	 */
+	bool gotHostParamFromGlobalParams = false;
+	for (Size paramIndex = 0; paramIndex < ConnParams.size; paramIndex++)
+	{
+		if (strcmp(ConnParams.keywords[paramIndex], "host") == 0)
+		{
+			gotHostParamFromGlobalParams = true;
+			break;
+		}
+	}
+
 	const char *runtimeKeywords[] = {
-		"host",
+		gotHostParamFromGlobalParams ? "hostaddr" : "host",
 		"port",
 		"dbname",
 		"user",

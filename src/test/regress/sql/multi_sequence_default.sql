@@ -12,7 +12,6 @@ SET search_path = sequence_default, public;
 
 
 -- test both distributed and citus local tables
-SELECT 1 FROM citus_add_node('localhost', :master_port, groupId => 0);
 -- Cannot add a column involving DEFAULT nextval('..') because the table is not empty
 CREATE SEQUENCE seq_0;
 CREATE SEQUENCE seq_0_local_table;
@@ -66,6 +65,7 @@ CREATE TABLE seq_test_4 (x int, y int);
 SELECT create_distributed_table('seq_test_4','x');
 CREATE SEQUENCE seq_4;
 ALTER TABLE seq_test_4 ADD COLUMN a bigint DEFAULT nextval('seq_4');
+ALTER TABLE seq_test_4 ADD COLUMN IF NOT EXISTS a bigint DEFAULT nextval('seq_4');
 DROP SEQUENCE seq_4 CASCADE;
 TRUNCATE seq_test_4;
 CREATE SEQUENCE seq_4;
@@ -441,7 +441,7 @@ ROLLBACK;
 -- Show that existing sequence has been renamed and a new sequence with the same name
 -- created for another type
 \c - - - :worker_1_port
-SELECT seqrelid::regclass, seqtypid::regtype, seqmax, seqmin FROM pg_sequence WHERE seqrelid::regclass::text like '%sequence_rollback%' ORDER BY 1,2;
+SELECT seqrelid::regclass, seqtypid::regtype, seqmax, seqmin FROM pg_sequence WHERE seqrelid::regclass::text in ('sequence_rollback', '"sequence_rollback(citus_backup_0)"') ORDER BY 1,2;
 
 \c - - - :master_port
 
@@ -451,5 +451,4 @@ DROP TABLE test_seq_dist;
 DROP TABLE sequence_default.seq_test_7_par;
 SET client_min_messages TO error; -- suppress cascading objects dropping
 DROP SCHEMA sequence_default CASCADE;
-SELECT master_remove_node('localhost', :master_port);
 SET search_path TO public;

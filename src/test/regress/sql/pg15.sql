@@ -179,11 +179,6 @@ CREATE TABLE tbl2
 MERGE INTO tbl1 USING tbl2 ON (true)
 WHEN MATCHED THEN DELETE;
 
--- add coordinator node as a worker
-SET client_min_messages to ERROR;
-SELECT 1 FROM master_add_node('localhost', :master_port, groupId => 0);
-RESET client_min_messages;
-
 -- one table is Citus local table, fails
 SELECT citus_add_local_table_to_metadata('tbl1');
 
@@ -198,13 +193,13 @@ SELECT citus_add_local_table_to_metadata('tbl2');
 MERGE INTO tbl1 USING tbl2 ON (true)
 WHEN MATCHED THEN DELETE;
 
--- one table is reference, the other local, not supported
+-- source table is reference, the target is local, supported
 SELECT create_reference_table('tbl2');
 
 MERGE INTO tbl1 USING tbl2 ON (true)
 WHEN MATCHED THEN DELETE;
 
--- now, both are reference, still not supported
+-- now, both are reference, not supported
 SELECT create_reference_table('tbl1');
 
 MERGE INTO tbl1 USING tbl2 ON (true)
@@ -254,15 +249,13 @@ SET client_min_messages to ERROR;
 DROP TABLE FKTABLE_local, PKTABLE_local;
 RESET client_min_messages;
 
-SELECT 1 FROM citus_remove_node('localhost', :master_port);
-
 SELECT create_distributed_table('tbl1', 'x');
 SELECT create_distributed_table('tbl2', 'x');
 
 MERGE INTO tbl1 USING tbl2 ON (true)
 WHEN MATCHED THEN DELETE;
 
--- also, not inside subqueries & ctes
+-- also, inside subqueries & ctes
 WITH targq AS (
     SELECT * FROM tbl2
 )
@@ -537,7 +530,7 @@ SELECT create_distributed_table('FKTABLE', 'tid');
 SELECT create_reference_table('FKTABLE');
 
 -- show that the definition is expected
-SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'fktable'::regclass::oid ORDER BY oid;
+SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'fktable'::regclass::oid ORDER BY 1;
 
 \c - - - :worker_1_port
 
@@ -810,6 +803,7 @@ CREATE TABLE set_on_default_test_referenced(
 );
 SELECT create_reference_table('set_on_default_test_referenced');
 
+-- should error since col_3 defaults to a sequence
 CREATE TABLE set_on_default_test_referencing(
     col_1 int, col_2 int, col_3 serial, col_4 int,
     FOREIGN KEY(col_1, col_3)
@@ -818,10 +812,6 @@ CREATE TABLE set_on_default_test_referencing(
     ON UPDATE SET DEFAULT
 );
 
--- should error since col_3 defaults to a sequence
-SELECT create_reference_table('set_on_default_test_referencing');
-
-DROP TABLE set_on_default_test_referencing;
 CREATE TABLE set_on_default_test_referencing(
     col_1 int, col_2 int, col_3 serial, col_4 int,
     FOREIGN KEY(col_1, col_3)
@@ -921,7 +911,6 @@ SELECT * FROM foreign_table WHERE c1::text LIKE 'foo' LIMIT 1; -- ERROR; cast no
 RESET citus.use_citus_managed_tables;
 SELECT undistribute_table('foreign_table');
 SELECT undistribute_table('foreign_table_test');
-SELECT 1 FROM citus_remove_node('localhost', :master_port);
 DROP SERVER foreign_server CASCADE;
 
 -- PG15 now supports specifying oid on CREATE DATABASE
@@ -943,6 +932,43 @@ ALTER TABLE mx_ddl_table2 SET ACCESS METHOD heap2;
 DROP TABLE mx_ddl_table2;
 DROP ACCESS METHOD heap2;
 SELECT run_command_on_workers($$DROP ACCESS METHOD heap2$$);
+
+CREATE TABLE referenced (int_col integer PRIMARY KEY);
+CREATE TABLE referencing (text_col text);
+
+SET citus.shard_replication_factor TO 1;
+SELECT create_distributed_table('referenced', null);
+SELECT create_distributed_table('referencing', null);
+RESET citus.shard_replication_factor;
+
+CREATE OR REPLACE FUNCTION my_random(numeric)
+  RETURNS numeric AS
+$$
+BEGIN
+  RETURN 7 * $1;
+END;
+$$
+LANGUAGE plpgsql IMMUTABLE;
+
+ALTER TABLE referencing ADD COLUMN test_2 integer UNIQUE NULLS DISTINCT REFERENCES referenced(int_col);
+ALTER TABLE referencing ADD COLUMN test_3 integer GENERATED ALWAYS AS (text_col::int * my_random(1)) STORED UNIQUE NULLS NOT DISTINCT;
+
+SELECT (groupid = 0) AS is_coordinator, result FROM run_command_on_all_nodes(
+  $$SELECT get_grouped_fkey_constraints FROM get_grouped_fkey_constraints('pg15.referencing')$$
+)
+JOIN pg_dist_node USING (nodeid)
+ORDER BY is_coordinator DESC, result;
+
+SELECT (groupid = 0) AS is_coordinator, result FROM run_command_on_all_nodes(
+  $$SELECT get_index_defs FROM get_index_defs('pg15', 'referencing')$$
+)
+JOIN pg_dist_node USING (nodeid)
+ORDER BY is_coordinator DESC, result;
+
+set citus.log_remote_commands = true;
+set citus.grep_remote_commands = '%ALTER DATABASE%';
+alter database regression REFRESH COLLATION VERSION;
+set citus.log_remote_commands = false;
 
 -- Clean up
 \set VERBOSITY terse

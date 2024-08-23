@@ -8,18 +8,21 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
-#include "commands/extension.h"
+
+#include "cdc_decoder_utils.h"
 #include "fmgr.h"
 #include "miscadmin.h"
+
 #include "access/genam.h"
 #include "access/heapam.h"
+#include "catalog/pg_namespace.h"
+#include "commands/extension.h"
 #include "common/hashfn.h"
 #include "common/string.h"
 #include "utils/fmgroids.h"
-#include "utils/typcache.h"
 #include "utils/lsyscache.h"
-#include "catalog/pg_namespace.h"
-#include "cdc_decoder_utils.h"
+#include "utils/typcache.h"
+
 #include "distributed/pg_dist_partition.h"
 #include "distributed/pg_dist_shard.h"
 #include "distributed/relay_utility.h"
@@ -72,7 +75,7 @@ DistShardRelationId(void)
 
 
 /*
- * DistShardRelationId returns the relation id of the pg_dist_shard
+ * DistShardShardidIndexId returns the relation id of the pg_dist_shard_shardid_index
  */
 static Oid
 DistShardShardidIndexId(void)
@@ -87,7 +90,7 @@ DistShardShardidIndexId(void)
 
 
 /*
- * DistShardRelationId returns the relation id of the pg_dist_shard
+ * DistPartitionRelationId returns the relation id of the pg_dist_partition
  */
 static Oid
 DistPartitionRelationId(void)
@@ -184,9 +187,9 @@ CdcExtractShardIdFromTableName(const char *tableName, bool missingOk)
 
 
 /*
- * CdcGetLocalGroupId returns the group identifier of the local node. The function assumes
- * that pg_dist_local_node_group has exactly one row and has at least one column.
- * Otherwise, the function errors out.
+ * CdcGetLocalGroupId returns the group identifier of the local node. The
+ * function assumes that pg_dist_local_group has exactly one row and has at
+ * least one column. Otherwise, the function errors out.
  */
 static int32
 CdcGetLocalGroupId(void)
@@ -331,16 +334,16 @@ CdcPgDistPartitionTupleViaCatalog(Oid relationId)
 
 
 /*
- * CdcPartitionMethodViaCatalog gets a relationId and returns the partition
- * method column from pg_dist_partition via reading from catalog.
+ * CdcIsReferenceTableViaCatalog gets a relationId and returns true if the relation
+ * is a reference table and false otherwise.
  */
 char
-CdcPartitionMethodViaCatalog(Oid relationId)
+CdcIsReferenceTableViaCatalog(Oid relationId)
 {
 	HeapTuple partitionTuple = CdcPgDistPartitionTupleViaCatalog(relationId);
 	if (!HeapTupleIsValid(partitionTuple))
 	{
-		return DISTRIBUTE_BY_INVALID;
+		return false;
 	}
 
 	Datum datumArray[Natts_pg_dist_partition];
@@ -351,21 +354,33 @@ CdcPartitionMethodViaCatalog(Oid relationId)
 	TupleDesc tupleDescriptor = RelationGetDescr(pgDistPartition);
 	heap_deform_tuple(partitionTuple, tupleDescriptor, datumArray, isNullArray);
 
-	if (isNullArray[Anum_pg_dist_partition_partmethod - 1])
+	if (isNullArray[Anum_pg_dist_partition_partmethod - 1] ||
+		isNullArray[Anum_pg_dist_partition_repmodel - 1])
 	{
-		/* partition method cannot be NULL, still let's make sure */
+		/*
+		 * partition method and replication model cannot be NULL,
+		 * still let's make sure
+		 */
 		heap_freetuple(partitionTuple);
 		table_close(pgDistPartition, NoLock);
-		return DISTRIBUTE_BY_INVALID;
+		return false;
 	}
 
 	Datum partitionMethodDatum = datumArray[Anum_pg_dist_partition_partmethod - 1];
 	char partitionMethodChar = DatumGetChar(partitionMethodDatum);
 
+	Datum replicationModelDatum = datumArray[Anum_pg_dist_partition_repmodel - 1];
+	char replicationModelChar = DatumGetChar(replicationModelDatum);
+
 	heap_freetuple(partitionTuple);
 	table_close(pgDistPartition, NoLock);
 
-	return partitionMethodChar;
+	/*
+	 * A table is a reference table when its partition method is 'none'
+	 * and replication model is 'two phase commit'
+	 */
+	return partitionMethodChar == DISTRIBUTE_BY_NONE &&
+		   replicationModelChar == REPLICATION_MODEL_2PC;
 }
 
 

@@ -10,8 +10,7 @@
 
 #include "postgres.h"
 
-#include "distributed/commands.h"
-#include "distributed/pg_version_constants.h"
+#include "miscadmin.h"
 
 #include "access/genam.h"
 #include "access/heapam.h"
@@ -36,6 +35,13 @@
 #include "catalog/pg_type.h"
 #include "commands/extension.h"
 #include "common/hashfn.h"
+#include "utils/fmgroids.h"
+#include "utils/hsearch.h"
+#include "utils/lsyscache.h"
+#include "utils/syscache.h"
+
+#include "pg_version_constants.h"
+
 #include "distributed/citus_depended_object.h"
 #include "distributed/commands.h"
 #include "distributed/commands/utility_hook.h"
@@ -46,11 +52,6 @@
 #include "distributed/metadata_cache.h"
 #include "distributed/metadata_sync.h"
 #include "distributed/version_compat.h"
-#include "miscadmin.h"
-#include "utils/fmgroids.h"
-#include "utils/hsearch.h"
-#include "utils/lsyscache.h"
-#include "utils/syscache.h"
 
 /*
  * ObjectAddressCollector keeps track of collected ObjectAddresses. This can be used
@@ -896,18 +897,11 @@ DeferErrorIfHasUnsupportedDependency(const ObjectAddress *objectAddress)
 		return NULL;
 	}
 
-	char *objectDescription = NULL;
-	char *dependencyDescription = NULL;
 	StringInfo errorInfo = makeStringInfo();
 	StringInfo detailInfo = makeStringInfo();
 
-	#if PG_VERSION_NUM >= PG_VERSION_14
-	objectDescription = getObjectDescription(objectAddress, false);
-	dependencyDescription = getObjectDescription(undistributableDependency, false);
-	#else
-	objectDescription = getObjectDescription(objectAddress);
-	dependencyDescription = getObjectDescription(undistributableDependency);
-	#endif
+	char *objectDescription = getObjectDescription(objectAddress, false);
+	char *dependencyDescription = getObjectDescription(undistributableDependency, false);
 
 	/*
 	 * We expect callers to interpret the error returned from this function
@@ -1029,13 +1023,12 @@ GetUndistributableDependency(const ObjectAddress *objectAddress)
 		if (!SupportedDependencyByCitus(dependency))
 		{
 			/*
-			 * Skip roles and text search templates.
-			 *
-			 * Roles should be handled manually with Citus community whereas text search
-			 * templates should be handled manually in both community and enterprise
+			 * Since we do not yet support distributed TS TEMPLATE and AM objects, we skip
+			 * dependency checks for text search templates. The user is expected to
+			 * manually create the TS TEMPLATE and AM objects.
 			 */
-			if (getObjectClass(dependency) != OCLASS_ROLE &&
-				getObjectClass(dependency) != OCLASS_TSTEMPLATE)
+			if (getObjectClass(dependency) != OCLASS_TSTEMPLATE &&
+				getObjectClass(dependency) != OCLASS_AM)
 			{
 				return dependency;
 			}
@@ -1189,6 +1182,47 @@ IsAnyObjectAddressOwnedByExtension(const List *targets,
 	}
 
 	return false;
+}
+
+
+/*
+ * FirstExtensionWithSchema returns the first extension address whose schema is the same
+ * as given schema. If no extension depends on the schema, it returns NULL.
+ * i.e. decide if given schema is an extension schema as in
+ *  `CREATE EXTENSION <ext> [WITH] SCHEMA <schema>;`
+ */
+ObjectAddress *
+FirstExtensionWithSchema(Oid schemaId)
+{
+	ObjectAddress *extensionAddress = NULL;
+
+	Relation relation = table_open(ExtensionRelationId, AccessShareLock);
+
+	ScanKeyData entry[1];
+	ScanKeyInit(&entry[0], Anum_pg_extension_extnamespace, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(schemaId));
+
+	SysScanDesc scan = systable_beginscan(relation, InvalidOid, false, NULL, 1, entry);
+	HeapTuple extensionTuple = systable_getnext(scan);
+	if (HeapTupleIsValid(extensionTuple))
+	{
+		int extensionIdIndex = Anum_pg_extension_oid;
+		TupleDesc tupleDescriptor = RelationGetDescr(relation);
+		bool isNull = false;
+		Datum extensionIdDatum = heap_getattr(extensionTuple, extensionIdIndex,
+											  tupleDescriptor, &isNull);
+		Oid extensionId = DatumGetObjectId(extensionIdDatum);
+
+		extensionAddress = palloc0(sizeof(ObjectAddress));
+		extensionAddress->objectId = extensionId;
+		extensionAddress->classId = ExtensionRelationId;
+		extensionAddress->objectSubId = 0;
+	}
+
+	systable_endscan(scan);
+	table_close(relation, AccessShareLock);
+
+	return extensionAddress;
 }
 
 

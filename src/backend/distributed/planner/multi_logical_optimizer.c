@@ -11,11 +11,9 @@
  *-------------------------------------------------------------------------
  */
 
-#include "postgres.h"
-
-#include "distributed/pg_version_constants.h"
-
 #include <math.h>
+
+#include "postgres.h"
 
 #include "access/genam.h"
 #include "access/heapam.h"
@@ -27,6 +25,23 @@
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
 #include "commands/extension.h"
+#include "nodes/makefuncs.h"
+#include "nodes/nodeFuncs.h"
+#include "optimizer/clauses.h"
+#include "optimizer/optimizer.h"
+#include "optimizer/tlist.h"
+#include "parser/parse_agg.h"
+#include "parser/parse_coerce.h"
+#include "parser/parse_oper.h"
+#include "parser/parsetree.h"
+#include "rewrite/rewriteManip.h"
+#include "utils/fmgroids.h"
+#include "utils/lsyscache.h"
+#include "utils/rel.h"
+#include "utils/syscache.h"
+
+#include "pg_version_constants.h"
+
 #include "distributed/citus_nodes.h"
 #include "distributed/citus_ruleutils.h"
 #include "distributed/colocation_utils.h"
@@ -42,22 +57,8 @@
 #include "distributed/query_pushdown_planning.h"
 #include "distributed/string_utils.h"
 #include "distributed/tdigest_extension.h"
-#include "distributed/worker_protocol.h"
 #include "distributed/version_compat.h"
-#include "nodes/makefuncs.h"
-#include "nodes/nodeFuncs.h"
-#include "optimizer/clauses.h"
-#include "optimizer/tlist.h"
-#include "optimizer/optimizer.h"
-#include "parser/parse_agg.h"
-#include "parser/parse_coerce.h"
-#include "parser/parse_oper.h"
-#include "parser/parsetree.h"
-#include "rewrite/rewriteManip.h"
-#include "utils/fmgroids.h"
-#include "utils/lsyscache.h"
-#include "utils/rel.h"
-#include "utils/syscache.h"
+#include "distributed/worker_protocol.h"
 
 /* Config variable managed via guc.c */
 int LimitClauseRowFetchCount = -1; /* number of rows to fetch from each task */
@@ -1855,11 +1856,7 @@ MasterAggregateExpression(Aggref *originalAggregate,
 		{
 			/* array_cat_agg() takes anyarray as input */
 			catAggregateName = ARRAY_CAT_AGGREGATE_NAME;
-#if PG_VERSION_NUM >= PG_VERSION_14
 			catInputType = ANYCOMPATIBLEARRAYOID;
-#else
-			catInputType = ANYARRAYOID;
-#endif
 		}
 		else if (aggregateType == AGGREGATE_JSONB_AGG ||
 				 aggregateType == AGGREGATE_JSONB_OBJECT_AGG)
@@ -1897,8 +1894,6 @@ MasterAggregateExpression(Aggref *originalAggregate,
 
 		if (aggregateType == AGGREGATE_ARRAY_AGG)
 		{
-#if PG_VERSION_NUM >= PG_VERSION_14
-
 			/*
 			 * Postgres expects the type of the array here such as INT4ARRAYOID.
 			 * Hence we set it to workerReturnType. If we set this to
@@ -1906,9 +1901,6 @@ MasterAggregateExpression(Aggref *originalAggregate,
 			 * "argument declared anycompatiblearray is not an array but type anycompatiblearray"
 			 */
 			newMasterAggregate->aggargtypes = list_make1_oid(workerReturnType);
-#else
-			newMasterAggregate->aggargtypes = list_make1_oid(ANYARRAYOID);
-#endif
 		}
 		else
 		{
@@ -2985,7 +2977,7 @@ AppendTargetEntryToGroupClause(TargetEntry *targetEntry,
 	Expr *targetExpr PG_USED_FOR_ASSERTS_ONLY = targetEntry->expr;
 
 	/* we currently only support appending Var target entries */
-	AssertArg(IsA(targetExpr, Var));
+	Assert(IsA(targetExpr, Var));
 
 	Var *targetColumn = (Var *) targetEntry->expr;
 	SortGroupClause *groupByClause = CreateSortGroupClause(targetColumn);
@@ -3625,8 +3617,8 @@ static Oid
 CitusFunctionOidWithSignature(char *functionName, int numargs, Oid *argtypes)
 {
 	List *aggregateName = list_make2(makeString("pg_catalog"), makeString(functionName));
-	FuncCandidateList clist = FuncnameGetCandidates_compat(aggregateName, numargs, NIL,
-														   false, false, false, true);
+	FuncCandidateList clist = FuncnameGetCandidates(aggregateName, numargs, NIL,
+													false, false, false, true);
 
 	for (; clist; clist = clist->next)
 	{

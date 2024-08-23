@@ -8,19 +8,21 @@
  *-------------------------------------------------------------------------
  */
 
-#include "distributed/replication_origin_session_utils.h"
-#include "distributed/remote_commands.h"
-#include "distributed/metadata_cache.h"
-#include "utils/builtins.h"
+#include "postgres.h"
+
 #include "miscadmin.h"
+
+#include "utils/builtins.h"
+
+#include "distributed/metadata_cache.h"
+#include "distributed/remote_commands.h"
+#include "distributed/replication_origin_session_utils.h"
 
 static bool IsRemoteReplicationOriginSessionSetup(MultiConnection *connection);
 
 static void SetupMemoryContextResetReplicationOriginHandler(void);
 
 static void SetupReplicationOriginSessionHelper(bool isContexResetSetupNeeded);
-
-static inline bool IsLocalReplicationOriginSessionActive(void);
 
 PG_FUNCTION_INFO_V1(citus_internal_start_replication_origin_tracking);
 PG_FUNCTION_INFO_V1(citus_internal_stop_replication_origin_tracking);
@@ -68,6 +70,16 @@ citus_internal_stop_replication_origin_tracking(PG_FUNCTION_ARGS)
 }
 
 
+/* IsLocalReplicationOriginSessionActive checks if the current replication origin
+ * session is active in the local node.
+ */
+static inline bool
+IsLocalReplicationOriginSessionActive(void)
+{
+	return (replorigin_session_origin == DoNotReplicateId);
+}
+
+
 /* citus_internal_is_replication_origin_tracking_active checks if the current replication origin
  * session is active in the local node.
  */
@@ -76,16 +88,6 @@ citus_internal_is_replication_origin_tracking_active(PG_FUNCTION_ARGS)
 {
 	bool result = IsLocalReplicationOriginSessionActive();
 	PG_RETURN_BOOL(result);
-}
-
-
-/* IsLocalReplicationOriginSessionActive checks if the current replication origin
- * session is active in the local node.
- */
-inline bool
-IsLocalReplicationOriginSessionActive(void)
-{
-	return (replorigin_session_origin == DoNotReplicateId);
 }
 
 

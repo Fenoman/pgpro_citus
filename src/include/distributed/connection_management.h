@@ -13,15 +13,17 @@
 
 #include "postgres.h"
 
-#include "distributed/transaction_management.h"
-#include "distributed/remote_transaction.h"
-#include "lib/ilist.h"
 #include "pg_config.h"
+
+#include "lib/ilist.h"
 #include "portability/instr_time.h"
 #include "storage/latch.h"
 #include "utils/guc.h"
 #include "utils/hsearch.h"
 #include "utils/timestamp.h"
+
+#include "distributed/remote_transaction.h"
+#include "distributed/transaction_management.h"
 
 /* maximum (textual) lengths of hostname and port */
 #define MAX_NODE_LENGTH 255 /* includes 0 byte */
@@ -134,7 +136,7 @@ enum MultiConnectionMode
 
 
 /*
- * This state is used for keeping track of the initilization
+ * This state is used for keeping track of the initialization
  * of the underlying pg_conn struct.
  */
 typedef enum MultiConnectionState
@@ -149,7 +151,7 @@ typedef enum MultiConnectionState
 
 
 /*
- * This state is used for keeping track of the initilization
+ * This state is used for keeping track of the initialization
  * of MultiConnection struct, not specifically the underlying
  * pg_conn. The state is useful to determine the action during
  * clean-up of connections.
@@ -207,7 +209,7 @@ typedef struct MultiConnection
 	instr_time connectionEstablishmentStart;
 	instr_time connectionEstablishmentEnd;
 
-	/* membership in list of list of connections in ConnectionHashEntry */
+	/* membership in list of connections in ConnectionHashEntry */
 	dlist_node connectionNode;
 
 	/* information about the associated remote transaction */
@@ -229,7 +231,7 @@ typedef struct MultiConnection
 	/* replication option */
 	bool requiresReplication;
 
-	MultiConnectionStructInitializationState initilizationState;
+	MultiConnectionStructInitializationState initializationState;
 } MultiConnection;
 
 
@@ -285,6 +287,7 @@ extern int MaxCachedConnectionLifetime;
 /* parameters used for outbound connections */
 extern char *NodeConninfo;
 extern char *LocalHostName;
+extern bool checkAtBootPassed;
 
 /* the hash tables are externally accessiable */
 extern HTAB *ConnectionHash;
@@ -352,7 +355,4 @@ extern bool CitusModifyWaitEvent(WaitEventSet *set, int pos, uint32 events,
 extern double MillisecondsPassedSince(instr_time moment);
 extern long MillisecondsToTimeout(instr_time start, long msAfterStart);
 
-#if PG_VERSION_NUM < 140000
-extern void WarmUpConnParamsHash(void);
-#endif
 #endif /* CONNECTION_MANAGMENT_H */

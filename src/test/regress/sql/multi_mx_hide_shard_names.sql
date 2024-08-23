@@ -50,6 +50,24 @@ prepare transaction 'take-aggressive-lock';
 
 -- shards are hidden when using psql as application_name
 SELECT relname FROM pg_catalog.pg_class WHERE relnamespace = 'mx_hide_shard_names'::regnamespace ORDER BY relname;
+-- Even when using subquery and having no existing quals on pg_clcass
+SELECT relname FROM (SELECT relname, relnamespace FROM pg_catalog.pg_class) AS q WHERE relnamespace = 'mx_hide_shard_names'::regnamespace ORDER BY relname;
+
+-- Check that inserts into pg_class don't add the filter
+EXPLAIN (COSTS OFF) INSERT INTO pg_class VALUES (1);
+-- Unless it's an INSERT SELECT that queries from pg_class;
+EXPLAIN (COSTS OFF) INSERT INTO pg_class SELECT * FROM pg_class;
+
+-- Check that query that psql "\d test_table" does gets optimized to an index
+-- scan
+EXPLAIN (COSTS OFF) SELECT c.oid,
+  n.nspname,
+  c.relname
+FROM pg_catalog.pg_class c
+     LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relname OPERATOR(pg_catalog.~) '^(test_table)$' COLLATE pg_catalog.default
+  AND pg_catalog.pg_table_is_visible(c.oid)
+ORDER BY 2, 3;
 
 commit prepared 'take-aggressive-lock';
 
@@ -226,14 +244,32 @@ RESET citus.enable_metadata_sync;
 -- the shards and indexes do not show up
 SELECT relname FROM pg_catalog.pg_class WHERE relnamespace = 'mx_hide_shard_names'::regnamespace ORDER BY relname;
 
+-- PG16 added one more backend type B_STANDALONE_BACKEND
+-- and also alphabetized the backend types, hence the orders changed
+-- Relevant PG commit:
+-- https://github.com/postgres/postgres/commit/0c679464a837079acc75ff1d45eaa83f79e05690
+SHOW server_version \gset
+SELECT substring(:'server_version', '\d+')::int >= 16 AS server_version_ge_16
+\gset
+
+\if :server_version_ge_16
+SELECT 4 AS client_backend \gset
+SELECT 5 AS bgworker \gset
+SELECT 12 AS walsender \gset
+\else
+SELECT 3 AS client_backend \gset
+SELECT 4 AS bgworker \gset
+SELECT 9 AS walsender \gset
+\endif
+
 -- say, we set it to bgworker
 -- the shards and indexes do not show up
-SELECT set_backend_type(4);
+SELECT set_backend_type(:bgworker);
 SELECT relname FROM pg_catalog.pg_class WHERE relnamespace = 'mx_hide_shard_names'::regnamespace ORDER BY relname;
 
 -- or, we set it to walsender
 -- the shards and indexes do not show up
-SELECT set_backend_type(9);
+SELECT set_backend_type(:walsender);
 SELECT relname FROM pg_catalog.pg_class WHERE relnamespace = 'mx_hide_shard_names'::regnamespace ORDER BY relname;
 
 -- unless the application name starts with citus_shard
@@ -242,7 +278,7 @@ SELECT relname FROM pg_catalog.pg_class WHERE relnamespace = 'mx_hide_shard_name
 RESET application_name;
 
 -- but, client backends to see the shards
-SELECT set_backend_type(3);
+SELECT set_backend_type(:client_backend);
 SELECT relname FROM pg_catalog.pg_class WHERE relnamespace = 'mx_hide_shard_names'::regnamespace ORDER BY relname;
 
 

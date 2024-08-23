@@ -11,18 +11,20 @@
  */
 
 #include "postgres.h"
+
 #include "fmgr.h"
 #include "funcapi.h"
 
 #include "catalog/dependency.h"
 #include "catalog/pg_constraint.h"
-#include "distributed/foreign_key_relationship.h"
+#include "utils/builtins.h"
+
 #include "distributed/coordinator_protocol.h"
+#include "distributed/foreign_key_relationship.h"
 #include "distributed/listutils.h"
 #include "distributed/metadata_cache.h"
 #include "distributed/tuplestore.h"
 #include "distributed/version_compat.h"
-#include "utils/builtins.h"
 
 
 #define GET_FKEY_CONNECTED_RELATIONS_COLUMNS 1
@@ -119,7 +121,7 @@ get_referencing_relation_id_list(PG_FUNCTION_ARGS)
 
 		wrapper->listCell = lnext(wrapper->list, wrapper->listCell);
 
-		SRF_RETURN_NEXT(functionContext, PointerGetDatum(refId));
+		SRF_RETURN_NEXT(functionContext, ObjectIdGetDatum(refId));
 	}
 	else
 	{
@@ -178,7 +180,7 @@ get_referenced_relation_id_list(PG_FUNCTION_ARGS)
 
 		wrapper->listCell = lnext(wrapper->list, wrapper->listCell);
 
-		SRF_RETURN_NEXT(functionContext, PointerGetDatum(refId));
+		SRF_RETURN_NEXT(functionContext, ObjectIdGetDatum(refId));
 	}
 	else
 	{

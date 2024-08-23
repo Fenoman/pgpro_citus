@@ -13,11 +13,10 @@
 #include <sys/statvfs.h>
 
 #include "postgres.h"
+
 #include "funcapi.h"
 #include "libpq-fe.h"
 #include "miscadmin.h"
-
-#include "distributed/pg_version_constants.h"
 
 #include "access/genam.h"
 #include "access/htup_details.h"
@@ -29,41 +28,14 @@
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_extension.h"
 #include "catalog/pg_namespace.h"
+
+#include "pg_version_constants.h"
+#if PG_VERSION_NUM >= PG_VERSION_16
+#include "catalog/pg_proc_d.h"
+#endif
 #include "catalog/pg_type.h"
 #include "commands/extension.h"
 #include "commands/sequence.h"
-#include "distributed/background_jobs.h"
-#include "distributed/colocation_utils.h"
-#include "distributed/connection_management.h"
-#include "distributed/citus_nodes.h"
-#include "distributed/citus_safe_lib.h"
-#include "distributed/listutils.h"
-#include "distributed/lock_graph.h"
-#include "distributed/metadata_utility.h"
-#include "distributed/coordinator_protocol.h"
-#include "distributed/metadata_cache.h"
-#include "distributed/metadata_sync.h"
-#include "distributed/multi_join_order.h"
-#include "distributed/multi_logical_optimizer.h"
-#include "distributed/multi_partitioning_utils.h"
-#include "distributed/multi_physical_planner.h"
-#include "distributed/pg_dist_background_job.h"
-#include "distributed/pg_dist_background_task.h"
-#include "distributed/pg_dist_backrgound_task_depend.h"
-#include "distributed/pg_dist_colocation.h"
-#include "distributed/pg_dist_partition.h"
-#include "distributed/pg_dist_shard.h"
-#include "distributed/pg_dist_placement.h"
-#include "distributed/reference_table_utils.h"
-#include "distributed/relay_utility.h"
-#include "distributed/resource_lock.h"
-#include "distributed/remote_commands.h"
-#include "distributed/shard_rebalancer.h"
-#include "distributed/tuplestore.h"
-#include "distributed/utils/array_type.h"
-#include "distributed/worker_manager.h"
-#include "distributed/worker_protocol.h"
-#include "distributed/version_compat.h"
 #include "nodes/makefuncs.h"
 #include "parser/scansup.h"
 #include "storage/lmgr.h"
@@ -78,6 +50,39 @@
 #include "utils/rel.h"
 #include "utils/syscache.h"
 
+#include "distributed/background_jobs.h"
+#include "distributed/citus_nodes.h"
+#include "distributed/citus_safe_lib.h"
+#include "distributed/colocation_utils.h"
+#include "distributed/connection_management.h"
+#include "distributed/coordinator_protocol.h"
+#include "distributed/listutils.h"
+#include "distributed/lock_graph.h"
+#include "distributed/metadata_cache.h"
+#include "distributed/metadata_sync.h"
+#include "distributed/metadata_utility.h"
+#include "distributed/multi_join_order.h"
+#include "distributed/multi_logical_optimizer.h"
+#include "distributed/multi_partitioning_utils.h"
+#include "distributed/multi_physical_planner.h"
+#include "distributed/pg_dist_background_job.h"
+#include "distributed/pg_dist_background_task.h"
+#include "distributed/pg_dist_backrgound_task_depend.h"
+#include "distributed/pg_dist_colocation.h"
+#include "distributed/pg_dist_partition.h"
+#include "distributed/pg_dist_placement.h"
+#include "distributed/pg_dist_shard.h"
+#include "distributed/reference_table_utils.h"
+#include "distributed/relay_utility.h"
+#include "distributed/remote_commands.h"
+#include "distributed/resource_lock.h"
+#include "distributed/shard_rebalancer.h"
+#include "distributed/tuplestore.h"
+#include "distributed/utils/array_type.h"
+#include "distributed/version_compat.h"
+#include "distributed/worker_manager.h"
+#include "distributed/worker_protocol.h"
+
 #define DISK_SPACE_FIELDS 2
 
 /* Local functions forward declarations */
@@ -91,7 +96,8 @@ static bool DistributedTableSizeOnWorker(WorkerNode *workerNode, Oid relationId,
 										 SizeQueryType sizeQueryType, bool failOnError,
 										 uint64 *tableSize);
 static List * ShardIntervalsOnWorkerGroup(WorkerNode *workerNode, Oid relationId);
-static char * GenerateShardStatisticsQueryForShardList(List *shardIntervalList);
+static char * GenerateShardIdNameValuesForShardList(List *shardIntervalList,
+													bool firstValue);
 static char * GenerateSizeQueryForRelationNameList(List *quotedShardNames,
 												   char *sizeFunction);
 static char * GetWorkerPartitionedSizeUDFNameBySizeQueryType(SizeQueryType sizeQueryType);
@@ -101,10 +107,10 @@ static char * GenerateAllShardStatisticsQueryForNode(WorkerNode *workerNode,
 static List * GenerateShardStatisticsQueryList(List *workerNodeList, List *citusTableIds);
 static void ErrorIfNotSuitableToGetSize(Oid relationId);
 static List * OpenConnectionToNodes(List *workerNodeList);
-static void ReceiveShardNameAndSizeResults(List *connectionList,
-										   Tuplestorestate *tupleStore,
-										   TupleDesc tupleDescriptor);
-static void AppendShardSizeQuery(StringInfo selectQuery, ShardInterval *shardInterval);
+static void ReceiveShardIdAndSizeResults(List *connectionList,
+										 Tuplestorestate *tupleStore,
+										 TupleDesc tupleDescriptor);
+static void AppendShardIdNameValues(StringInfo selectQuery, ShardInterval *shardInterval);
 
 static HeapTuple CreateDiskSpaceTuple(TupleDesc tupleDesc, uint64 availableBytes,
 									  uint64 totalBytes);
@@ -253,7 +259,7 @@ GetNodeDiskSpaceStatsForConnection(MultiConnection *connection, uint64 *availabl
 
 
 /*
- * citus_shard_sizes returns all shard names and their sizes.
+ * citus_shard_sizes returns all shard ids and their sizes.
  */
 Datum
 citus_shard_sizes(PG_FUNCTION_ARGS)
@@ -271,7 +277,7 @@ citus_shard_sizes(PG_FUNCTION_ARGS)
 	TupleDesc tupleDescriptor = NULL;
 	Tuplestorestate *tupleStore = SetupTuplestore(fcinfo, &tupleDescriptor);
 
-	ReceiveShardNameAndSizeResults(connectionList, tupleStore, tupleDescriptor);
+	ReceiveShardIdAndSizeResults(connectionList, tupleStore, tupleDescriptor);
 
 	PG_RETURN_VOID();
 }
@@ -446,12 +452,12 @@ GenerateShardStatisticsQueryList(List *workerNodeList, List *citusTableIds)
 
 
 /*
- * ReceiveShardNameAndSizeResults receives shard name and size results from the given
+ * ReceiveShardIdAndSizeResults receives shard id and size results from the given
  * connection list.
  */
 static void
-ReceiveShardNameAndSizeResults(List *connectionList, Tuplestorestate *tupleStore,
-							   TupleDesc tupleDescriptor)
+ReceiveShardIdAndSizeResults(List *connectionList, Tuplestorestate *tupleStore,
+							 TupleDesc tupleDescriptor)
 {
 	MultiConnection *connection = NULL;
 	foreach_ptr(connection, connectionList)
@@ -488,13 +494,9 @@ ReceiveShardNameAndSizeResults(List *connectionList, Tuplestorestate *tupleStore
 			memset(values, 0, sizeof(values));
 			memset(isNulls, false, sizeof(isNulls));
 
-			/* format is [0] shard id, [1] shard name, [2] size */
-			char *tableName = PQgetvalue(result, rowIndex, 1);
-			Datum resultStringDatum = CStringGetDatum(tableName);
-			Datum textDatum = DirectFunctionCall1(textin, resultStringDatum);
-
-			values[0] = textDatum;
-			values[1] = ParseIntField(result, rowIndex, 2);
+			/* format is [0] shard id, [1] size */
+			values[0] = ParseIntField(result, rowIndex, 0);
+			values[1] = ParseIntField(result, rowIndex, 1);
 
 			tuplestore_putvalues(tupleStore, tupleDescriptor, values, isNulls);
 		}
@@ -920,6 +922,12 @@ static char *
 GenerateAllShardStatisticsQueryForNode(WorkerNode *workerNode, List *citusTableIds)
 {
 	StringInfo allShardStatisticsQuery = makeStringInfo();
+	bool insertedValues = false;
+
+	appendStringInfoString(allShardStatisticsQuery, "SELECT shard_id, ");
+	appendStringInfo(allShardStatisticsQuery, PG_TOTAL_RELATION_SIZE_FUNCTION,
+					 "table_name");
+	appendStringInfoString(allShardStatisticsQuery, " FROM (VALUES ");
 
 	Oid relationId = InvalidOid;
 	foreach_oid(relationId, citusTableIds)
@@ -934,34 +942,49 @@ GenerateAllShardStatisticsQueryForNode(WorkerNode *workerNode, List *citusTableI
 		{
 			List *shardIntervalsOnNode = ShardIntervalsOnWorkerGroup(workerNode,
 																	 relationId);
-			char *shardStatisticsQuery =
-				GenerateShardStatisticsQueryForShardList(shardIntervalsOnNode);
-			appendStringInfoString(allShardStatisticsQuery, shardStatisticsQuery);
+			if (list_length(shardIntervalsOnNode) == 0)
+			{
+				relation_close(relation, AccessShareLock);
+				continue;
+			}
+			char *shardIdNameValues =
+				GenerateShardIdNameValuesForShardList(shardIntervalsOnNode,
+													  !insertedValues);
+			insertedValues = true;
+			appendStringInfoString(allShardStatisticsQuery, shardIdNameValues);
 			relation_close(relation, AccessShareLock);
 		}
 	}
 
-	/* Add a dummy entry so that UNION ALL doesn't complain */
-	appendStringInfo(allShardStatisticsQuery, "SELECT 0::bigint, NULL::text, 0::bigint;");
+	if (!insertedValues)
+	{
+		return "SELECT 0 AS shard_id, '' AS table_name LIMIT 0";
+	}
 
+	appendStringInfoString(allShardStatisticsQuery, ") t(shard_id, table_name) "
+													"WHERE to_regclass(table_name) IS NOT NULL");
 	return allShardStatisticsQuery->data;
 }
 
 
 /*
- * GenerateShardStatisticsQueryForShardList generates a query that returns:
- * SELECT shard_id, shard_name, shard_size for all shards in the list
+ * GenerateShardIdNameValuesForShardList generates a list of (shard_id, shard_name) values
+ * for all shards in the list
  */
 static char *
-GenerateShardStatisticsQueryForShardList(List *shardIntervalList)
+GenerateShardIdNameValuesForShardList(List *shardIntervalList, bool firstValue)
 {
 	StringInfo selectQuery = makeStringInfo();
 
 	ShardInterval *shardInterval = NULL;
 	foreach_ptr(shardInterval, shardIntervalList)
 	{
-		AppendShardSizeQuery(selectQuery, shardInterval);
-		appendStringInfo(selectQuery, " UNION ALL ");
+		if (!firstValue)
+		{
+			appendStringInfoString(selectQuery, ", ");
+		}
+		firstValue = false;
+		AppendShardIdNameValues(selectQuery, shardInterval);
 	}
 
 	return selectQuery->data;
@@ -969,11 +992,10 @@ GenerateShardStatisticsQueryForShardList(List *shardIntervalList)
 
 
 /*
- * AppendShardSizeQuery appends a query in the following form to selectQuery
- * SELECT shard_id, shard_name, shard_size
+ * AppendShardIdNameValues appends (shard_id, shard_name) for shard
  */
 static void
-AppendShardSizeQuery(StringInfo selectQuery, ShardInterval *shardInterval)
+AppendShardIdNameValues(StringInfo selectQuery, ShardInterval *shardInterval)
 {
 	uint64 shardId = shardInterval->shardId;
 	Oid schemaId = get_rel_namespace(shardInterval->relationId);
@@ -985,9 +1007,7 @@ AppendShardSizeQuery(StringInfo selectQuery, ShardInterval *shardInterval)
 	char *shardQualifiedName = quote_qualified_identifier(schemaName, shardName);
 	char *quotedShardName = quote_literal_cstr(shardQualifiedName);
 
-	appendStringInfo(selectQuery, "SELECT " UINT64_FORMAT " AS shard_id, ", shardId);
-	appendStringInfo(selectQuery, "%s AS shard_name, ", quotedShardName);
-	appendStringInfo(selectQuery, PG_TOTAL_RELATION_SIZE_FUNCTION, quotedShardName);
+	appendStringInfo(selectQuery, "(" UINT64_FORMAT ", %s)", shardId, quotedShardName);
 }
 
 
@@ -1381,6 +1401,17 @@ IsActiveShardPlacement(ShardPlacement *shardPlacement)
 
 
 /*
+ * IsRemoteShardPlacement returns true if the shard placement is on a remote
+ * node.
+ */
+bool
+IsRemoteShardPlacement(ShardPlacement *shardPlacement)
+{
+	return shardPlacement->groupId != GetLocalGroupId();
+}
+
+
+/*
  * IsPlacementOnWorkerNode checks if the shard placement is for to the given
  * workenode.
  */
@@ -1766,6 +1797,24 @@ InsertShardRow(Oid relationId, uint64 shardId, char storageType,
 
 
 /*
+ * InsertShardPlacementRowGlobally inserts shard placement that has given
+ * parameters into pg_dist_placement globally.
+ */
+ShardPlacement *
+InsertShardPlacementRowGlobally(uint64 shardId, uint64 placementId,
+								uint64 shardLength, int32 groupId)
+{
+	InsertShardPlacementRow(shardId, placementId, shardLength, groupId);
+
+	char *insertPlacementCommand =
+		AddPlacementMetadataCommand(shardId, placementId, shardLength, groupId);
+	SendCommandToWorkersWithMetadata(insertPlacementCommand);
+
+	return LoadShardPlacement(shardId, placementId);
+}
+
+
+/*
  * InsertShardPlacementRow opens the shard placement system catalog, and inserts
  * a new row with the given values into that system catalog. If placementId is
  * INVALID_PLACEMENT_ID, a new placement id will be assigned.Then, returns the
@@ -1978,6 +2027,21 @@ DeleteShardRow(uint64 shardId)
 
 	CommandCounterIncrement();
 	table_close(pgDistShard, NoLock);
+}
+
+
+/*
+ * DeleteShardPlacementRowGlobally deletes shard placement that has given
+ * parameters from pg_dist_placement globally.
+ */
+void
+DeleteShardPlacementRowGlobally(uint64 placementId)
+{
+	DeleteShardPlacementRow(placementId);
+
+	char *deletePlacementCommand =
+		DeletePlacementMetadataCommand(placementId);
+	SendCommandToWorkersWithMetadata(deletePlacementCommand);
 }
 
 
@@ -2226,6 +2290,93 @@ UpdateDistributionColumn(Oid relationId, char distributionMethod, Var *distribut
 
 
 /*
+ * UpdateNoneDistTableMetadataGlobally globally updates pg_dist_partition for
+ * given none-distributed table.
+ */
+void
+UpdateNoneDistTableMetadataGlobally(Oid relationId, char replicationModel,
+									uint32 colocationId, bool autoConverted)
+{
+	UpdateNoneDistTableMetadata(relationId, replicationModel,
+								colocationId, autoConverted);
+
+	if (ShouldSyncTableMetadata(relationId))
+	{
+		char *metadataCommand =
+			UpdateNoneDistTableMetadataCommand(relationId,
+											   replicationModel,
+											   colocationId,
+											   autoConverted);
+		SendCommandToWorkersWithMetadata(metadataCommand);
+	}
+}
+
+
+/*
+ * UpdateNoneDistTableMetadata locally updates pg_dist_partition for given
+ * none-distributed table.
+ */
+void
+UpdateNoneDistTableMetadata(Oid relationId, char replicationModel, uint32 colocationId,
+							bool autoConverted)
+{
+	if (HasDistributionKey(relationId))
+	{
+		ereport(ERROR, (errmsg("cannot update metadata for a distributed "
+							   "table that has a distribution column")));
+	}
+
+	ScanKeyData scanKey[1];
+	int scanKeyCount = 1;
+	bool indexOK = true;
+	Datum values[Natts_pg_dist_partition];
+	bool isnull[Natts_pg_dist_partition];
+	bool replace[Natts_pg_dist_partition];
+
+	Relation pgDistPartition = table_open(DistPartitionRelationId(), RowExclusiveLock);
+	TupleDesc tupleDescriptor = RelationGetDescr(pgDistPartition);
+	ScanKeyInit(&scanKey[0], Anum_pg_dist_partition_logicalrelid,
+				BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(relationId));
+
+	SysScanDesc scanDescriptor = systable_beginscan(pgDistPartition,
+													DistPartitionLogicalRelidIndexId(),
+													indexOK,
+													NULL, scanKeyCount, scanKey);
+
+	HeapTuple heapTuple = systable_getnext(scanDescriptor);
+	if (!HeapTupleIsValid(heapTuple))
+	{
+		ereport(ERROR, (errmsg("could not find valid entry for Citus table with oid: %u",
+							   relationId)));
+	}
+
+	memset(replace, 0, sizeof(replace));
+
+	values[Anum_pg_dist_partition_colocationid - 1] = UInt32GetDatum(colocationId);
+	isnull[Anum_pg_dist_partition_colocationid - 1] = false;
+	replace[Anum_pg_dist_partition_colocationid - 1] = true;
+
+	values[Anum_pg_dist_partition_repmodel - 1] = CharGetDatum(replicationModel);
+	isnull[Anum_pg_dist_partition_repmodel - 1] = false;
+	replace[Anum_pg_dist_partition_repmodel - 1] = true;
+
+	values[Anum_pg_dist_partition_autoconverted - 1] = BoolGetDatum(autoConverted);
+	isnull[Anum_pg_dist_partition_autoconverted - 1] = false;
+	replace[Anum_pg_dist_partition_autoconverted - 1] = true;
+
+	heapTuple = heap_modify_tuple(heapTuple, tupleDescriptor, values, isnull, replace);
+
+	CatalogTupleUpdate(pgDistPartition, &heapTuple->t_self, heapTuple);
+
+	CitusInvalidateRelcacheByRelid(relationId);
+	CommandCounterIncrement();
+
+	systable_endscan(scanDescriptor);
+	table_close(pgDistPartition, NoLock);
+}
+
+
+/*
  * Check that the current user has `mode` permissions on relationId, error out
  * if not. Superusers always have such permissions.
  */
@@ -2248,10 +2399,25 @@ EnsureTablePermissions(Oid relationId, AclMode mode)
 void
 EnsureTableOwner(Oid relationId)
 {
-	if (!pg_class_ownercheck(relationId, GetUserId()))
+	if (!object_ownercheck(RelationRelationId, relationId, GetUserId()))
 	{
 		aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_TABLE,
 					   get_rel_name(relationId));
+	}
+}
+
+
+/*
+ * Check that the current user has owner rights to schemaId, error out if
+ * not. Superusers are regarded as owners.
+ */
+void
+EnsureSchemaOwner(Oid schemaId)
+{
+	if (!object_ownercheck(NamespaceRelationId, schemaId, GetUserId()))
+	{
+		aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_SCHEMA,
+					   get_namespace_name(schemaId));
 	}
 }
 
@@ -2264,7 +2430,7 @@ EnsureTableOwner(Oid relationId)
 void
 EnsureFunctionOwner(Oid functionId)
 {
-	if (!pg_proc_ownercheck(functionId, GetUserId()))
+	if (!object_ownercheck(ProcedureRelationId, functionId, GetUserId()))
 	{
 		aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_FUNCTION,
 					   get_func_name(functionId));
@@ -2284,6 +2450,24 @@ EnsureHashDistributedTable(Oid relationId)
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						errmsg("relation %s should be a "
 							   "hash distributed table", get_rel_name(relationId))));
+	}
+}
+
+
+/*
+ * EnsureHashOrSingleShardDistributedTable error out if the given relation is not a
+ * hash or single shard distributed table with the given message.
+ */
+void
+EnsureHashOrSingleShardDistributedTable(Oid relationId)
+{
+	if (!IsCitusTableType(relationId, HASH_DISTRIBUTED) &&
+		!IsCitusTableType(relationId, SINGLE_SHARD_DISTRIBUTED))
+	{
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("relation %s should be a "
+							   "hash or single shard distributed table",
+							   get_rel_name(relationId))));
 	}
 }
 
@@ -3238,11 +3422,11 @@ BackgroundTaskHasUmnetDependencies(int64 jobId, int64 taskId)
 
 	/* pg_catalog.pg_dist_background_task_depend.job_id = jobId */
 	ScanKeyInit(&scanKey[0], Anum_pg_dist_background_task_depend_job_id,
-				BTEqualStrategyNumber, F_INT8EQ, jobId);
+				BTEqualStrategyNumber, F_INT8EQ, Int64GetDatum(jobId));
 
 	/* pg_catalog.pg_dist_background_task_depend.task_id = $taskId */
 	ScanKeyInit(&scanKey[1], Anum_pg_dist_background_task_depend_task_id,
-				BTEqualStrategyNumber, F_INT8EQ, taskId);
+				BTEqualStrategyNumber, F_INT8EQ, Int64GetDatum(taskId));
 
 	SysScanDesc scanDescriptor =
 		systable_beginscan(pgDistBackgroundTasksDepend,
@@ -4003,11 +4187,7 @@ CancelTasksForJob(int64 jobid)
 							errmsg("must be a superuser to cancel superuser tasks")));
 		}
 		else if (!has_privs_of_role(GetUserId(), taskOwner) &&
-#if PG_VERSION_NUM >= 140000
 				 !has_privs_of_role(GetUserId(), ROLE_PG_SIGNAL_BACKEND))
-#else
-				 !has_privs_of_role(GetUserId(), DEFAULT_ROLE_SIGNAL_BACKENDID))
-#endif
 		{
 			/* user doesn't have the permissions to cancel this job */
 			ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),

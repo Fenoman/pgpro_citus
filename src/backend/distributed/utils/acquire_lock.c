@@ -22,12 +22,12 @@
 
 #include "postgres.h"
 
+#include "miscadmin.h"
+#include "pgstat.h"
 
 #include "access/xact.h"
 #include "catalog/pg_type.h"
 #include "executor/spi.h"
-#include "miscadmin.h"
-#include "pgstat.h"
 #include "portability/instr_time.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
@@ -39,7 +39,7 @@
 #include "distributed/version_compat.h"
 
 /* forward declaration of background worker entrypoint */
-extern void LockAcquireHelperMain(Datum main_arg);
+extern PGDLLEXPORT void LockAcquireHelperMain(Datum main_arg);
 
 /* forward declaration of helper functions */
 static void lock_acquire_helper_sigterm(SIGNAL_ARGS);

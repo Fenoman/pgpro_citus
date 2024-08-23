@@ -10,12 +10,12 @@
 #ifndef MULTI_UTILITY_H
 #define MULTI_UTILITY_H
 
-#include "distributed/pg_version_constants.h"
-
 #include "postgres.h"
 
-#include "utils/relcache.h"
 #include "tcop/utility.h"
+#include "utils/relcache.h"
+
+#include "pg_version_constants.h"
 
 #include "distributed/coordinator_protocol.h"
 #include "distributed/function_call_delegation.h"
@@ -79,9 +79,7 @@ typedef struct DDLJob
 extern ProcessUtility_hook_type PrevProcessUtility;
 
 extern void multi_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
-#if PG_VERSION_NUM >= PG_VERSION_14
 								 bool readOnlyTree,
-#endif
 								 ProcessUtilityContext context, ParamListInfo params,
 								 struct QueryEnvironment *queryEnv, DestReceiver *dest,
 								 QueryCompletion *completionTag

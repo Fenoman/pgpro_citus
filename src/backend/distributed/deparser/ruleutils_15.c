@@ -14,7 +14,7 @@
  * This needs to be closely in sync with the core code.
  *-------------------------------------------------------------------------
  */
-#include "distributed/pg_version_constants.h"
+#include "pg_version_constants.h"
 
 #include "pg_config.h"
 
@@ -54,6 +54,7 @@
 #include "distributed/citus_nodefuncs.h"
 #include "distributed/citus_ruleutils.h"
 #include "distributed/multi_router_planner.h"
+#include "distributed/namespace_utils.h"
 #include "executor/spi.h"
 #include "foreign/foreign.h"
 #include "funcapi.h"
@@ -624,18 +625,14 @@ pg_get_rule_expr(Node *expression)
 {
 	bool showImplicitCasts = true;
 	deparse_context context;
-	OverrideSearchPath *overridePath = NULL;
 	StringInfo buffer = makeStringInfo();
 
 	/*
 	 * Set search_path to NIL so that all objects outside of pg_catalog will be
 	 * schema-prefixed. pg_catalog will be added automatically when we call
-	 * PushOverrideSearchPath(), since we set addCatalog to true;
+	 * PushEmptySearchPath(), since we set addCatalog to true;
 	 */
-	overridePath = GetOverrideSearchPath(CurrentMemoryContext);
-	overridePath->schemas = NIL;
-	overridePath->addCatalog = true;
-	PushOverrideSearchPath(overridePath);
+	int saveNestLevel = PushEmptySearchPath();
 
 	context.buf = buffer;
 	context.namespaces = NIL;
@@ -652,7 +649,7 @@ pg_get_rule_expr(Node *expression)
 	get_rule_expr(expression, &context, showImplicitCasts);
 
 	/* revert back to original search_path */
-	PopOverrideSearchPath();
+	PopEmptySearchPath(saveNestLevel);
 
 	return buffer->data;
 }
@@ -1566,8 +1563,15 @@ set_join_column_names(deparse_namespace *dpns, RangeTblEntry *rte,
 
 	/* Assert we processed the right number of columns */
 #ifdef USE_ASSERT_CHECKING
-	while (i < colinfo->num_cols && colinfo->colnames[i] == NULL)
-		i++;
+	for (int col_index = 0; col_index < colinfo->num_cols; col_index++)
+	{
+		/*
+		 * In the above processing-loops, "i" advances only if
+		 * the column is not new, check if this is a new column.
+		 */
+		if (colinfo->is_new_col[col_index])
+			i++;
+	}
 	Assert(i == colinfo->num_cols);
 	Assert(j == nnewcolumns);
 #endif
@@ -2038,8 +2042,6 @@ get_query_def_extended(Query *query, StringInfo buf, List *parentnamespace,
 	deparse_context context;
 	deparse_namespace dpns;
 
-	OverrideSearchPath *overridePath = NULL;
-
 	/* Guard against excessively long or deeply-nested queries */
 	CHECK_FOR_INTERRUPTS();
 	check_stack_depth();
@@ -2058,12 +2060,9 @@ get_query_def_extended(Query *query, StringInfo buf, List *parentnamespace,
 	/*
 	 * Set search_path to NIL so that all objects outside of pg_catalog will be
 	 * schema-prefixed. pg_catalog will be added automatically when we call
-	 * PushOverrideSearchPath(), since we set addCatalog to true;
+	 * PushEmptySearchPath().
 	 */
-	overridePath = GetOverrideSearchPath(CurrentMemoryContext);
-	overridePath->schemas = NIL;
-	overridePath->addCatalog = true;
-	PushOverrideSearchPath(overridePath);
+	int saveNestLevel = PushEmptySearchPath();
 
 	context.buf = buf;
 	context.namespaces = lcons(&dpns, list_copy(parentnamespace));
@@ -2118,7 +2117,7 @@ get_query_def_extended(Query *query, StringInfo buf, List *parentnamespace,
 	}
 
 	/* revert back to original search_path */
-	PopOverrideSearchPath();
+	PopEmptySearchPath(saveNestLevel);
 }
 
 /* ----------
@@ -5696,42 +5695,20 @@ get_rule_expr(Node *node, deparse_context *context,
 		case T_RelabelType:
 			{
 				RelabelType *relabel = (RelabelType *) node;
+				Node	   *arg = (Node *) relabel->arg;
 
-				/*
-				 * This is a Citus specific modification
-				 * The planner converts CollateExpr to RelabelType
-				 * and here we convert back.
-				 */
-				if (relabel->resultcollid != InvalidOid)
+				if (relabel->relabelformat == COERCE_IMPLICIT_CAST &&
+					!showimplicit)
 				{
-					CollateExpr *collate = RelabelTypeToCollateExpr(relabel);
-					Node	   *arg = (Node *) collate->arg;
-
-					if (!PRETTY_PAREN(context))
-						appendStringInfoChar(buf, '(');
-					get_rule_expr_paren(arg, context, showimplicit, node);
-					appendStringInfo(buf, " COLLATE %s",
-									generate_collation_name(collate->collOid));
-					if (!PRETTY_PAREN(context))
-						appendStringInfoChar(buf, ')');
+					/* don't show the implicit cast */
+					get_rule_expr_paren(arg, context, false, node);
 				}
 				else
 				{
-					Node	   *arg = (Node *) relabel->arg;
-
-					if (relabel->relabelformat == COERCE_IMPLICIT_CAST &&
-						!showimplicit)
-					{
-						/* don't show the implicit cast */
-						get_rule_expr_paren(arg, context, false, node);
-					}
-					else
-					{
-						get_coercion_expr(arg, context,
-										  relabel->resulttype,
-										  relabel->resulttypmod,
-										  node);
-					}
+					get_coercion_expr(arg, context,
+									  relabel->resulttype,
+									  relabel->resulttypmod,
+									  node);
 				}
 			}
 			break;

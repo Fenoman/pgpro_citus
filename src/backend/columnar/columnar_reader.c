@@ -22,22 +22,23 @@
 #include "access/xact.h"
 #include "catalog/pg_am.h"
 #include "commands/defrem.h"
-#include "distributed/listutils.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
-#include "optimizer/optimizer.h"
 #include "optimizer/clauses.h"
+#include "optimizer/optimizer.h"
 #include "optimizer/restrictinfo.h"
 #include "storage/fd.h"
 #include "utils/guc.h"
-#include "utils/memutils.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
 #include "utils/rel.h"
 
 #include "columnar/columnar.h"
 #include "columnar/columnar_storage.h"
 #include "columnar/columnar_tableam.h"
 #include "columnar/columnar_version_compat.h"
+
+#include "distributed/listutils.h"
 
 #define UNEXPECTED_STRIPE_READ_ERR_MSG \
 	"attempted to read an unexpected stripe while reading columnar " \
@@ -254,8 +255,9 @@ ColumnarReadFlushPendingWrites(ColumnarReadState *readState)
 {
 	Assert(!readState->snapshotRegisteredByUs);
 
-	Oid relfilenode = readState->relation->rd_node.relNode;
-	FlushWriteStateForRelfilenode(relfilenode, GetCurrentSubTransactionId());
+	RelFileNumber relfilenumber = RelationPhysicalIdentifierNumber_compat(
+		RelationPhysicalIdentifier_compat(readState->relation));
+	FlushWriteStateForRelfilenumber(relfilenumber, GetCurrentSubTransactionId());
 
 	if (readState->snapshot == InvalidSnapshot || !IsMVCCSnapshot(readState->snapshot))
 	{
@@ -984,7 +986,8 @@ ColumnarTableRowCount(Relation relation)
 {
 	ListCell *stripeMetadataCell = NULL;
 	uint64 totalRowCount = 0;
-	List *stripeList = StripesForRelfilenode(relation->rd_node);
+	List *stripeList = StripesForRelfilelocator(RelationPhysicalIdentifier_compat(
+													relation));
 
 	foreach(stripeMetadataCell, stripeList)
 	{
@@ -1012,7 +1015,8 @@ LoadFilteredStripeBuffers(Relation relation, StripeMetadata *stripeMetadata,
 
 	bool *projectedColumnMask = ProjectedColumnMask(columnCount, projectedColumnList);
 
-	StripeSkipList *stripeSkipList = ReadStripeSkipList(relation->rd_node,
+	StripeSkipList *stripeSkipList = ReadStripeSkipList(RelationPhysicalIdentifier_compat(
+															relation),
 														stripeMetadata->id,
 														tupleDescriptor,
 														stripeMetadata->chunkCount,
@@ -1557,7 +1561,7 @@ DeserializeDatumArray(StringInfo datumBuffer, bool *existsArray, uint32 datumCou
 										   datumTypeLength);
 		currentDatumDataOffset = att_addlength_datum(currentDatumDataOffset,
 													 datumTypeLength,
-													 currentDatumDataPointer);
+													 datumArray[datumIndex]);
 		currentDatumDataOffset = att_align_nominal(currentDatumDataOffset,
 												   datumTypeAlign);
 

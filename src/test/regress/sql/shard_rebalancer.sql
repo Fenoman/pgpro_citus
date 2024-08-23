@@ -5,6 +5,14 @@
 SET citus.next_shard_id TO 433000;
 SET citus.propagate_session_settings_for_loopback_connection TO ON;
 
+-- Because of historic reasons this test was written in a way that assumes that
+-- by_shard_count is the default strategy.
+SELECT citus_set_default_rebalance_strategy('by_shard_count');
+-- Lower the minimum disk size that a shard group is considered as. Otherwise
+-- we need to create shards of more than 100MB.
+ALTER SYSTEM SET citus.rebalancer_by_disk_size_base_cost = 0;
+SELECT pg_reload_conf();
+
 CREATE TABLE ref_table_test(a int primary key);
 SELECT create_reference_table('ref_table_test');
 CREATE TABLE dist_table_test(a int primary key);
@@ -1228,7 +1236,7 @@ DROP TABLE tab;
 
 -- we don't need the coordinator on pg_dist_node anymore
 SELECT 1 FROM master_remove_node('localhost', :master_port);
-SELECT public.wait_until_metadata_sync(30000);
+SELECT public.wait_until_metadata_sync(60000);
 
 --
 -- Make sure that rebalance_table_shards() and replicate_table_shards() replicate
@@ -1419,7 +1427,13 @@ SELECT create_distributed_table('test_rebalance_with_disabled_worker', 'a', colo
 SELECT citus_disable_node('localhost', :worker_2_port);
 SELECT public.wait_until_metadata_sync(30000);
 
+-- errors out because shard replication factor > shard allowed node count
 SELECT rebalance_table_shards('test_rebalance_with_disabled_worker');
+
+-- set replication factor to one, and try again
+SET citus.shard_replication_factor TO 1;
+SELECT rebalance_table_shards('test_rebalance_with_disabled_worker');
+SET citus.shard_replication_factor TO 2;
 
 SELECT 1 FROM citus_activate_node('localhost', :worker_2_port);
 
@@ -1431,7 +1445,7 @@ DROP TABLE IF EXISTS test_with_all_shards_excluded;
 CREATE TABLE test_with_all_shards_excluded(a int PRIMARY KEY);
 SELECT create_distributed_table('test_with_all_shards_excluded', 'a', colocate_with:='none', shard_count:=4);
 
-SELECT shardid FROM pg_dist_shard;
+SELECT shardid FROM pg_dist_shard ORDER BY shardid ASC;
 
 SELECT rebalance_table_shards('test_with_all_shards_excluded', excluded_shard_list:='{102073, 102074, 102075, 102076}');
 
@@ -1569,6 +1583,9 @@ select 1 from citus_add_node('localhost', :worker_2_port);
 select rebalance_table_shards();
 
 DROP TABLE table_with_primary_key, table_without_primary_key;
+SELECT citus_set_default_rebalance_strategy('by_disk_size');
+ALTER SYSTEM RESET citus.rebalancer_by_disk_size_base_cost;
+SELECT pg_reload_conf();
 \c - - - :worker_1_port
 SET citus.enable_ddl_propagation TO OFF;
 REVOKE ALL ON SCHEMA public FROM testrole;

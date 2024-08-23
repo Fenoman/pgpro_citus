@@ -16,21 +16,22 @@
 
 #include "postgres.h"
 
-#include "distributed/pg_version_constants.h"
-
 #include "c.h"
 
 #include "datatype/timestamp.h"
-#include "distributed/citus_nodes.h"
-#include "distributed/errormessage.h"
-#include "distributed/log_utils.h"
-#include "distributed/metadata_utility.h"
-#include "distributed/worker_manager.h"
-#include "distributed/multi_logical_planner.h"
-#include "distributed/distributed_planner.h"
 #include "lib/stringinfo.h"
 #include "nodes/parsenodes.h"
 #include "utils/array.h"
+
+#include "pg_version_constants.h"
+
+#include "distributed/citus_nodes.h"
+#include "distributed/distributed_planner.h"
+#include "distributed/errormessage.h"
+#include "distributed/log_utils.h"
+#include "distributed/metadata_utility.h"
+#include "distributed/multi_logical_planner.h"
+#include "distributed/worker_manager.h"
 
 
 /* Definitions local to the physical planner */
@@ -361,19 +362,19 @@ typedef struct JoinSequenceNode
 
 
 /*
- * InsertSelectMethod represents the method to use for INSERT INTO ... SELECT
- * queries.
+ * ModifyWithSelectMethod represents the method to use for INSERT INTO ... SELECT
+ * or MERGE type of queries.
  *
  * Note that there is a third method which is not represented here, which is
- * pushing down the INSERT INTO ... SELECT to workers. This method is executed
- * similar to other distributed queries and doesn't need a special execution
- * code, so we don't need to represent it here.
+ * pushing down the MERGE/INSERT INTO ... SELECT to workers. This method is
+ * executed similar to other distributed queries and doesn't need a special
+ * execution code, so we don't need to represent it here.
  */
-typedef enum InsertSelectMethod
+typedef enum ModifyWithSelectMethod
 {
-	INSERT_SELECT_VIA_COORDINATOR,
-	INSERT_SELECT_REPARTITION
-} InsertSelectMethod;
+	MODIFY_WITH_SELECT_VIA_COORDINATOR,
+	MODIFY_WITH_SELECT_REPARTITION
+} ModifyWithSelectMethod;
 
 
 /*
@@ -412,18 +413,22 @@ typedef struct DistributedPlan
 	Oid targetRelationId;
 
 	/*
-	 * INSERT .. SELECT via the coordinator or repartition */
-	Query *insertSelectQuery;
-	PlannedStmt *selectPlanForInsertSelect;
-	InsertSelectMethod insertSelectMethod;
+	 * Modifications performed using the output of a source query via
+	 * the coordinator or repartition.
+	 */
+	Query *modifyQueryViaCoordinatorOrRepartition;
+	PlannedStmt *selectPlanForModifyViaCoordinatorOrRepartition;
+	ModifyWithSelectMethod modifyWithSelectMethod;
 
 	/*
-	 * If intermediateResultIdPrefix is non-null, an INSERT ... SELECT
-	 * via the coordinator is written to a set of intermediate results
-	 * named according to <intermediateResultIdPrefix>_<anchorShardId>.
-	 * That way we can run a distributed INSERT ... SELECT with
-	 * RETURNING or ON CONFLICT from the intermediate results to the
-	 * target relation.
+	 * If intermediateResultIdPrefix is non-null, the source query
+	 * results are written to a set of intermediate results named
+	 * according to <intermediateResultIdPrefix>_<anchorShardId>.
+	 * That way we can run a distributed modification query which
+	 * requires evaluating source query results at the coordinator.
+	 * Once results are captured in intermediate files, modification
+	 * is done from the intermediate results into the target relation.
+	 *
 	 */
 	char *intermediateResultIdPrefix;
 
@@ -459,6 +464,13 @@ typedef struct DistributedPlan
 	 * or if prepared statement parameters prevented successful planning.
 	 */
 	DeferredErrorMessage *planningError;
+
+	/*
+	 * When performing query execution scenarios that require repartitioning
+	 * the source rows, this field stores the index of the column in the list
+	 * of source rows to be repartitioned for colocation with the target.
+	 */
+	int sourceResultRepartitionColumnIndex;
 } DistributedPlan;
 
 
@@ -543,7 +555,6 @@ extern Node *  WrapUngroupedVarsInAnyValueAggregate(Node *expression,
 													List *groupClauseList,
 													List *targetList,
 													bool checkExpressionEquality);
-extern CollateExpr * RelabelTypeToCollateExpr(RelabelType *relabelType);
 
 /*
  * Function declarations for building, updating constraints and simple operator

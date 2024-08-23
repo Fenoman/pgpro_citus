@@ -14,42 +14,43 @@
 
 #include "postgres.h"
 
-#include "distributed/pg_version_constants.h"
-
 #include "access/heapam.h"
 #include "access/nbtree.h"
 #include "catalog/pg_am.h"
 #include "catalog/pg_class.h"
 #include "commands/defrem.h"
-#include "distributed/citus_clauses.h"
-#include "distributed/colocation_utils.h"
-#include "distributed/metadata_cache.h"
-#include "distributed/insert_select_planner.h"
-#include "distributed/listutils.h"
-#include "distributed/multi_logical_optimizer.h"
-#include "distributed/multi_logical_planner.h"
-#include "distributed/multi_physical_planner.h"
-#include "distributed/reference_table_utils.h"
-#include "distributed/relation_restriction_equivalence.h"
-#include "distributed/query_pushdown_planning.h"
-#include "distributed/query_utils.h"
-#include "distributed/multi_router_planner.h"
-#include "distributed/worker_protocol.h"
-#include "distributed/version_compat.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/pathnodes.h"
-#include "optimizer/optimizer.h"
 #include "optimizer/clauses.h"
+#include "optimizer/optimizer.h"
 #include "optimizer/prep.h"
 #include "optimizer/tlist.h"
 #include "parser/parsetree.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
 #include "utils/lsyscache.h"
-#include "utils/syscache.h"
 #include "utils/rel.h"
 #include "utils/relcache.h"
+#include "utils/syscache.h"
+
+#include "pg_version_constants.h"
+
+#include "distributed/citus_clauses.h"
+#include "distributed/colocation_utils.h"
+#include "distributed/insert_select_planner.h"
+#include "distributed/listutils.h"
+#include "distributed/metadata_cache.h"
+#include "distributed/multi_logical_optimizer.h"
+#include "distributed/multi_logical_planner.h"
+#include "distributed/multi_physical_planner.h"
+#include "distributed/multi_router_planner.h"
+#include "distributed/query_pushdown_planning.h"
+#include "distributed/query_utils.h"
+#include "distributed/reference_table_utils.h"
+#include "distributed/relation_restriction_equivalence.h"
+#include "distributed/version_compat.h"
+#include "distributed/worker_protocol.h"
 
 
 /* Struct to differentiate different qualifier types in an expression tree walker */
@@ -272,7 +273,7 @@ TargetListOnPartitionColumn(Query *query, List *targetEntryList)
 	if (!targetListOnPartitionColumn)
 	{
 		if (!FindNodeMatchingCheckFunctionInRangeTableList(query->rtable,
-														   IsDistributedTableRTE))
+														   IsTableWithDistKeyRTE))
 		{
 			targetListOnPartitionColumn = true;
 		}
@@ -376,6 +377,20 @@ IsReferenceTableRTE(Node *node)
 {
 	Oid relationId = NodeTryGetRteRelid(node);
 	return relationId != InvalidOid && IsCitusTableType(relationId, REFERENCE_TABLE);
+}
+
+
+/*
+ * IsTableWithDistKeyRTE gets a node and returns true if the node
+ * is a range table relation entry that points to a distributed table
+ * that has a distribution column.
+ */
+bool
+IsTableWithDistKeyRTE(Node *node)
+{
+	Oid relationId = NodeTryGetRteRelid(node);
+	return relationId != InvalidOid && IsCitusTable(relationId) &&
+		   HasDistributionKey(relationId);
 }
 
 
@@ -1014,7 +1029,8 @@ ErrorHintRequired(const char *errorHint, Query *queryTree)
 		{
 			continue;
 		}
-		else if (IsCitusTableType(relationId, HASH_DISTRIBUTED))
+		else if (IsCitusTableType(relationId, HASH_DISTRIBUTED) ||
+				 IsCitusTableType(relationId, SINGLE_SHARD_DISTRIBUTED))
 		{
 			int colocationId = TableColocationId(relationId);
 			colocationIdList = list_append_unique_int(colocationIdList, colocationId);
@@ -2125,7 +2141,8 @@ ApplySinglePartitionJoin(MultiNode *leftNode, MultiNode *rightNode,
 	 * we introduce a (re-)partition operator for the other column.
 	 */
 	OpExpr *joinClause = SinglePartitionJoinClause(partitionColumnList,
-												   applicableJoinClauses);
+												   applicableJoinClauses,
+												   NULL);
 	Assert(joinClause != NULL);
 
 	/* both are verified in SinglePartitionJoinClause to not be NULL, assert is to guard */

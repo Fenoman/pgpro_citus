@@ -11,31 +11,31 @@
  *-------------------------------------------------------------------------
  */
 
-#include "postgres.h"
-
-#include "distributed/pg_version_constants.h"
-
 #include <limits.h>
 
-#include "access/nbtree.h"
+#include "postgres.h"
+
 #include "access/heapam.h"
 #include "access/htup_details.h"
+#include "access/nbtree.h"
 #include "catalog/pg_am.h"
+#include "lib/stringinfo.h"
+#include "nodes/nodeFuncs.h"
+#include "optimizer/optimizer.h"
+#include "utils/builtins.h"
+#include "utils/datum.h"
+#include "utils/lsyscache.h"
+#include "utils/rel.h"
+#include "utils/syscache.h"
+
+#include "pg_version_constants.h"
+
 #include "distributed/listutils.h"
 #include "distributed/metadata_cache.h"
 #include "distributed/multi_join_order.h"
 #include "distributed/multi_physical_planner.h"
 #include "distributed/pg_dist_partition.h"
 #include "distributed/worker_protocol.h"
-#include "lib/stringinfo.h"
-#include "optimizer/optimizer.h"
-#include "utils/builtins.h"
-#include "nodes/nodeFuncs.h"
-#include "utils/builtins.h"
-#include "utils/datum.h"
-#include "utils/lsyscache.h"
-#include "utils/rel.h"
-#include "utils/syscache.h"
 
 
 /* Config variables managed via guc.c */
@@ -81,8 +81,6 @@ static JoinOrderNode * CartesianProductReferenceJoin(JoinOrderNode *joinNode,
 													 JoinType joinType);
 static JoinOrderNode * LocalJoin(JoinOrderNode *joinNode, TableEntry *candidateTable,
 								 List *applicableJoinClauses, JoinType joinType);
-static bool JoinOnColumns(List *currentPartitionColumnList, Var *candidatePartitionColumn,
-						  List *joinClauseList);
 static JoinOrderNode * SinglePartitionJoin(JoinOrderNode *joinNode,
 										   TableEntry *candidateTable,
 										   List *applicableJoinClauses,
@@ -212,7 +210,7 @@ ExtractLeftMostRangeTableIndex(Node *node, int *rangeTableIndex)
 /*
  * JoinOnColumns determines whether two columns are joined by a given join clause list.
  */
-static bool
+bool
 JoinOnColumns(List *currentPartitionColumnList, Var *candidateColumn,
 			  List *joinClauseList)
 {
@@ -1001,7 +999,8 @@ SinglePartitionJoin(JoinOrderNode *currentJoinNode, TableEntry *candidateTable,
 	}
 
 	OpExpr *joinClause =
-		SinglePartitionJoinClause(currentPartitionColumnList, applicableJoinClauses);
+		SinglePartitionJoinClause(currentPartitionColumnList, applicableJoinClauses,
+								  NULL);
 	if (joinClause != NULL)
 	{
 		if (currentPartitionMethod == DISTRIBUTE_BY_HASH)
@@ -1039,7 +1038,8 @@ SinglePartitionJoin(JoinOrderNode *currentJoinNode, TableEntry *candidateTable,
 		 */
 		List *candidatePartitionColumnList = list_make1(candidatePartitionColumn);
 		joinClause = SinglePartitionJoinClause(candidatePartitionColumnList,
-											   applicableJoinClauses);
+											   applicableJoinClauses,
+											   NULL);
 		if (joinClause != NULL)
 		{
 			if (candidatePartitionMethod == DISTRIBUTE_BY_HASH)
@@ -1080,8 +1080,14 @@ SinglePartitionJoin(JoinOrderNode *currentJoinNode, TableEntry *candidateTable,
  * clause exists, the function returns NULL.
  */
 OpExpr *
-SinglePartitionJoinClause(List *partitionColumnList, List *applicableJoinClauses)
+SinglePartitionJoinClause(List *partitionColumnList, List *applicableJoinClauses, bool
+						  *foundTypeMismatch)
 {
+	if (foundTypeMismatch)
+	{
+		*foundTypeMismatch = false;
+	}
+
 	if (list_length(partitionColumnList) == 0)
 	{
 		return NULL;
@@ -1123,6 +1129,10 @@ SinglePartitionJoinClause(List *partitionColumnList, List *applicableJoinClauses
 				{
 					ereport(DEBUG1, (errmsg("single partition column types do not "
 											"match")));
+					if (foundTypeMismatch)
+					{
+						*foundTypeMismatch = true;
+					}
 				}
 			}
 		}
@@ -1404,7 +1414,7 @@ DistPartitionKeyOrError(Oid relationId)
 	if (partitionKey == NULL)
 	{
 		ereport(ERROR, (errmsg(
-							"no distribution column found for relation %d, because it is a reference table",
+							"no distribution column found for relation %d",
 							relationId)));
 	}
 

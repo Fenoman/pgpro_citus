@@ -10,13 +10,15 @@
 #ifndef RECURSIVE_PLANNING_H
 #define RECURSIVE_PLANNING_H
 
-#include "distributed/pg_version_constants.h"
+#include "nodes/pathnodes.h"
+#include "nodes/pg_list.h"
+#include "nodes/primnodes.h"
+
+#include "pg_version_constants.h"
+
 #include "distributed/errormessage.h"
 #include "distributed/log_utils.h"
 #include "distributed/relation_restriction_equivalence.h"
-#include "nodes/pg_list.h"
-#include "nodes/primnodes.h"
-#include "nodes/pathnodes.h"
 
 typedef struct RecursivePlanningContextInternal RecursivePlanningContext;
 
@@ -42,10 +44,12 @@ extern bool GeneratingSubplans(void);
 extern bool ContainsLocalTableDistributedTableJoin(List *rangeTableList);
 extern void ReplaceRTERelationWithRteSubquery(RangeTblEntry *rangeTableEntry,
 											  List *requiredAttrNumbers,
-											  RecursivePlanningContext *context);
+											  RecursivePlanningContext *context,
+											  RTEPermissionInfo *perminfo);
 extern bool IsRecursivelyPlannableRelation(RangeTblEntry *rangeTableEntry);
 extern bool IsRelationLocalTableOrMatView(Oid relationId);
 extern bool ContainsReferencesToOuterQuery(Query *query);
+extern void UpdateVarNosInNode(Node *node, Index newVarNo);
 
 
 #endif /* RECURSIVE_PLANNING_H */

@@ -9,23 +9,12 @@
  */
 
 #include "postgres.h"
+
 #include "fmgr.h"
 
 #include "access/genam.h"
 #include "catalog/objectaddress.h"
 #include "commands/extension.h"
-#include "distributed/commands.h"
-#include "distributed/citus_ruleutils.h"
-#include "distributed/commands/utility_hook.h"
-#include "distributed/deparser.h"
-#include "distributed/errormessage.h"
-#include "distributed/listutils.h"
-#include "distributed/metadata_sync.h"
-#include "distributed/metadata/dependency.h"
-#include "distributed/metadata/distobject.h"
-#include "distributed/multi_executor.h"
-#include "distributed/namespace_utils.h"
-#include "distributed/worker_transaction.h"
 #include "executor/spi.h"
 #include "nodes/nodes.h"
 #include "nodes/pg_list.h"
@@ -34,6 +23,19 @@
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
+
+#include "distributed/citus_ruleutils.h"
+#include "distributed/commands.h"
+#include "distributed/commands/utility_hook.h"
+#include "distributed/deparser.h"
+#include "distributed/errormessage.h"
+#include "distributed/listutils.h"
+#include "distributed/metadata/dependency.h"
+#include "distributed/metadata/distobject.h"
+#include "distributed/metadata_sync.h"
+#include "distributed/multi_executor.h"
+#include "distributed/namespace_utils.h"
+#include "distributed/worker_transaction.h"
 
 /*
  * GUC controls some restrictions for local objects. For example,
@@ -479,10 +481,7 @@ AppendViewDefinitionToCreateViewCommand(StringInfo buf, Oid viewOid)
 	 * Set search_path to NIL so that all objects outside of pg_catalog will be
 	 * schema-prefixed.
 	 */
-	OverrideSearchPath *overridePath = GetOverrideSearchPath(CurrentMemoryContext);
-	overridePath->schemas = NIL;
-	overridePath->addCatalog = true;
-	PushOverrideSearchPath(overridePath);
+	int saveNestLevel = PushEmptySearchPath();
 
 	/*
 	 * Push the transaction snapshot to be able to get vief definition with pg_get_viewdef
@@ -494,7 +493,7 @@ AppendViewDefinitionToCreateViewCommand(StringInfo buf, Oid viewOid)
 	char *viewDefinition = TextDatumGetCString(viewDefinitionDatum);
 
 	PopActiveSnapshot();
-	PopOverrideSearchPath();
+	PopEmptySearchPath(saveNestLevel);
 
 	appendStringInfo(buf, "AS %s ", viewDefinition);
 }
@@ -598,7 +597,7 @@ List *
 PostprocessAlterViewStmt(Node *node, const char *queryString)
 {
 	AlterTableStmt *stmt = castNode(AlterTableStmt, node);
-	Assert(AlterTableStmtObjType_compat(stmt) == OBJECT_VIEW);
+	Assert(stmt->objtype == OBJECT_VIEW);
 
 	List *viewAddresses = GetObjectAddressListFromParseTree((Node *) stmt, true, true);
 

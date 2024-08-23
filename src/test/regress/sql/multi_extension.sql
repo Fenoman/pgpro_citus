@@ -63,7 +63,9 @@ BEGIN
 	SELECT p.description previous_object, c.description current_object
 	FROM current_objects c FULL JOIN prev_objects p
 	ON p.description = c.description
-	WHERE p.description is null OR c.description is null;
+	WHERE (p.description is null OR c.description is null)
+          AND c.description IS DISTINCT FROM 'function any_value(anyelement) anyelement'
+          AND c.description IS DISTINCT FROM 'function any_value_agg(anyelement,anyelement) anyelement';
 
 	DROP TABLE prev_objects;
 	ALTER TABLE current_objects RENAME TO prev_objects;
@@ -456,7 +458,7 @@ DELETE FROM pg_dist_shard WHERE shardid = 1;
 CREATE TABLE e_transactions(order_id varchar(255) NULL, transaction_id int) PARTITION BY LIST(transaction_id);
 CREATE TABLE orders_2020_07_01
 PARTITION OF e_transactions FOR VALUES IN (1,2,3);
-INSERT INTO pg_dist_partition VALUES ('e_transactions'::regclass,'h', '{VAR :varno 1 :varattno 1 :vartype 1043 :vartypmod 259 :varcollid 100 :varlevelsup 0 :varnosyn 1 :varattnosyn 1 :location -1}', 7, 's');
+INSERT INTO pg_dist_partition VALUES ('e_transactions'::regclass,'h', '{VAR :varno 1 :varattno 1 :vartype 1043 :vartypmod 259 :varcollid 100 :varnullingrels (b) :varlevelsup 0 :varnosyn 1 :varattnosyn 1 :location -1}', 7, 's');
 
 SELECT
 	(metadata->>'partitioned_citus_table_exists_pre_11')::boolean as partitioned_citus_table_exists_pre_11,
@@ -591,16 +593,51 @@ SELECT * FROM multi_extension.print_extension_changes();
 ALTER EXTENSION citus UPDATE TO '11.3-1';
 SELECT * FROM multi_extension.print_extension_changes();
 
--- show running version
-SHOW citus.version;
-
--- Snapshot of state at 11.2-2
-ALTER EXTENSION citus UPDATE TO '11.2-2';
-
+-- Test downgrade to 11.3-1 from 11.3-2
+ALTER EXTENSION citus UPDATE TO '11.3-2';
+ALTER EXTENSION citus UPDATE TO '11.3-1';
+-- Should be empty result since upgrade+downgrade should be a no-op
 SELECT * FROM multi_extension.print_extension_changes();
 
--- Test downgrade to 11.2-1 from 11.2-2
-ALTER EXTENSION citus UPDATE TO '11.2-1';
+-- Snapshot of state at 11.3-2
+ALTER EXTENSION citus UPDATE TO '11.3-2';
+SELECT * FROM multi_extension.print_extension_changes();
+
+-- Test downgrade to 11.3-2 from 12.0-1
+ALTER EXTENSION citus UPDATE TO '12.0-1';
+
+CREATE TABLE null_shard_key (x int, y int);
+SET citus.shard_replication_factor TO 1;
+SELECT create_distributed_table('null_shard_key', null);
+
+-- Show that we cannot downgrade to 11.3-2 becuase the cluster has a
+-- distributed table with single-shard.
+ALTER EXTENSION citus UPDATE TO '11.3-2';
+
+DROP TABLE null_shard_key;
+
+ALTER EXTENSION citus UPDATE TO '11.3-2';
+-- Should be empty result since upgrade+downgrade should be a no-op
+SELECT * FROM multi_extension.print_extension_changes();
+
+-- Snapshot of state at 12.0-1
+ALTER EXTENSION citus UPDATE TO '12.0-1';
+SELECT * FROM multi_extension.print_extension_changes();
+
+-- Test downgrade to 12.0-1 from 12.1-1
+ALTER EXTENSION citus UPDATE TO '12.1-1';
+ALTER EXTENSION citus UPDATE TO '12.0-1';
+-- Should be empty result since upgrade+downgrade should be a no-op
+SELECT * FROM multi_extension.print_extension_changes();
+
+-- Snapshot of state at 12.1-1
+ALTER EXTENSION citus UPDATE TO '12.1-1';
+SELECT * FROM multi_extension.print_extension_changes();
+
+DROP TABLE multi_extension.prev_objects, multi_extension.extension_diff;
+
+-- show running version
+SHOW citus.version;
 
 -- ensure no unexpected objects were created outside pg_catalog
 SELECT pgio.type, pgio.identity
@@ -612,8 +649,6 @@ WHERE pgd.refclassid = 'pg_extension'::regclass AND
 	  pge.extname    = 'citus' AND
 	  pgio.schema    NOT IN ('pg_catalog', 'citus', 'citus_internal', 'test', 'columnar', 'columnar_internal')
 ORDER BY 1, 2;
-
-DROP TABLE multi_extension.prev_objects, multi_extension.extension_diff;
 
 -- see incompatible version errors out
 RESET citus.enable_version_checks;
@@ -902,6 +937,55 @@ SELECT create_distributed_table('test','x');
 DROP TABLE test;
 TRUNCATE pg_dist_node;
 
+-- confirm that we can create a single-shard table on an empty node
+CREATE TABLE test (x int, y int);
+INSERT INTO test VALUES (1,2);
+SET citus.shard_replication_factor TO 1;
+SELECT create_distributed_table('test', null, colocate_with=>'none', distribution_type=>null);
+
+-- and make sure that we can't remove the coordinator due to "test"
+SELECT citus_remove_node('localhost', :master_port);
+
+DROP TABLE test;
+
+-- and now we should be able to remove the coordinator
+SELECT citus_remove_node('localhost', :master_port);
+
+-- confirm that we can create a tenant schema / table on an empty node
+
+SET citus.enable_schema_based_sharding TO ON;
+
+CREATE SCHEMA tenant_schema;
+CREATE TABLE tenant_schema.test(x int, y int);
+
+SELECT colocationid = (
+    SELECT colocationid FROM pg_dist_partition WHERE logicalrelid = 'tenant_schema.test'::regclass
+)
+FROM pg_dist_schema
+WHERE schemaid::regnamespace::text = 'tenant_schema';
+
+-- and make sure that we can't remove the coordinator due to "test"
+SELECT citus_remove_node('localhost', :master_port);
+
+BEGIN;
+  SET LOCAL client_min_messages TO WARNING;
+  DROP SCHEMA tenant_schema CASCADE;
+COMMIT;
+
+-- and now we should be able to remove the coordinator
+SELECT citus_remove_node('localhost', :master_port);
+
+CREATE SCHEMA tenant_schema;
+
+-- Make sure that we can sync metadata for empty tenant schemas
+-- when adding the first node to the cluster.
+SELECT 1 FROM citus_add_node('localhost', :worker_1_port);
+
+DROP SCHEMA tenant_schema;
+SELECT citus_remove_node('localhost', :worker_1_port);
+
+RESET citus.enable_schema_based_sharding;
+
 -- confirm that we can create a reference table on an empty node
 CREATE TABLE test (x int, y int);
 INSERT INTO test VALUES (1,2);
@@ -914,6 +998,19 @@ CREATE TABLE test (x int, y int);
 INSERT INTO test VALUES (1,2);
 SELECT citus_add_local_table_to_metadata('test');
 DROP TABLE test;
+
+-- Verify that we don't consider the schemas created by extensions as tenant schemas.
+-- Easiest way of verifying this is to drop and re-create columnar extension.
+DROP EXTENSION citus_columnar;
+
+SET citus.enable_schema_based_sharding TO ON;
+
+CREATE EXTENSION citus_columnar;
+SELECT COUNT(*)=0 FROM pg_dist_schema
+WHERE schemaid IN ('columnar'::regnamespace, 'columnar_internal'::regnamespace);
+
+RESET citus.enable_schema_based_sharding;
+
 DROP EXTENSION citus;
 CREATE EXTENSION citus;
 

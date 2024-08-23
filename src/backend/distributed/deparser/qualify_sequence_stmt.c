@@ -17,12 +17,13 @@
 
 #include "postgres.h"
 
+#include "parser/parse_func.h"
+#include "utils/lsyscache.h"
+
 #include "distributed/commands.h"
 #include "distributed/deparser.h"
 #include "distributed/listutils.h"
 #include "distributed/version_compat.h"
-#include "parser/parse_func.h"
-#include "utils/lsyscache.h"
 
 
 /*
@@ -34,7 +35,7 @@ void
 QualifyAlterSequenceOwnerStmt(Node *node)
 {
 	AlterTableStmt *stmt = castNode(AlterTableStmt, node);
-	Assert(AlterTableStmtObjType_compat(stmt) == OBJECT_SEQUENCE);
+	Assert(stmt->objtype == OBJECT_SEQUENCE);
 
 	RangeVar *seq = stmt->relation;
 
@@ -62,7 +63,7 @@ void
 QualifyAlterSequencePersistenceStmt(Node *node)
 {
 	AlterTableStmt *stmt = castNode(AlterTableStmt, node);
-	Assert(AlterTableStmtObjType_compat(stmt) == OBJECT_SEQUENCE);
+	Assert(stmt->objtype == OBJECT_SEQUENCE);
 
 	RangeVar *seq = stmt->relation;
 

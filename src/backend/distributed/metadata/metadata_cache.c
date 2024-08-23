@@ -8,20 +8,17 @@
  */
 
 #include "postgres.h"
-#include "distributed/pg_version_constants.h"
-#include "pg_version_compat.h"
 
-#include "stdint.h"
-#include "postgres.h"
 #include "libpq-fe.h"
 #include "miscadmin.h"
+#include "stdint.h"
 
 #include "access/genam.h"
 #include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/nbtree.h"
-#include "access/xact.h"
 #include "access/sysattr.h"
+#include "access/xact.h"
 #include "catalog/index.h"
 #include "catalog/indexing.h"
 #include "catalog/pg_am.h"
@@ -30,38 +27,10 @@
 #include "catalog/pg_extension.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_type.h"
-#include "citus_version.h"
 #include "commands/dbcommands.h"
 #include "commands/extension.h"
 #include "commands/trigger.h"
-#include "distributed/backend_data.h"
-#include "distributed/citus_depended_object.h"
-#include "distributed/colocation_utils.h"
-#include "distributed/connection_management.h"
-#include "distributed/citus_ruleutils.h"
-#include "distributed/multi_executor.h"
-#include "distributed/function_utils.h"
-#include "distributed/listutils.h"
-#include "distributed/foreign_key_relationship.h"
-#include "distributed/listutils.h"
-#include "distributed/metadata_utility.h"
-#include "distributed/metadata/pg_dist_object.h"
-#include "distributed/metadata_cache.h"
-#include "distributed/multi_executor.h"
-#include "distributed/multi_physical_planner.h"
-#include "distributed/pg_dist_local_group.h"
-#include "distributed/pg_dist_node_metadata.h"
-#include "distributed/pg_dist_node.h"
-#include "distributed/pg_dist_partition.h"
-#include "distributed/pg_dist_shard.h"
-#include "distributed/pg_dist_placement.h"
-#include "distributed/shared_library_init.h"
-#include "distributed/shardinterval_utils.h"
-#include "distributed/utils/array_type.h"
-#include "distributed/utils/function.h"
-#include "distributed/version_compat.h"
-#include "distributed/worker_manager.h"
-#include "distributed/worker_protocol.h"
+#include "common/hashfn.h"
 #include "executor/executor.h"
 #include "nodes/makefuncs.h"
 #include "nodes/memnodes.h"
@@ -74,16 +43,48 @@
 #include "utils/catcache.h"
 #include "utils/datum.h"
 #include "utils/elog.h"
-#include "utils/hsearch.h"
-#include "utils/jsonb.h"
-#include "common/hashfn.h"
-#include "utils/inval.h"
 #include "utils/fmgroids.h"
+#include "utils/hsearch.h"
+#include "utils/inval.h"
+#include "utils/jsonb.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/palloc.h"
 #include "utils/rel.h"
+
+#include "citus_version.h"
+#include "pg_version_compat.h"
+#include "pg_version_constants.h"
+
+#include "distributed/backend_data.h"
+#include "distributed/citus_depended_object.h"
+#include "distributed/citus_ruleutils.h"
+#include "distributed/colocation_utils.h"
+#include "distributed/connection_management.h"
+#include "distributed/foreign_key_relationship.h"
+#include "distributed/function_utils.h"
+#include "distributed/listutils.h"
+#include "distributed/metadata/pg_dist_object.h"
+#include "distributed/metadata_cache.h"
+#include "distributed/metadata_utility.h"
+#include "distributed/multi_executor.h"
+#include "distributed/multi_physical_planner.h"
+#include "distributed/pg_dist_local_group.h"
+#include "distributed/pg_dist_node.h"
+#include "distributed/pg_dist_node_metadata.h"
+#include "distributed/pg_dist_partition.h"
+#include "distributed/pg_dist_placement.h"
+#include "distributed/pg_dist_shard.h"
+#include "distributed/shardinterval_utils.h"
+#include "distributed/shared_library_init.h"
+#include "distributed/utils/array_type.h"
+#include "distributed/utils/function.h"
+#include "distributed/version_compat.h"
+#include "distributed/worker_manager.h"
+#include "distributed/worker_protocol.h"
+#if PG_VERSION_NUM < PG_VERSION_16
 #include "utils/relfilenodemap.h"
+#endif
 #include "utils/relmapper.h"
 #include "utils/resowner.h"
 #include "utils/syscache.h"
@@ -131,6 +132,19 @@ typedef struct ShardIdCacheEntry
 	int shardIndex;
 } ShardIdCacheEntry;
 
+/*
+ * ExtensionCreatedState is used to track if citus extension has been created
+ * using CREATE EXTENSION command.
+ *  UNKNOWN     : MetadataCache is invalid. State is UNKNOWN.
+ *  CREATED     : Citus is created.
+ *  NOTCREATED	: Citus is not created.
+ */
+typedef enum ExtensionCreatedState
+{
+	UNKNOWN = 0,
+	CREATED = 1,
+	NOTCREATED = 2,
+} ExtensionCreatedState;
 
 /*
  * State which should be cleared upon DROP EXTENSION. When the configuration
@@ -138,7 +152,7 @@ typedef struct ShardIdCacheEntry
  */
 typedef struct MetadataCacheData
 {
-	bool extensionLoaded;
+	ExtensionCreatedState extensionCreatedState;
 	Oid distShardRelationId;
 	Oid distPlacementRelationId;
 	Oid distBackgroundJobRelationId;
@@ -178,6 +192,7 @@ typedef struct MetadataCacheData
 	Oid distColocationRelationId;
 	Oid distColocationConfigurationIndexId;
 	Oid distPartitionRelationId;
+	Oid distTenantSchemaRelationId;
 	Oid distPartitionLogicalRelidIndexId;
 	Oid distPartitionColocationidIndexId;
 	Oid distShardLogicalRelidIndexId;
@@ -188,6 +203,8 @@ typedef struct MetadataCacheData
 	Oid distPlacementGroupidIndexId;
 	Oid distTransactionRelationId;
 	Oid distTransactionGroupIndexId;
+	Oid distTenantSchemaPrimaryKeyIndexId;
+	Oid distTenantSchemaUniqueColocationIdIndexId;
 	Oid citusCatalogNamespaceId;
 	Oid copyFormatTypeId;
 	Oid readIntermediateResultFuncId;
@@ -283,7 +300,6 @@ static void CreateDistTableCache(void);
 static void CreateShardIdCache(void);
 static void CreateDistObjectCache(void);
 static void InvalidateForeignRelationGraphCacheCallback(Datum argument, Oid relationId);
-static void InvalidateDistRelationCacheCallback(Datum argument, Oid relationId);
 static void InvalidateNodeRelationCacheCallback(Datum argument, Oid relationId);
 static void InvalidateLocalGroupIdRelationCacheCallback(Datum argument, Oid relationId);
 static void InvalidateConnParamsCacheCallback(Datum argument, Oid relationId);
@@ -349,7 +365,8 @@ EnsureModificationsCanRun(void)
 {
 	if (RecoveryInProgress() && !WritableStandbyCoordinator)
 	{
-		ereport(ERROR, (errmsg("writing to worker nodes is not currently allowed"),
+		ereport(ERROR, (errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
+						errmsg("writing to worker nodes is not currently allowed"),
 						errdetail("the database is read-only")));
 	}
 
@@ -410,7 +427,8 @@ EnsureModificationsCanRunOnRelation(Oid relationId)
 
 	if (modifiedTableReplicated)
 	{
-		ereport(ERROR, (errmsg("writing to worker nodes is not currently "
+		ereport(ERROR, (errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
+						errmsg("writing to worker nodes is not currently "
 							   "allowed for replicated tables such as reference "
 							   "tables or hash distributed tables with replication "
 							   "factor greater than 1."),
@@ -439,6 +457,52 @@ IsCitusTableType(Oid relationId, CitusTableType tableType)
 		return false;
 	}
 	return IsCitusTableTypeCacheEntry(tableEntry, tableType);
+}
+
+
+/*
+ * GetCitusTableType is a helper function that returns the CitusTableType
+ * for the given relationId.
+ * Note that a single table can be qualified as multiple CitusTableType, such
+ * as hash distributed tables are both HASH_DISTRIBUTED and DISTRIBUTED_TABLE.
+ * This function returns the base type for a given table.
+ *
+ * If the table is not a Citus table, ANY_CITUS_TABLE_TYPE is returned.
+ */
+CitusTableType
+GetCitusTableType(CitusTableCacheEntry *tableEntry)
+{
+	/* we do not expect local tables here */
+	Assert(tableEntry != NULL);
+
+	if (IsCitusTableTypeCacheEntry(tableEntry, HASH_DISTRIBUTED))
+	{
+		return HASH_DISTRIBUTED;
+	}
+	else if (IsCitusTableTypeCacheEntry(tableEntry, SINGLE_SHARD_DISTRIBUTED))
+	{
+		return SINGLE_SHARD_DISTRIBUTED;
+	}
+	else if (IsCitusTableTypeCacheEntry(tableEntry, REFERENCE_TABLE))
+	{
+		return REFERENCE_TABLE;
+	}
+	else if (IsCitusTableTypeCacheEntry(tableEntry, CITUS_LOCAL_TABLE))
+	{
+		return CITUS_LOCAL_TABLE;
+	}
+	else if (IsCitusTableTypeCacheEntry(tableEntry, APPEND_DISTRIBUTED))
+	{
+		return APPEND_DISTRIBUTED;
+	}
+	else if (IsCitusTableTypeCacheEntry(tableEntry, RANGE_DISTRIBUTED))
+	{
+		return RANGE_DISTRIBUTED;
+	}
+	else
+	{
+		return ANY_CITUS_TABLE_TYPE;
+	}
 }
 
 
@@ -508,11 +572,21 @@ IsCitusTableTypeInternal(char partitionMethod, char replicationModel,
 			return partitionMethod == DISTRIBUTE_BY_RANGE;
 		}
 
+		case SINGLE_SHARD_DISTRIBUTED:
+		{
+			return partitionMethod == DISTRIBUTE_BY_NONE &&
+				   replicationModel != REPLICATION_MODEL_2PC &&
+				   colocationId != INVALID_COLOCATION_ID;
+		}
+
 		case DISTRIBUTED_TABLE:
 		{
 			return partitionMethod == DISTRIBUTE_BY_HASH ||
 				   partitionMethod == DISTRIBUTE_BY_RANGE ||
-				   partitionMethod == DISTRIBUTE_BY_APPEND;
+				   partitionMethod == DISTRIBUTE_BY_APPEND ||
+				   (partitionMethod == DISTRIBUTE_BY_NONE &&
+					replicationModel != REPLICATION_MODEL_2PC &&
+					colocationId != INVALID_COLOCATION_ID);
 		}
 
 		case STRICTLY_PARTITIONED_DISTRIBUTED_TABLE:
@@ -812,6 +886,21 @@ IsCitusLocalTableByDistParams(char partitionMethod, char replicationModel,
 	return partitionMethod == DISTRIBUTE_BY_NONE &&
 		   replicationModel != REPLICATION_MODEL_2PC &&
 		   colocationId == INVALID_COLOCATION_ID;
+}
+
+
+/*
+ * IsSingleShardTableByDistParams returns true if given partitionMethod,
+ * replicationModel and colocationId would identify a single-shard distributed
+ * table that has a null shard key.
+ */
+bool
+IsSingleShardTableByDistParams(char partitionMethod, char replicationModel,
+							   uint32 colocationId)
+{
+	return partitionMethod == DISTRIBUTE_BY_NONE &&
+		   replicationModel != REPLICATION_MODEL_2PC &&
+		   colocationId != INVALID_COLOCATION_ID;
 }
 
 
@@ -2109,16 +2198,30 @@ HasOverlappingShardInterval(ShardInterval **shardIntervalArray,
 bool
 CitusHasBeenLoaded(void)
 {
-	if (!MetadataCache.extensionLoaded || creating_extension)
+	/*
+	 * We do not use Citus hooks during CREATE/ALTER EXTENSION citus
+	 * since the objects used by the C code might be not be there yet.
+	 */
+	if (creating_extension)
 	{
-		/*
-		 * Refresh if we have not determined whether the extension has been
-		 * loaded yet, or in case of ALTER EXTENSION since we want to treat
-		 * Citus as "not loaded" during ALTER EXTENSION citus.
-		 */
-		bool extensionLoaded = CitusHasBeenLoadedInternal();
+		Oid citusExtensionOid = get_extension_oid("citus", true);
 
-		if (extensionLoaded && !MetadataCache.extensionLoaded)
+		if (CurrentExtensionObject == citusExtensionOid)
+		{
+			return false;
+		}
+	}
+
+	/*
+	 * If extensionCreatedState is UNKNOWN, query pg_extension for Citus
+	 * and cache the result. Otherwise return the value extensionCreatedState
+	 * indicates.
+	 */
+	if (MetadataCache.extensionCreatedState == UNKNOWN)
+	{
+		bool extensionCreated = CitusHasBeenLoadedInternal();
+
+		if (extensionCreated)
 		{
 			/*
 			 * Loaded Citus for the first time in this session, or first time after
@@ -2131,30 +2234,21 @@ CitusHasBeenLoaded(void)
 			StartupCitusBackend();
 
 			/*
-			 * InvalidateDistRelationCacheCallback resets state such as extensionLoaded
-			 * when it notices changes to pg_dist_partition (which usually indicate
-			 * `DROP EXTENSION citus;` has been run)
-			 *
-			 * Ensure InvalidateDistRelationCacheCallback will notice those changes
-			 * by caching pg_dist_partition's oid.
-			 *
-			 * We skip these checks during upgrade since pg_dist_partition is not
-			 * present during early stages of upgrade operation.
-			 */
-			DistPartitionRelationId();
-
-			/*
 			 * This needs to be initialized so we can receive foreign relation graph
 			 * invalidation messages in InvalidateForeignRelationGraphCacheCallback().
 			 * See the comments of InvalidateForeignKeyGraph for more context.
 			 */
 			DistColocationRelationId();
-		}
 
-		MetadataCache.extensionLoaded = extensionLoaded;
+			MetadataCache.extensionCreatedState = CREATED;
+		}
+		else
+		{
+			MetadataCache.extensionCreatedState = NOTCREATED;
+		}
 	}
 
-	return MetadataCache.extensionLoaded;
+	return (MetadataCache.extensionCreatedState == CREATED) ? true : false;
 }
 
 
@@ -2176,15 +2270,6 @@ CitusHasBeenLoadedInternal(void)
 	if (citusExtensionOid == InvalidOid)
 	{
 		/* Citus extension does not exist yet */
-		return false;
-	}
-
-	if (creating_extension && CurrentExtensionObject == citusExtensionOid)
-	{
-		/*
-		 * We do not use Citus hooks during CREATE/ALTER EXTENSION citus
-		 * since the objects used by the C code might be not be there yet.
-		 */
 		return false;
 	}
 
@@ -2815,6 +2900,39 @@ DistColocationConfigurationIndexId(void)
 						 &MetadataCache.distColocationConfigurationIndexId);
 
 	return MetadataCache.distColocationConfigurationIndexId;
+}
+
+
+/* return oid of pg_dist_schema relation */
+Oid
+DistTenantSchemaRelationId(void)
+{
+	CachedRelationLookup("pg_dist_schema",
+						 &MetadataCache.distTenantSchemaRelationId);
+
+	return MetadataCache.distTenantSchemaRelationId;
+}
+
+
+/* return oid of pg_dist_schema_pkey index */
+Oid
+DistTenantSchemaPrimaryKeyIndexId(void)
+{
+	CachedRelationLookup("pg_dist_schema_pkey",
+						 &MetadataCache.distTenantSchemaPrimaryKeyIndexId);
+
+	return MetadataCache.distTenantSchemaPrimaryKeyIndexId;
+}
+
+
+/* return oid of pg_dist_schema_unique_colocationid_index index */
+Oid
+DistTenantSchemaUniqueColocationIdIndexId(void)
+{
+	CachedRelationLookup("pg_dist_schema_unique_colocationid_index",
+						 &MetadataCache.distTenantSchemaUniqueColocationIdIndexId);
+
+	return MetadataCache.distTenantSchemaUniqueColocationIdIndexId;
 }
 
 
@@ -4090,10 +4208,6 @@ InitializeDistCache(void)
 	CreateShardIdCache();
 
 	InitializeDistObjectCache();
-
-	/* Watch for invalidation events. */
-	CacheRegisterRelcacheCallback(InvalidateDistRelationCacheCallback,
-								  (Datum) 0);
 }
 
 
@@ -4306,9 +4420,9 @@ RegisterCitusTableCacheEntryReleaseCallbacks(void)
 
 
 /*
- * GetLocalGroupId returns the group identifier of the local node. The function assumes
- * that pg_dist_local_node_group has exactly one row and has at least one column.
- * Otherwise, the function errors out.
+ * GetLocalGroupId returns the group identifier of the local node. The function
+ * assumes that pg_dist_local_group has exactly one row and has at least one
+ * column. Otherwise, the function errors out.
  */
 int32
 GetLocalGroupId(void)
@@ -4643,7 +4757,7 @@ InvalidateForeignKeyGraph(void)
  * InvalidateDistRelationCacheCallback flushes cache entries when a relation
  * is updated (or flushes the entire cache).
  */
-static void
+void
 InvalidateDistRelationCacheCallback(Datum argument, Oid relationId)
 {
 	/* invalidate either entire cache or a specific entry */
@@ -4651,11 +4765,17 @@ InvalidateDistRelationCacheCallback(Datum argument, Oid relationId)
 	{
 		InvalidateDistTableCache();
 		InvalidateDistObjectCache();
+		InvalidateMetadataSystemCache();
 	}
 	else
 	{
 		void *hashKey = (void *) &relationId;
 		bool foundInCache = false;
+
+		if (DistTableCacheHash == NULL)
+		{
+			return;
+		}
 
 		CitusTableCacheEntrySlot *cacheSlot =
 			hash_search(DistTableCacheHash, hashKey, HASH_FIND, &foundInCache);
@@ -4665,20 +4785,18 @@ InvalidateDistRelationCacheCallback(Datum argument, Oid relationId)
 		}
 
 		/*
-		 * If pg_dist_partition is being invalidated drop all state
-		 * This happens pretty rarely, but most importantly happens during
-		 * DROP EXTENSION citus; This isn't the only time when this happens
-		 * though, it can happen for multiple other reasons, such as an
-		 * autovacuum running ANALYZE on pg_dist_partition. Such an ANALYZE
-		 * wouldn't really need a full Metadata cache invalidation, but we
-		 * don't know how to differentiate between DROP EXTENSION and ANALYZE.
-		 * So for now we simply drop it in both cases and take the slight
-		 * temporary performance hit.
+		 * if pg_dist_partition relcache is invalidated for some reason,
+		 * invalidate the MetadataCache. It is likely an overkill to invalidate
+		 * the entire cache here. But until a better fix, we keep it this way
+		 * for postgres regression tests that includes
+		 *   REINDEX SCHEMA CONCURRENTLY pg_catalog
+		 * command.
 		 */
 		if (relationId == MetadataCache.distPartitionRelationId)
 		{
 			InvalidateMetadataSystemCache();
 		}
+
 
 		if (relationId == MetadataCache.distObjectRelationId)
 		{
@@ -4719,6 +4837,11 @@ InvalidateDistTableCache(void)
 	CitusTableCacheEntrySlot *cacheSlot = NULL;
 	HASH_SEQ_STATUS status;
 
+	if (DistTableCacheHash == NULL)
+	{
+		return;
+	}
+
 	hash_seq_init(&status, DistTableCacheHash);
 
 	while ((cacheSlot = (CitusTableCacheEntrySlot *) hash_seq_search(&status)) != NULL)
@@ -4736,6 +4859,11 @@ InvalidateDistObjectCache(void)
 {
 	DistObjectCacheEntry *cacheEntry = NULL;
 	HASH_SEQ_STATUS status;
+
+	if (DistObjectCacheHash == NULL)
+	{
+		return;
+	}
 
 	hash_seq_init(&status, DistObjectCacheHash);
 
@@ -4819,8 +4947,8 @@ CreateDistObjectCache(void)
 
 
 /*
- * InvalidateMetadataSystemCache resets all the cached OIDs and the extensionLoaded flag,
- * and invalidates the worker node, ConnParams, and local group ID caches.
+ * InvalidateMetadataSystemCache resets all the cached OIDs and the extensionCreatedState
+ * flag and invalidates the worker node, ConnParams, and local group ID caches.
  */
 void
 InvalidateMetadataSystemCache(void)
@@ -4878,8 +5006,8 @@ CitusTableTypeIdList(CitusTableType citusTableType)
 		Datum replicationModelDatum = datumArray[Anum_pg_dist_partition_repmodel - 1];
 		Datum colocationIdDatum = datumArray[Anum_pg_dist_partition_colocationid - 1];
 
-		Oid partitionMethod = DatumGetChar(partMethodDatum);
-		Oid replicationModel = DatumGetChar(replicationModelDatum);
+		char partitionMethod = DatumGetChar(partMethodDatum);
+		char replicationModel = DatumGetChar(replicationModelDatum);
 		uint32 colocationId = DatumGetUInt32(colocationIdDatum);
 
 		if (IsCitusTableTypeInternal(partitionMethod, replicationModel, colocationId,
@@ -5539,7 +5667,7 @@ role_exists(PG_FUNCTION_ARGS)
  * Otherwise, this function returns NULL.
  */
 char *
-GetPoolinfoViaCatalog(int64 nodeId)
+GetPoolinfoViaCatalog(int32 nodeId)
 {
 	ScanKeyData scanKey[1];
 	const int scanKeyCount = 1;

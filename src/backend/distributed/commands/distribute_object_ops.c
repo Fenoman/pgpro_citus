@@ -12,11 +12,12 @@
 
 #include "postgres.h"
 
+#include "pg_version_constants.h"
+
 #include "distributed/commands.h"
-#include "distributed/deparser.h"
-#include "distributed/pg_version_constants.h"
-#include "distributed/version_compat.h"
 #include "distributed/commands/utility_hook.h"
+#include "distributed/deparser.h"
+#include "distributed/version_compat.h"
 
 static DistributeObjectOps NoDistributeOps = {
 	.deparse = NULL,
@@ -294,8 +295,8 @@ static DistributeObjectOps Any_CreateForeignServer = {
 static DistributeObjectOps Any_CreateSchema = {
 	.deparse = DeparseCreateSchemaStmt,
 	.qualify = NULL,
-	.preprocess = PreprocessCreateSchemaStmt,
-	.postprocess = NULL,
+	.preprocess = NULL,
+	.postprocess = PostprocessCreateSchemaStmt,
 	.operationType = DIST_OPS_CREATE,
 	.address = CreateSchemaStmtObjectAddress,
 	.markDistributed = true,
@@ -432,6 +433,42 @@ static DistributeObjectOps Database_AlterOwner = {
 	.address = AlterDatabaseOwnerObjectAddress,
 	.markDistributed = false,
 };
+
+static DistributeObjectOps Database_Grant = {
+	.deparse = DeparseGrantOnDatabaseStmt,
+	.qualify = NULL,
+	.preprocess = PreprocessGrantOnDatabaseStmt,
+	.postprocess = NULL,
+	.objectType = OBJECT_DATABASE,
+	.operationType = DIST_OPS_ALTER,
+	.address = NULL,
+	.markDistributed = false,
+};
+
+static DistributeObjectOps Database_Alter = {
+	.deparse = DeparseAlterDatabaseStmt,
+	.qualify = NULL,
+	.preprocess = PreprocessAlterDatabaseStmt,
+	.postprocess = NULL,
+	.objectType = OBJECT_DATABASE,
+	.operationType = DIST_OPS_ALTER,
+	.address = NULL,
+	.markDistributed = false,
+};
+
+#if PG_VERSION_NUM >= PG_VERSION_15
+static DistributeObjectOps Database_RefreshColl = {
+	.deparse = DeparseAlterDatabaseRefreshCollStmt,
+	.qualify = NULL,
+	.preprocess = PreprocessAlterDatabaseRefreshCollStmt,
+	.postprocess = NULL,
+	.objectType = OBJECT_DATABASE,
+	.operationType = DIST_OPS_ALTER,
+	.address = NULL,
+	.markDistributed = false,
+};
+#endif
+
 static DistributeObjectOps Domain_Alter = {
 	.deparse = DeparseAlterDomainStmt,
 	.qualify = QualifyAlterDomainStmt,
@@ -1024,6 +1061,15 @@ static DistributeObjectOps Routine_Rename = {
 	.address = RenameFunctionStmtObjectAddress,
 	.markDistributed = false,
 };
+static DistributeObjectOps Schema_AlterOwner = {
+	.deparse = DeparseAlterSchemaOwnerStmt,
+	.qualify = NULL,
+	.preprocess = PreprocessAlterDistributedObjectStmt,
+	.operationType = DIST_OPS_ALTER,
+	.postprocess = NULL,
+	.address = AlterSchemaOwnerStmtObjectAddress,
+	.markDistributed = false,
+};
 static DistributeObjectOps Schema_Drop = {
 	.deparse = DeparseDropSchemaStmt,
 	.qualify = NULL,
@@ -1251,7 +1297,6 @@ static DistributeObjectOps Trigger_Rename = {
 	.markDistributed = false,
 };
 
-
 /*
  * GetDistributeObjectOps looks up the DistributeObjectOps which handles the node.
  *
@@ -1262,6 +1307,18 @@ GetDistributeObjectOps(Node *node)
 {
 	switch (nodeTag(node))
 	{
+		case T_AlterDatabaseStmt:
+		{
+			return &Database_Alter;
+		}
+
+#if PG_VERSION_NUM >= PG_VERSION_15
+		case T_AlterDatabaseRefreshCollStmt:
+		{
+			return &Database_RefreshColl;
+		}
+
+#endif
 		case T_AlterDomainStmt:
 		{
 			return &Domain_Alter;
@@ -1457,6 +1514,11 @@ GetDistributeObjectOps(Node *node)
 					return &Routine_AlterOwner;
 				}
 
+				case OBJECT_SCHEMA:
+				{
+					return &Schema_AlterOwner;
+				}
+
 				case OBJECT_STATISTIC_EXT:
 				{
 					return &Statistics_AlterOwner;
@@ -1517,7 +1579,7 @@ GetDistributeObjectOps(Node *node)
 		case T_AlterTableStmt:
 		{
 			AlterTableStmt *stmt = castNode(AlterTableStmt, node);
-			switch (AlterTableStmtObjType_compat(stmt))
+			switch (stmt->objtype)
 			{
 				case OBJECT_TYPE:
 				{
@@ -1895,6 +1957,11 @@ GetDistributeObjectOps(Node *node)
 				case OBJECT_ROUTINE:
 				{
 					return &Routine_Grant;
+				}
+
+				case OBJECT_DATABASE:
+				{
+					return &Database_Grant;
 				}
 
 				default:

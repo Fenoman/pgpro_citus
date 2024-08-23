@@ -12,19 +12,14 @@
 
 #include "postgres.h"
 
-
 #include "access/attnum.h"
 #include "access/heapam.h"
 #include "access/htup_details.h"
-#include "distributed/distribution_column.h"
-#include "distributed/metadata_cache.h"
-#include "distributed/multi_partitioning_utils.h"
-#include "distributed/version_compat.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodes.h"
 #include "nodes/primnodes.h"
-#include "parser/scansup.h"
 #include "parser/parse_relation.h"
+#include "parser/scansup.h"
 #include "utils/builtins.h"
 #include "utils/elog.h"
 #include "utils/errcodes.h"
@@ -32,6 +27,11 @@
 #include "utils/rel.h"
 #include "utils/relcache.h"
 #include "utils/syscache.h"
+
+#include "distributed/distribution_column.h"
+#include "distributed/metadata_cache.h"
+#include "distributed/multi_partitioning_utils.h"
+#include "distributed/version_compat.h"
 
 
 /* exports for SQL callable functions */
@@ -135,7 +135,7 @@ BuildDistributionKeyFromColumnName(Oid relationId, char *columnName, LOCKMODE lo
 
 	char *tableName = get_rel_name(relationId);
 
-	/* short circuit for reference tables */
+	/* short circuit for reference tables and single-shard tables */
 	if (columnName == NULL)
 	{
 		return NULL;

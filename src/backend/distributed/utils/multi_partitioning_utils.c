@@ -6,7 +6,7 @@
  */
 #include "postgres.h"
 
-#include "distributed/pg_version_constants.h"
+#include "pgstat.h"
 
 #include "access/genam.h"
 #include "access/heapam.h"
@@ -19,8 +19,21 @@
 #include "catalog/pg_inherits.h"
 #include "commands/tablecmds.h"
 #include "common/string.h"
-#include "distributed/citus_nodes.h"
+#include "lib/stringinfo.h"
+#include "nodes/makefuncs.h"
+#include "nodes/pg_list.h"
+#include "partitioning/partdesc.h"
+#include "utils/builtins.h"
+#include "utils/fmgroids.h"
+#include "utils/lsyscache.h"
+#include "utils/rel.h"
+#include "utils/syscache.h"
+#include "utils/varlena.h"
+
+#include "pg_version_constants.h"
+
 #include "distributed/adaptive_executor.h"
+#include "distributed/citus_nodes.h"
 #include "distributed/citus_ruleutils.h"
 #include "distributed/colocation_utils.h"
 #include "distributed/commands.h"
@@ -36,17 +49,6 @@
 #include "distributed/shardinterval_utils.h"
 #include "distributed/version_compat.h"
 #include "distributed/worker_protocol.h"
-#include "lib/stringinfo.h"
-#include "nodes/makefuncs.h"
-#include "nodes/pg_list.h"
-#include "pgstat.h"
-#include "partitioning/partdesc.h"
-#include "utils/builtins.h"
-#include "utils/fmgroids.h"
-#include "utils/lsyscache.h"
-#include "utils/rel.h"
-#include "utils/syscache.h"
-#include "utils/varlena.h"
 
 static char * PartitionBound(Oid partitionId);
 static Relation try_relation_open_nolock(Oid relationId);
@@ -411,9 +413,9 @@ CheckConstraintNameListForRelation(Oid relationId)
 	Relation pgConstraint = table_open(ConstraintRelationId, AccessShareLock);
 
 	ScanKeyInit(&scanKey[0], Anum_pg_constraint_conrelid,
-				BTEqualStrategyNumber, F_OIDEQ, relationId);
+				BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(relationId));
 	ScanKeyInit(&scanKey[1], Anum_pg_constraint_contype,
-				BTEqualStrategyNumber, F_CHAREQ, CONSTRAINT_CHECK);
+				BTEqualStrategyNumber, F_CHAREQ, CharGetDatum(CONSTRAINT_CHECK));
 
 	bool useIndex = false;
 	SysScanDesc scanDescriptor = systable_beginscan(pgConstraint, InvalidOid, useIndex,
@@ -1023,7 +1025,7 @@ IsParentTable(Oid relationId)
 Oid
 PartitionParentOid(Oid partitionOid)
 {
-	Oid partitionParentOid = get_partition_parent_compat(partitionOid, false);
+	Oid partitionParentOid = get_partition_parent(partitionOid, false);
 
 	return partitionParentOid;
 }
@@ -1074,7 +1076,7 @@ PartitionList(Oid parentRelationId)
 
 		ereport(ERROR, (errmsg("\"%s\" is not a parent table", relationName)));
 	}
-	PartitionDesc partDesc = RelationGetPartitionDesc_compat(rel, true);
+	PartitionDesc partDesc = RelationGetPartitionDesc(rel, true);
 	Assert(partDesc != NULL);
 
 	int partitionCount = partDesc->nparts;
@@ -1107,7 +1109,7 @@ GenerateDetachPartitionCommand(Oid partitionTableId)
 		ereport(ERROR, (errmsg("\"%s\" is not a partition", relationName)));
 	}
 
-	Oid parentId = get_partition_parent_compat(partitionTableId, false);
+	Oid parentId = get_partition_parent(partitionTableId, false);
 	char *tableQualifiedName = generate_qualified_relation_name(partitionTableId);
 	char *parentTableQualifiedName = generate_qualified_relation_name(parentId);
 
@@ -1221,7 +1223,7 @@ GenerateAlterTableAttachPartitionCommand(Oid partitionTableId)
 		ereport(ERROR, (errmsg("\"%s\" is not a partition", relationName)));
 	}
 
-	Oid parentId = get_partition_parent_compat(partitionTableId, false);
+	Oid parentId = get_partition_parent(partitionTableId, false);
 	char *tableQualifiedName = generate_qualified_relation_name(partitionTableId);
 	char *parentTableQualifiedName = generate_qualified_relation_name(parentId);
 

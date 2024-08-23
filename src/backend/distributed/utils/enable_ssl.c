@@ -18,21 +18,18 @@
  * it otherwise we get warnings about redefining this value. This needs to be
  * done before including libpq.h.
  */
-#include "distributed/pg_version_constants.h"
-#if PG_VERSION_NUM < PG_VERSION_14
-#ifndef OPENSSL_API_COMPAT
-#define OPENSSL_API_COMPAT 0x1000100L
-#endif
-#endif
+#include "miscadmin.h"
+
+#include "libpq/libpq.h"
+#include "nodes/parsenodes.h"
+#include "postmaster/postmaster.h"
+#include "utils/guc.h"
+
+#include "pg_version_constants.h"
 
 #include "distributed/connection_management.h"
 #include "distributed/memutils.h"
 #include "distributed/worker_protocol.h"
-#include "libpq/libpq.h"
-#include "miscadmin.h"
-#include "nodes/parsenodes.h"
-#include "postmaster/postmaster.h"
-#include "utils/guc.h"
 
 #ifdef USE_OPENSSL
 #include "openssl/dsa.h"

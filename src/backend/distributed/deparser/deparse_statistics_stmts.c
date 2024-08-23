@@ -12,16 +12,17 @@
  */
 #include "postgres.h"
 
-#include "distributed/pg_version_constants.h"
-
 #include "catalog/namespace.h"
+#include "lib/stringinfo.h"
+#include "nodes/nodes.h"
+#include "utils/builtins.h"
+
+#include "pg_version_constants.h"
+
 #include "distributed/citus_ruleutils.h"
 #include "distributed/deparser.h"
 #include "distributed/listutils.h"
 #include "distributed/relay_utility.h"
-#include "lib/stringinfo.h"
-#include "nodes/nodes.h"
-#include "utils/builtins.h"
 
 static void AppendCreateStatisticsStmt(StringInfo buf, CreateStatsStmt *stmt);
 static void AppendDropStatisticsStmt(StringInfo buf, List *nameList, bool ifExists);
@@ -229,7 +230,6 @@ AppendStatTypes(StringInfo buf, CreateStatsStmt *stmt)
 }
 
 
-#if PG_VERSION_NUM >= PG_VERSION_14
 static void
 AppendColumnNames(StringInfo buf, CreateStatsStmt *stmt)
 {
@@ -256,36 +256,6 @@ AppendColumnNames(StringInfo buf, CreateStatsStmt *stmt)
 	}
 }
 
-
-#else
-static void
-AppendColumnNames(StringInfo buf, CreateStatsStmt *stmt)
-{
-	ColumnRef *column = NULL;
-
-	foreach_ptr(column, stmt->exprs)
-	{
-		if (!IsA(column, ColumnRef) || list_length(column->fields) != 1)
-		{
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg(
-						 "only simple column references are allowed in CREATE STATISTICS")));
-		}
-
-		char *columnName = NameListToQuotedString(column->fields);
-
-		appendStringInfoString(buf, columnName);
-
-		if (column != llast(stmt->exprs))
-		{
-			appendStringInfoString(buf, ", ");
-		}
-	}
-}
-
-
-#endif
 
 static void
 AppendTableName(StringInfo buf, CreateStatsStmt *stmt)

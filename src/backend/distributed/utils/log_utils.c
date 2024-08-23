@@ -9,18 +9,15 @@
 
 #include "postgres.h"
 
-#include "distributed/pg_version_constants.h"
-
-#include "utils/guc.h"
-#include "distributed/log_utils.h"
-#include "distributed/errormessage.h"
-#include "common/sha2.h"
-
-#include "utils/builtins.h"
-
-#if PG_VERSION_NUM >= PG_VERSION_14
 #include "common/cryptohash.h"
-#endif
+#include "common/sha2.h"
+#include "utils/builtins.h"
+#include "utils/guc.h"
+
+#include "pg_version_constants.h"
+
+#include "distributed/errormessage.h"
+#include "distributed/log_utils.h"
 
 
 /*

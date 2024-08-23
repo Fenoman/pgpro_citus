@@ -10,9 +10,14 @@
 
 #include "postgres.h"
 
+#include "miscadmin.h"
+
 #include "catalog/dependency.h"
 #include "catalog/objectaddress.h"
 #include "commands/extension.h"
+#include "storage/lmgr.h"
+#include "utils/lsyscache.h"
+
 #include "distributed/commands.h"
 #include "distributed/commands/utility_hook.h"
 #include "distributed/connection_management.h"
@@ -25,9 +30,6 @@
 #include "distributed/remote_commands.h"
 #include "distributed/worker_manager.h"
 #include "distributed/worker_transaction.h"
-#include "miscadmin.h"
-#include "storage/lmgr.h"
-#include "utils/lsyscache.h"
 
 
 static void EnsureDependenciesCanBeDistributed(const ObjectAddress *relationAddress);
@@ -112,15 +114,35 @@ EnsureDependenciesExistOnAllNodes(const ObjectAddress *target)
 						   dependency->objectSubId, ExclusiveLock);
 	}
 
-	WorkerNode *workerNode = NULL;
-	foreach_ptr(workerNode, workerNodeList)
-	{
-		const char *nodeName = workerNode->workerName;
-		uint32 nodePort = workerNode->workerPort;
 
-		SendCommandListToWorkerOutsideTransaction(nodeName, nodePort,
-												  CitusExtensionOwnerName(),
-												  ddlCommands);
+	/*
+	 * We need to propagate dependencies via the current user's metadata connection if
+	 * any dependency for the target is created in the current transaction. Our assumption
+	 * is that if we rely on a dependency created in the current transaction, then the
+	 * current user, most probably, has permissions to create the target object as well.
+	 * Note that, user still may not be able to create the target due to no permissions
+	 * for any of its dependencies. But this is ok since it should be rare.
+	 *
+	 * If we opted to use a separate superuser connection for the target, then we would
+	 * have visibility issues since propagated dependencies would be invisible to
+	 * the separate connection until we locally commit.
+	 */
+	if (HasAnyDependencyInPropagatedObjects(target))
+	{
+		SendCommandListToWorkersWithMetadata(ddlCommands);
+	}
+	else
+	{
+		WorkerNode *workerNode = NULL;
+		foreach_ptr(workerNode, workerNodeList)
+		{
+			const char *nodeName = workerNode->workerName;
+			uint32 nodePort = workerNode->workerPort;
+
+			SendCommandListToWorkerOutsideTransaction(nodeName, nodePort,
+													  CitusExtensionOwnerName(),
+													  ddlCommands);
+		}
 	}
 
 	/*
@@ -214,13 +236,7 @@ DeferErrorIfCircularDependencyExists(const ObjectAddress *objectAddress)
 			dependency->objectId == objectAddress->objectId &&
 			dependency->objectSubId == objectAddress->objectSubId)
 		{
-			char *objectDescription = NULL;
-
-			#if PG_VERSION_NUM >= PG_VERSION_14
-			objectDescription = getObjectDescription(objectAddress, false);
-			#else
-			objectDescription = getObjectDescription(objectAddress);
-			#endif
+			char *objectDescription = getObjectDescription(objectAddress, false);
 
 			StringInfo detailInfo = makeStringInfo();
 			appendStringInfo(detailInfo, "\"%s\" circularly depends itself, resolve "
@@ -529,9 +545,9 @@ GetDependencyCreateDDLCommands(const ObjectAddress *dependency)
 	 */
 	Assert(false);
 	ereport(ERROR, (errmsg("unsupported object %s for distribution by citus",
-						   getObjectTypeDescription_compat(dependency,
+						   getObjectTypeDescription(dependency,
 
-	                                                       /* missingOk: */ false)),
+	                                                /* missingOk: */ false)),
 					errdetail(
 						"citus tries to recreate an unsupported object on its workers"),
 					errhint("please report a bug as this should not be happening")));

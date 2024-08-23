@@ -370,11 +370,13 @@ SELECT DISTINCT y FROM test;
 (1 row)
 
 -- non deterministic collations
+SET client_min_messages TO WARNING;
 CREATE COLLATION test_pg12.case_insensitive (
 	provider = icu,
 	locale = '@colStrength=secondary',
 	deterministic = false
 );
+RESET client_min_messages;
 CREATE TABLE col_test (
 	id int,
 	val text collate case_insensitive
@@ -402,13 +404,6 @@ where val = 'asdf';
  count
 ---------------------------------------------------------------------
      3
-(1 row)
-
-SELECT 1 FROM citus_add_node('localhost', :master_port, groupId => 0);
-NOTICE:  localhost:xxxxx is the coordinator and already contains metadata, skipping syncing the metadata
- ?column?
----------------------------------------------------------------------
-        1
 (1 row)
 
 BEGIN;
@@ -639,12 +634,6 @@ NOTICE:  renaming the new table to test_pg12.generated_stored_ref
 (4 rows)
 
 ROLLBACK;
-SELECT citus_remove_node('localhost', :master_port);
- citus_remove_node
----------------------------------------------------------------------
-
-(1 row)
-
 CREATE TABLE superuser_columnar_table (a int) USING columnar;
 CREATE USER read_access;
 SET ROLE read_access;

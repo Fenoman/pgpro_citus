@@ -489,7 +489,7 @@ push(@pgOptions, "citus.enable_manual_changes_to_shards=on");
 push(@pgOptions, "citus.allow_unsafe_locks_from_workers=on");
 push(@pgOptions, "citus.stat_statements_track = 'all'");
 push(@pgOptions, "citus.enable_change_data_capture=on");
-push(@pgOptions, "citus.stat_tenants_limit = 10");
+push(@pgOptions, "citus.stat_tenants_limit = 2");
 push(@pgOptions, "citus.stat_tenants_track = 'ALL'");
 
 # Some tests look at shards in pg_class, make sure we can usually see them:
@@ -1120,16 +1120,33 @@ sub RunVanillaTests
     system("mkdir", ("-p", "$pgregressOutputdir/sql")) == 0
             or die "Could not create vanilla sql dir.";
 
-    $exitcode = system("$plainRegress",
-                        ("--dlpath", $dlpath),
-                        ("--inputdir",  $pgregressInputdir),
-                        ("--outputdir",  $pgregressOutputdir),
-                        ("--schedule",  catfile("$pgregressInputdir", "parallel_schedule")),
-                        ("--use-existing"),
-                        ("--host","$host"),
-                        ("--port","$masterPort"),
-                        ("--user","$user"),
-                        ("--dbname", "$dbName"));
+    if ($majorversion >= "16")
+    {
+        $exitcode = system("$plainRegress",
+                            ("--dlpath", $dlpath),
+                            ("--inputdir",  $pgregressInputdir),
+                            ("--outputdir",  $pgregressOutputdir),
+                            ("--expecteddir",  $pgregressOutputdir),
+                            ("--schedule",  catfile("$pgregressInputdir", "parallel_schedule")),
+                            ("--use-existing"),
+                            ("--host","$host"),
+                            ("--port","$masterPort"),
+                            ("--user","$user"),
+                            ("--dbname", "$dbName"));
+    }
+    else
+    {
+        $exitcode = system("$plainRegress",
+                            ("--dlpath", $dlpath),
+                            ("--inputdir",  $pgregressInputdir),
+                            ("--outputdir",  $pgregressOutputdir),
+                            ("--schedule",  catfile("$pgregressInputdir", "parallel_schedule")),
+                            ("--use-existing"),
+                            ("--host","$host"),
+                            ("--port","$masterPort"),
+                            ("--user","$user"),
+                            ("--dbname", "$dbName"));
+    }
 }
 
 if ($useMitmproxy) {

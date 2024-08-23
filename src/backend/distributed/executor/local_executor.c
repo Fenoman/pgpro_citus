@@ -76,35 +76,38 @@
  *  via coordinator cannot happen via the local execution.
  */
 #include "postgres.h"
+
 #include "miscadmin.h"
 
-#include "distributed/pg_version_constants.h"
+#include "executor/tstoreReceiver.h"
+#include "executor/tuptable.h"
+#include "nodes/params.h"
+#include "optimizer/optimizer.h"
+#include "utils/snapmgr.h"
+
+#include "pg_version_constants.h"
 
 #include "distributed/adaptive_executor.h"
-#include "distributed/commands/utility_hook.h"
 #include "distributed/citus_custom_scan.h"
 #include "distributed/citus_ruleutils.h"
-#include "distributed/query_utils.h"
+#include "distributed/colocation_utils.h"
+#include "distributed/commands/utility_hook.h"
+#include "distributed/coordinator_protocol.h"
 #include "distributed/deparse_shard_query.h"
+#include "distributed/executor_util.h"
 #include "distributed/listutils.h"
 #include "distributed/local_executor.h"
 #include "distributed/local_plan_cache.h"
-#include "distributed/coordinator_protocol.h"
-#include "distributed/executor_util.h"
 #include "distributed/metadata_cache.h"
 #include "distributed/multi_executor.h"
 #include "distributed/multi_server_executor.h"
+#include "distributed/query_utils.h"
 #include "distributed/relation_access_tracking.h"
 #include "distributed/remote_commands.h" /* to access LogRemoteCommands */
 #include "distributed/transaction_management.h"
 #include "distributed/utils/citus_stat_tenants.h"
 #include "distributed/version_compat.h"
 #include "distributed/worker_protocol.h"
-#include "executor/tstoreReceiver.h"
-#include "executor/tuptable.h"
-#include "optimizer/optimizer.h"
-#include "nodes/params.h"
-#include "utils/snapmgr.h"
 
 /* controlled via a GUC */
 bool EnableLocalExecution = true;
@@ -382,13 +385,12 @@ ExecuteLocalTaskListExtended(List *taskList,
 
 /*
  * SetColocationIdAndPartitionKeyValueForTasks sets colocationId and partitionKeyValue
- * for the tasks in the taskList if workerJob has a colocationId and partitionKeyValue.
+ * for the tasks in the taskList.
  */
 static void
 SetColocationIdAndPartitionKeyValueForTasks(List *taskList, Job *workerJob)
 {
-	if (workerJob->colocationId != 0 &&
-		workerJob->partitionKeyValue != NULL)
+	if (workerJob->colocationId != INVALID_COLOCATION_ID)
 	{
 		Task *task = NULL;
 		foreach_ptr(task, taskList)

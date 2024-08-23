@@ -41,6 +41,7 @@ lib*.pc
 /src/backend/distributed/cdc/build-cdc-*/*
 /src/test/cdc/tmp_check/*
 
+
 # temporary files vim creates
 *.swp
 

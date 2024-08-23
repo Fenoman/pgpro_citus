@@ -34,22 +34,23 @@
  */
 #include "postgres.h"
 
-#include "distributed/pg_version_constants.h"
-
-#include "distributed/distributed_planner.h"
-#include "distributed/insert_select_planner.h"
-#include "distributed/multi_physical_planner.h" /* only to use some utility functions */
-#include "distributed/metadata_cache.h"
-#include "distributed/multi_router_planner.h"
-#include "distributed/pg_dist_partition.h"
-#include "distributed/shardinterval_utils.h"
-#include "distributed/shard_pruning.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/parsenodes.h"
 #include "nodes/pg_list.h"
 #include "optimizer/optimizer.h"
 #include "tcop/pquery.h"
+
+#include "pg_version_constants.h"
+
+#include "distributed/distributed_planner.h"
+#include "distributed/insert_select_planner.h"
+#include "distributed/metadata_cache.h"
+#include "distributed/multi_physical_planner.h" /* only to use some utility functions */
+#include "distributed/multi_router_planner.h"
+#include "distributed/pg_dist_partition.h"
+#include "distributed/shard_pruning.h"
+#include "distributed/shardinterval_utils.h"
 
 bool EnableFastPathRouterPlanner = true;
 
@@ -103,15 +104,24 @@ PlannedStmt *
 GeneratePlaceHolderPlannedStmt(Query *parse)
 {
 	PlannedStmt *result = makeNode(PlannedStmt);
+#if PG_VERSION_NUM >= PG_VERSION_16
+	SeqScan *scanNode = makeNode(SeqScan);
+	Plan *plan = &(scanNode->scan.plan);
+#else
 	Scan *scanNode = makeNode(Scan);
 	Plan *plan = &scanNode->plan;
+#endif
 
 	Node *distKey PG_USED_FOR_ASSERTS_ONLY = NULL;
 
-	AssertArg(FastPathRouterQuery(parse, &distKey));
+	Assert(FastPathRouterQuery(parse, &distKey));
 
 	/* there is only a single relation rte */
+#if PG_VERSION_NUM >= PG_VERSION_16
+	scanNode->scan.scanrelid = 1;
+#else
 	scanNode->scanrelid = 1;
+#endif
 
 	plan->targetlist =
 		copyObject(FetchStatementTargetList((Node *) parse));
@@ -127,6 +137,9 @@ GeneratePlaceHolderPlannedStmt(Query *parse)
 	result->stmt_len = parse->stmt_len;
 
 	result->rtable = copyObject(parse->rtable);
+#if PG_VERSION_NUM >= PG_VERSION_16
+	result->permInfos = copyObject(parse->rteperminfos);
+#endif
 	result->planTree = (Plan *) plan;
 	result->hasReturning = (parse->returningList != NIL);
 
@@ -212,19 +225,22 @@ FastPathRouterQuery(Query *query, Node **distributionKeyValue)
 		return false;
 	}
 
+	/*
+	 * If the table doesn't have a distribution column, we don't need to
+	 * check anything further.
+	 */
+	Var *distributionKey = PartitionColumn(distributedTableId, 1);
+	if (!distributionKey)
+	{
+		return true;
+	}
+
 	/* WHERE clause should not be empty for distributed tables */
 	if (joinTree == NULL ||
 		(IsCitusTableTypeCacheEntry(cacheEntry, DISTRIBUTED_TABLE) && joinTree->quals ==
 		 NULL))
 	{
 		return false;
-	}
-
-	/* if that's a reference table, we don't need to check anything further */
-	Var *distributionKey = PartitionColumn(distributedTableId, 1);
-	if (!distributionKey)
-	{
-		return true;
 	}
 
 	/* convert list of expressions into expression tree for further processing */

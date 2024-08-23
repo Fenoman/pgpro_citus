@@ -12,8 +12,9 @@
 #ifndef COLOCATION_UTILS_H_
 #define COLOCATION_UTILS_H_
 
-#include "distributed/shardinterval_utils.h"
 #include "nodes/pg_list.h"
+
+#include "distributed/shardinterval_utils.h"
 
 #define INVALID_COLOCATION_ID 0
 
@@ -24,7 +25,8 @@ extern bool ShardsColocated(ShardInterval *leftShardInterval,
 extern List * ColocatedTableList(Oid distributedTableId);
 extern List * ColocatedShardIntervalList(ShardInterval *shardInterval);
 extern List * ColocatedNonPartitionShardIntervalList(ShardInterval *shardInterval);
-extern Oid ColocatedTableId(Oid colocationId);
+extern Oid ColocatedTableId(int32 colocationId);
+extern uint32 SingleShardTableColocationNodeId(uint32 colocationId);
 extern uint64 ColocatedShardIdInRelation(Oid relationId, int shardIndex);
 uint32 ColocationId(int shardCount, int replicationFactor, Oid distributionColumnType,
 					Oid distributionColumnCollation);
@@ -48,6 +50,7 @@ extern void UpdateRelationColocationGroup(Oid distributedRelationId, uint32 colo
 										  bool localOnly);
 extern void DeleteColocationGroupIfNoTablesBelong(uint32 colocationId);
 extern List * ColocationGroupTableList(uint32 colocationId, uint32 count);
+extern void DeleteColocationGroup(uint32 colocationId);
 extern void DeleteColocationGroupLocally(uint32 colocationId);
 extern uint32 FindColocateWithColocationId(Oid relationId, char replicationModel,
 										   Oid distributionColumnType,

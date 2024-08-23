@@ -11,18 +11,21 @@
  */
 
 #include "postgres.h"
-#include "pgstat.h"
-
-#include "distributed/pg_version_constants.h"
 
 #include "libpq-fe.h"
-
 #include "miscadmin.h"
+#include "pgstat.h"
 
 #include "access/hash.h"
 #include "access/htup_details.h"
 #include "catalog/pg_authid.h"
 #include "commands/dbcommands.h"
+#include "common/hashfn.h"
+#include "storage/ipc.h"
+#include "utils/builtins.h"
+
+#include "pg_version_constants.h"
+
 #include "distributed/backend_data.h"
 #include "distributed/cancel_utils.h"
 #include "distributed/connection_management.h"
@@ -32,12 +35,9 @@
 #include "distributed/multi_executor.h"
 #include "distributed/placement_connection.h"
 #include "distributed/shared_connection_stats.h"
-#include "distributed/worker_manager.h"
 #include "distributed/time_constants.h"
 #include "distributed/tuplestore.h"
-#include "utils/builtins.h"
-#include "common/hashfn.h"
-#include "storage/ipc.h"
+#include "distributed/worker_manager.h"
 
 
 #define REMOTE_CONNECTION_STATS_COLUMNS 4
@@ -339,7 +339,7 @@ TryToIncrementSharedConnectionCounter(const char *hostname, int port)
 	LockConnectionSharedMemory(LW_EXCLUSIVE);
 
 	/*
-	 * As the hash map is  allocated in shared memory, it doesn't rely on palloc for
+	 * As the hash map is allocated in shared memory, it doesn't rely on palloc for
 	 * memory allocation, so we could get NULL via HASH_ENTER_NULL when there is no
 	 * space in the shared memory. That's why we prefer continuing the execution
 	 * instead of throwing an error.
@@ -440,7 +440,7 @@ IncrementSharedConnectionCounter(const char *hostname, int port)
 	LockConnectionSharedMemory(LW_EXCLUSIVE);
 
 	/*
-	 * As the hash map is  allocated in shared memory, it doesn't rely on palloc for
+	 * As the hash map is allocated in shared memory, it doesn't rely on palloc for
 	 * memory allocation, so we could get NULL via HASH_ENTER_NULL. That's why we prefer
 	 * continuing the execution instead of throwing an error.
 	 */
@@ -694,7 +694,7 @@ SharedConnectionStatsShmemInit(void)
 		ConditionVariableInit(&ConnectionStatsSharedState->waitersConditionVariable);
 	}
 
-	/*  allocate hash table */
+	/* allocate hash table */
 	SharedConnStatsHash =
 		ShmemInitHash("Shared Conn. Stats Hash", MaxWorkerNodesTracked,
 					  MaxWorkerNodesTracked, &info, hashFlags);

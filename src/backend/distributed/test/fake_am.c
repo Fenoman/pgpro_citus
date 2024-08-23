@@ -19,14 +19,10 @@
 
 #include "postgres.h"
 
-#include "distributed/pg_version_constants.h"
-#include "pg_version_compat.h"
-
-
 #include "access/amapi.h"
 #include "access/heapam.h"
-#include "access/tableam.h"
 #include "access/multixact.h"
+#include "access/tableam.h"
 #include "access/xact.h"
 #include "catalog/index.h"
 #include "catalog/storage.h"
@@ -35,6 +31,9 @@
 #include "executor/tuptable.h"
 #include "storage/smgr.h"
 #include "utils/snapmgr.h"
+
+#include "pg_version_compat.h"
+#include "pg_version_constants.h"
 
 PG_FUNCTION_INFO_V1(fake_am_handler);
 
@@ -169,7 +168,6 @@ fake_tuple_satisfies_snapshot(Relation rel, TupleTableSlot *slot,
 }
 
 
-#if PG_VERSION_NUM >= PG_VERSION_14
 static TransactionId
 fake_index_delete_tuples(Relation rel,
 						 TM_IndexDeleteOp *delstate)
@@ -177,20 +175,6 @@ fake_index_delete_tuples(Relation rel,
 	elog(ERROR, "fake_index_delete_tuples not implemented");
 	return InvalidTransactionId;
 }
-
-
-#else
-static TransactionId
-fake_compute_xid_horizon_for_tuples(Relation rel,
-									ItemPointerData *tids,
-									int nitems)
-{
-	elog(ERROR, "fake_compute_xid_horizon_for_tuples not implemented");
-	return InvalidTransactionId;
-}
-
-
-#endif
 
 
 /* ----------------------------------------------------------------------------
@@ -269,7 +253,7 @@ fake_tuple_update(Relation relation, ItemPointer otid,
 				  TupleTableSlot *slot, CommandId cid,
 				  Snapshot snapshot, Snapshot crosscheck,
 				  bool wait, TM_FailureData *tmfd,
-				  LockTupleMode *lockmode, bool *update_indexes)
+				  LockTupleMode *lockmode, TU_UpdateIndexes *update_indexes)
 {
 	elog(ERROR, "fake_tuple_update not implemented");
 }
@@ -298,7 +282,7 @@ fake_finish_bulk_insert(Relation relation, int options)
  */
 static void
 fake_relation_set_new_filenode(Relation rel,
-							   const RelFileNode *newrnode,
+							   const RelFileLocator *newrnode,
 							   char persistence,
 							   TransactionId *freezeXid,
 							   MultiXactId *minmulti)
@@ -359,7 +343,7 @@ fake_relation_nontransactional_truncate(Relation rel)
 
 
 static void
-fake_copy_data(Relation rel, const RelFileNode *newrnode)
+fake_copy_data(Relation rel, const RelFileLocator *newrnode)
 {
 	elog(ERROR, "fake_copy_data not implemented");
 }
@@ -568,13 +552,13 @@ static const TableAmRoutine fake_methods = {
 	.tuple_get_latest_tid = fake_get_latest_tid,
 	.tuple_tid_valid = fake_tuple_tid_valid,
 	.tuple_satisfies_snapshot = fake_tuple_satisfies_snapshot,
-#if PG_VERSION_NUM >= PG_VERSION_14
 	.index_delete_tuples = fake_index_delete_tuples,
-#else
-	.compute_xid_horizon_for_tuples = fake_compute_xid_horizon_for_tuples,
-#endif
 
+#if PG_VERSION_NUM >= PG_VERSION_16
+	.relation_set_new_filelocator = fake_relation_set_new_filenode,
+#else
 	.relation_set_new_filenode = fake_relation_set_new_filenode,
+#endif
 	.relation_nontransactional_truncate = fake_relation_nontransactional_truncate,
 	.relation_copy_data = fake_copy_data,
 	.relation_copy_for_cluster = fake_copy_for_cluster,

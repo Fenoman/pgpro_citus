@@ -23,13 +23,14 @@
 #include "catalog/namespace.h"
 #include "catalog/objectaddress.h"
 #include "catalog/pg_type.h"
+#include "nodes/makefuncs.h"
+#include "parser/parse_type.h"
+#include "utils/lsyscache.h"
+#include "utils/syscache.h"
+
 #include "distributed/commands.h"
 #include "distributed/deparser.h"
 #include "distributed/version_compat.h"
-#include "nodes/makefuncs.h"
-#include "parser/parse_type.h"
-#include "utils/syscache.h"
-#include "utils/lsyscache.h"
 
 /*
  * GetTypeNamespaceNameByNameList resolved the schema name of a type by its namelist.
@@ -123,7 +124,7 @@ void
 QualifyAlterTypeStmt(Node *node)
 {
 	AlterTableStmt *stmt = castNode(AlterTableStmt, node);
-	Assert(AlterTableStmtObjType_compat(stmt) == OBJECT_TYPE);
+	Assert(stmt->objtype == OBJECT_TYPE);
 
 	if (stmt->relation->schemaname == NULL)
 	{

@@ -7,12 +7,11 @@
  *-------------------------------------------------------------------------
  */
 
-#include "postgres.h"
-#include "miscadmin.h"
-
-#include "distributed/pg_version_constants.h"
-
 #include <stddef.h>
+
+#include "postgres.h"
+
+#include "miscadmin.h"
 
 #include "access/attnum.h"
 #include "access/genam.h"
@@ -22,9 +21,7 @@
 #include "access/skey.h"
 #include "access/stratnum.h"
 #include "access/sysattr.h"
-#if PG_VERSION_NUM >= PG_VERSION_14
 #include "access/toast_compression.h"
-#endif
 #include "access/tupdesc.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
@@ -41,21 +38,11 @@
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
 #include "commands/extension.h"
-#include "distributed/citus_ruleutils.h"
-#include "distributed/commands.h"
-#include "distributed/listutils.h"
-#include "distributed/multi_partitioning_utils.h"
-#include "distributed/metadata_cache.h"
-#include "distributed/metadata_sync.h"
-#include "distributed/metadata_utility.h"
-#include "distributed/namespace_utils.h"
-#include "distributed/relay_utility.h"
-#include "distributed/version_compat.h"
-#include "distributed/worker_protocol.h"
+#include "commands/sequence.h"
 #include "foreign/foreign.h"
 #include "lib/stringinfo.h"
-#include "nodes/nodes.h"
 #include "nodes/nodeFuncs.h"
+#include "nodes/nodes.h"
 #include "nodes/parsenodes.h"
 #include "nodes/pg_list.h"
 #include "parser/parse_utilcmd.h"
@@ -73,7 +60,20 @@
 #include "utils/relcache.h"
 #include "utils/ruleutils.h"
 #include "utils/syscache.h"
-#include "commands/sequence.h"
+
+#include "pg_version_constants.h"
+
+#include "distributed/citus_ruleutils.h"
+#include "distributed/commands.h"
+#include "distributed/listutils.h"
+#include "distributed/metadata_cache.h"
+#include "distributed/metadata_sync.h"
+#include "distributed/metadata_utility.h"
+#include "distributed/multi_partitioning_utils.h"
+#include "distributed/namespace_utils.h"
+#include "distributed/relay_utility.h"
+#include "distributed/version_compat.h"
+#include "distributed/worker_protocol.h"
 
 
 static void deparse_index_columns(StringInfo buffer, List *indexParameterList,
@@ -386,13 +386,11 @@ pg_get_tableschemadef_string(Oid tableRelationId, IncludeSequenceDefaults
 				atttypmod);
 			appendStringInfoString(&buffer, attributeTypeName);
 
-#if PG_VERSION_NUM >= PG_VERSION_14
 			if (CompressionMethodIsValid(attributeForm->attcompression))
 			{
 				appendStringInfo(&buffer, " COMPRESSION %s",
 								 GetCompressionMethodName(attributeForm->attcompression));
 			}
-#endif
 
 			if (attributeForm->attidentity && includeIdentityDefaults)
 			{
@@ -822,7 +820,7 @@ deparse_shard_index_statement(IndexStmt *origStmt, Oid distrelid, int64 shardid,
 	 * Switch to empty search_path to deparse_index_columns to produce fully-
 	 * qualified names in expressions.
 	 */
-	PushOverrideEmptySearchPath(CurrentMemoryContext);
+	int saveNestLevel = PushEmptySearchPath();
 
 	/* index column or expression list begins here */
 	appendStringInfoChar(buffer, '(');
@@ -859,7 +857,7 @@ deparse_shard_index_statement(IndexStmt *origStmt, Oid distrelid, int64 shardid,
 	}
 
 	/* revert back to original search_path */
-	PopOverrideSearchPath();
+	PopEmptySearchPath(saveNestLevel);
 }
 
 
@@ -939,17 +937,6 @@ deparse_shard_reindex_statement(ReindexStmt *origStmt, Oid distrelid, int64 shar
 bool
 IsReindexWithParam_compat(ReindexStmt *reindexStmt, char *param)
 {
-#if PG_VERSION_NUM < PG_VERSION_14
-	if (strcmp(param, "concurrently") == 0)
-	{
-		return reindexStmt->concurrent;
-	}
-	else if (strcmp(param, "verbose") == 0)
-	{
-		return reindexStmt->options & REINDEXOPT_VERBOSE;
-	}
-	return false;
-#else
 	DefElem *opt = NULL;
 	foreach_ptr(opt, reindexStmt->params)
 	{
@@ -959,7 +946,6 @@ IsReindexWithParam_compat(ReindexStmt *reindexStmt, char *param)
 		}
 	}
 	return false;
-#endif
 }
 
 
@@ -974,7 +960,7 @@ AddVacuumParams(ReindexStmt *reindexStmt, StringInfo buffer)
 	{
 		appendStringInfoString(temp, "VERBOSE");
 	}
-#if PG_VERSION_NUM >= PG_VERSION_14
+
 	char *tableSpaceName = NULL;
 	DefElem *opt = NULL;
 	foreach_ptr(opt, reindexStmt->params)
@@ -997,7 +983,6 @@ AddVacuumParams(ReindexStmt *reindexStmt, StringInfo buffer)
 			appendStringInfo(temp, "TABLESPACE %s", tableSpaceName);
 		}
 	}
-#endif
 
 	if (temp->len > 0)
 	{
@@ -1627,9 +1612,7 @@ RoleSpecString(RoleSpec *spec, bool withQuoteIdentifier)
 				   spec->rolename;
 		}
 
-		#if PG_VERSION_NUM >= PG_VERSION_14
 		case ROLESPEC_CURRENT_ROLE:
-		#endif
 		case ROLESPEC_CURRENT_USER:
 		{
 			return withQuoteIdentifier ?

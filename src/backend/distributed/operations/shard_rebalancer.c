@@ -12,30 +12,47 @@
  */
 
 
-#include "postgres.h"
-#include "libpq-fe.h"
-
 #include <math.h>
 
-#include "distributed/pg_version_constants.h"
+#include "postgres.h"
 
-#include "access/htup_details.h"
+#include "funcapi.h"
+#include "libpq-fe.h"
+#include "miscadmin.h"
+
 #include "access/genam.h"
-#include "catalog/pg_type.h"
+#include "access/htup_details.h"
 #include "catalog/pg_proc.h"
+#include "catalog/pg_type.h"
 #include "commands/dbcommands.h"
 #include "commands/sequence.h"
+#include "common/hashfn.h"
+#include "postmaster/postmaster.h"
+#include "storage/lmgr.h"
+#include "utils/builtins.h"
+#include "utils/fmgroids.h"
+#include "utils/guc_tables.h"
+#include "utils/json.h"
+#include "utils/lsyscache.h"
+#include "utils/memutils.h"
+#include "utils/pg_lsn.h"
+#include "utils/syscache.h"
+#include "utils/varlena.h"
+
+#include "pg_version_constants.h"
+
 #include "distributed/argutils.h"
 #include "distributed/background_jobs.h"
-#include "distributed/citus_safe_lib.h"
 #include "distributed/citus_ruleutils.h"
+#include "distributed/citus_safe_lib.h"
 #include "distributed/colocation_utils.h"
+#include "distributed/commands/utility_hook.h"
 #include "distributed/connection_management.h"
+#include "distributed/coordinator_protocol.h"
 #include "distributed/enterprise.h"
 #include "distributed/hash_helpers.h"
 #include "distributed/listutils.h"
 #include "distributed/lock_graph.h"
-#include "distributed/coordinator_protocol.h"
 #include "distributed/metadata_cache.h"
 #include "distributed/metadata_utility.h"
 #include "distributed/multi_logical_replication.h"
@@ -45,27 +62,12 @@
 #include "distributed/reference_table_utils.h"
 #include "distributed/remote_commands.h"
 #include "distributed/resource_lock.h"
-#include "distributed/shard_rebalancer.h"
 #include "distributed/shard_cleaner.h"
+#include "distributed/shard_rebalancer.h"
 #include "distributed/shard_transfer.h"
 #include "distributed/tuplestore.h"
 #include "distributed/utils/array_type.h"
 #include "distributed/worker_protocol.h"
-#include "funcapi.h"
-#include "miscadmin.h"
-#include "postmaster/postmaster.h"
-#include "storage/lmgr.h"
-#include "utils/builtins.h"
-#include "utils/fmgroids.h"
-#include "utils/json.h"
-#include "utils/lsyscache.h"
-#include "utils/memutils.h"
-#include "utils/pg_lsn.h"
-#include "utils/syscache.h"
-#include "common/hashfn.h"
-#include "utils/varlena.h"
-#include "utils/guc_tables.h"
-#include "distributed/commands/utility_hook.h"
 
 /* RebalanceOptions are the options used to control the rebalance algorithm */
 typedef struct RebalanceOptions
@@ -319,6 +321,7 @@ PG_FUNCTION_INFO_V1(citus_rebalance_wait);
 
 bool RunningUnderIsolationTest = false;
 int MaxRebalancerLoggedIgnoredMoves = 5;
+int RebalancerByDiskSizeBaseCost = 100 * 1024 * 1024;
 bool PropagateSessionSettingsForLoopbackConnection = false;
 
 static const char *PlacementUpdateTypeNames[] = {
@@ -525,6 +528,13 @@ GetRebalanceSteps(RebalanceOptions *options)
 		}
 	}
 
+	if (shardAllowedNodeCount < ShardReplicationFactor)
+	{
+		ereport(ERROR, (errmsg("Shard replication factor (%d) cannot be greater than "
+							   "number of nodes with should_have_shards=true (%d).",
+							   ShardReplicationFactor, shardAllowedNodeCount)));
+	}
+
 	List *activeShardPlacementListList = NIL;
 	List *unbalancedShards = NIL;
 
@@ -676,6 +686,8 @@ citus_shard_cost_by_disk_size(PG_FUNCTION_ARGS)
 
 	MemoryContextSwitchTo(oldContext);
 	MemoryContextReset(localContext);
+
+	colocationSizeInBytes += RebalancerByDiskSizeBaseCost;
 
 	if (colocationSizeInBytes <= 0)
 	{
@@ -872,7 +884,7 @@ ExecutePlacementUpdates(List *placementUpdateList, Oid shardReplicationModeOid,
  * ones) and the relation id of the target table. The dynamic shared memory
  * portion consists of a RebalanceMonitorHeader and multiple
  * PlacementUpdateEventProgress, one for each planned shard placement move. The
- * dsm_handle of the created segment is savedin the progress of the current backend so
+ * dsm_handle of the created segment is saved in the progress of the current backend so
  * that it can be read by external agents such as get_rebalance_progress function by
  * calling pg_stat_get_progress_info UDF. Since currently only VACUUM commands are
  * officially allowed as the command type, we describe ourselves as a VACUUM command and
@@ -1177,6 +1189,11 @@ replicate_table_shards(PG_FUNCTION_ARGS)
 	int32 maxShardCopies = PG_GETARG_INT32(2);
 	ArrayType *excludedShardArray = PG_GETARG_ARRAYTYPE_P(3);
 	Oid shardReplicationModeOid = PG_GETARG_OID(4);
+
+	if (IsCitusTableType(relationId, SINGLE_SHARD_DISTRIBUTED))
+	{
+		ereport(ERROR, (errmsg("cannot replicate single shard tables' shards")));
+	}
 
 	char transferMode = LookupShardTransferMode(shardReplicationModeOid);
 	EnsureReferenceTablesExistOnAllNodesExtended(transferMode);
@@ -2012,7 +2029,7 @@ GenerateTaskMoveDependencyList(PlacementUpdateEvent *move, int64 colocationId,
 	 * overlaps with the current move's target node.
 	 * The earlier/first move might make space for the later/second move.
 	 * So we could run out of disk space (or at least overload the node)
-	 * if we move the second shard to it before the first one is moved away. 
+	 * if we move the second shard to it before the first one is moved away.
 	 */
 	ShardMoveSourceNodeHashEntry *shardMoveSourceNodeHashEntry = hash_search(
 		shardMoveDependencies.nodeDependencies, &move->targetNode->nodeId, HASH_FIND,
@@ -2174,7 +2191,10 @@ RebalanceTableShardsBackground(RebalanceOptions *options, Oid shardReplicationMo
 						 quote_literal_cstr(shardTranferModeLabel));
 
 		int32 nodesInvolved[] = { 0 };
-		BackgroundTask *task = ScheduleBackgroundTask(jobId, GetUserId(), buf.data, 0,
+
+		/* replicate_reference_tables permissions require superuser */
+		Oid superUserId = CitusExtensionOwner();
+		BackgroundTask *task = ScheduleBackgroundTask(jobId, superUserId, buf.data, 0,
 													  NULL, 0, nodesInvolved);
 		replicateRefTablesTaskId = task->taskid;
 	}
@@ -2277,7 +2297,7 @@ UpdateShardPlacement(PlacementUpdateEvent *placementUpdateEvent,
 	if (updateType == PLACEMENT_UPDATE_MOVE)
 	{
 		appendStringInfo(placementUpdateCommand,
-						 "SELECT citus_move_shard_placement(%ld,%u,%u,%s)",
+						 "SELECT pg_catalog.citus_move_shard_placement(%ld,%u,%u,%s)",
 						 shardId,
 						 sourceNode->nodeId,
 						 targetNode->nodeId,
@@ -2286,7 +2306,7 @@ UpdateShardPlacement(PlacementUpdateEvent *placementUpdateEvent,
 	else if (updateType == PLACEMENT_UPDATE_COPY)
 	{
 		appendStringInfo(placementUpdateCommand,
-						 "SELECT citus_copy_shard_placement(%ld,%u,%u,%s)",
+						 "SELECT pg_catalog.citus_copy_shard_placement(%ld,%u,%u,%s)",
 						 shardId,
 						 sourceNode->nodeId,
 						 targetNode->nodeId,
@@ -2362,8 +2382,8 @@ GetSetCommandListForNewConnections(void)
 {
 	List *commandList = NIL;
 
-	struct config_generic **guc_vars = get_guc_variables();
-	int gucCount = GetNumConfigOptions();
+	int gucCount = 0;
+	struct config_generic **guc_vars = get_guc_variables_compat(&gucCount);
 
 	for (int gucIndex = 0; gucIndex < gucCount; gucIndex++)
 	{
@@ -2778,7 +2798,15 @@ FindAllowedTargetFillState(RebalanceState *state, uint64 shardId)
 				targetFillState->node,
 				state->functions->context))
 		{
-			return targetFillState;
+			bool targetHasShard = PlacementsHashFind(state->placementsHash,
+													 shardId,
+													 targetFillState->node);
+
+			/* skip if the shard is already placed on the target node */
+			if (!targetHasShard)
+			{
+				return targetFillState;
+			}
 		}
 	}
 	return NULL;

@@ -10,7 +10,6 @@
 
 #include "postgres.h"
 
-#include "distributed/pg_version_constants.h"
 #include "access/genam.h"
 #include "access/htup_details.h"
 #include "access/xact.h"
@@ -18,29 +17,16 @@
 #include "catalog/index.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_class.h"
+
+#include "pg_version_constants.h"
+#if PG_VERSION_NUM >= PG_VERSION_16
+#include "catalog/pg_namespace.h"
+#endif
+#include "miscadmin.h"
+
 #include "commands/defrem.h"
 #include "commands/tablecmds.h"
-#include "distributed/citus_ruleutils.h"
-#include "distributed/commands.h"
-#include "distributed/commands/utility_hook.h"
-#include "distributed/deparse_shard_query.h"
-#include "distributed/deparser.h"
-#include "distributed/distributed_planner.h"
-#include "distributed/listutils.h"
-#include "distributed/local_executor.h"
-#include "distributed/coordinator_protocol.h"
-#include "distributed/metadata_cache.h"
-#include "distributed/multi_executor.h"
-#include "distributed/multi_physical_planner.h"
-#include "distributed/multi_partitioning_utils.h"
-#include "distributed/namespace_utils.h"
-#include "distributed/resource_lock.h"
-#include "distributed/relation_access_tracking.h"
-#include "distributed/relation_utils.h"
-#include "distributed/version_compat.h"
-#include "distributed/worker_manager.h"
 #include "lib/stringinfo.h"
-#include "miscadmin.h"
 #include "nodes/parsenodes.h"
 #include "parser/parse_utilcmd.h"
 #include "storage/lmgr.h"
@@ -49,6 +35,26 @@
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
+
+#include "distributed/citus_ruleutils.h"
+#include "distributed/commands.h"
+#include "distributed/commands/utility_hook.h"
+#include "distributed/coordinator_protocol.h"
+#include "distributed/deparse_shard_query.h"
+#include "distributed/deparser.h"
+#include "distributed/distributed_planner.h"
+#include "distributed/listutils.h"
+#include "distributed/local_executor.h"
+#include "distributed/metadata_cache.h"
+#include "distributed/multi_executor.h"
+#include "distributed/multi_partitioning_utils.h"
+#include "distributed/multi_physical_planner.h"
+#include "distributed/namespace_utils.h"
+#include "distributed/relation_access_tracking.h"
+#include "distributed/relation_utils.h"
+#include "distributed/resource_lock.h"
+#include "distributed/version_compat.h"
+#include "distributed/worker_manager.h"
 
 
 /* Local functions forward declarations for helper functions */
@@ -1055,8 +1061,8 @@ RangeVarCallbackForDropIndex(const RangeVar *rel, Oid relOid, Oid oldRelOid, voi
 				errmsg("\"%s\" is not an index", rel->relname)));
 
 	/* Allow DROP to either table owner or schema owner */
-	if (!pg_class_ownercheck(relOid, GetUserId()) &&
-	    !pg_namespace_ownercheck(classform->relnamespace, GetUserId()))
+	if (!object_ownercheck(RelationRelationId, relOid, GetUserId()) &&
+		!object_ownercheck(NamespaceRelationId, classform->relnamespace, GetUserId()))
 	{
 		aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_INDEX, rel->relname);
 	}
@@ -1140,7 +1146,7 @@ RangeVarCallbackForReindexIndex(const RangeVar *relation, Oid relId, Oid oldRelI
 				 errmsg("\"%s\" is not an index", relation->relname)));
 
 	/* Check permissions */
-	if (!pg_class_ownercheck(relId, GetUserId()))
+	if (!object_ownercheck(RelationRelationId, relId, GetUserId()))
 		aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_INDEX, relation->relname);
 
 	/* Lock heap before index to avoid deadlock. */

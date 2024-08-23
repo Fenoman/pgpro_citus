@@ -13,10 +13,11 @@
 #define METADATA_SYNC_H
 
 
+#include "nodes/pg_list.h"
+
 #include "distributed/commands/utility_hook.h"
 #include "distributed/coordinator_protocol.h"
 #include "distributed/metadata_cache.h"
-#include "nodes/pg_list.h"
 
 /* managed via guc.c */
 typedef enum
@@ -119,7 +120,7 @@ extern List * InterTableRelationshipOfRelationCommandList(Oid relationId);
 extern List * DetachPartitionCommandList(void);
 extern void SyncNodeMetadataToNodes(void);
 extern BackgroundWorkerHandle * SpawnSyncNodeMetadataToNodes(Oid database, Oid owner);
-extern void SyncNodeMetadataToNodesMain(Datum main_arg);
+extern PGDLLEXPORT void SyncNodeMetadataToNodesMain(Datum main_arg);
 extern void SignalMetadataSyncDaemon(Oid database, int sig);
 extern bool ShouldInitiateMetadataSync(bool *lockFailure);
 extern List * SequenceDependencyCommandList(Oid relationId);
@@ -127,8 +128,13 @@ extern List * IdentitySequenceDependencyCommandList(Oid targetRelationId);
 
 extern List * DDLCommandsForSequence(Oid sequenceOid, char *ownerName);
 extern List * GetSequencesFromAttrDef(Oid attrdefOid);
+#if PG_VERSION_NUM < PG_VERSION_15
+ObjectAddress GetAttrDefaultColumnAddress(Oid attrdefoid);
+#endif
+extern List * GetAttrDefsFromSequence(Oid seqOid);
 extern void GetDependentSequencesWithRelation(Oid relationId, List **seqInfoList,
 											  AttrNumber attnum, char depType);
+extern List * GetDependentRelationsWithSequence(Oid seqId, char depType);
 extern List * GetDependentFunctionsWithRelation(Oid relationId);
 extern Oid GetAttributeTypeOid(Oid relationId, AttrNumber attnum);
 extern void SetLocalEnableMetadataSync(bool state);
@@ -137,6 +143,13 @@ extern void SyncNewColocationGroupToNodes(uint32 colocationId, int shardCount,
 										  Oid distributionColumType,
 										  Oid distributionColumnCollation);
 extern void SyncDeleteColocationGroupToNodes(uint32 colocationId);
+extern char * TenantSchemaInsertCommand(Oid schemaId, uint32 colocationId);
+extern char * TenantSchemaDeleteCommand(char *schemaName);
+extern char * UpdateNoneDistTableMetadataCommand(Oid relationId, char replicationModel,
+												 uint32 colocationId, bool autoConverted);
+extern char * AddPlacementMetadataCommand(uint64 shardId, uint64 placementId,
+										  uint64 shardLength, int32 groupId);
+extern char * DeletePlacementMetadataCommand(uint64 placementId);
 
 extern MetadataSyncContext * CreateMetadataSyncContext(List *nodeList,
 													   bool collectCommands,
@@ -163,6 +176,7 @@ extern void SendNodeWideObjectsSyncCommands(MetadataSyncContext *context);
 extern void SendShellTableDeletionCommands(MetadataSyncContext *context);
 extern void SendMetadataDeletionCommands(MetadataSyncContext *context);
 extern void SendColocationMetadataCommands(MetadataSyncContext *context);
+extern void SendTenantSchemaMetadataCommands(MetadataSyncContext *context);
 extern void SendDependencyCreationCommands(MetadataSyncContext *context);
 extern void SendDistTableMetadataCommands(MetadataSyncContext *context);
 extern void SendDistObjectCommands(MetadataSyncContext *context);
@@ -174,6 +188,7 @@ extern void SendInterTableRelationshipCommands(MetadataSyncContext *context);
 #define DELETE_ALL_DISTRIBUTED_OBJECTS "DELETE FROM pg_catalog.pg_dist_object"
 #define DELETE_ALL_PARTITIONS "DELETE FROM pg_dist_partition"
 #define DELETE_ALL_COLOCATION "DELETE FROM pg_catalog.pg_dist_colocation"
+#define DELETE_ALL_TENANT_SCHEMAS "DELETE FROM pg_catalog.pg_dist_schema"
 #define WORKER_DROP_ALL_SHELL_TABLES \
 	"CALL pg_catalog.worker_drop_all_shell_tables(%s)"
 #define CITUS_INTERNAL_MARK_NODE_NOT_SYNCED \

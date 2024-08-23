@@ -12,32 +12,11 @@
 
 #include "postgres.h"
 
-#include "distributed/pg_version_constants.h"
+#include "miscadmin.h"
 
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
-#include "distributed/backend_data.h"
-#include "distributed/metadata_utility.h"
-#include "distributed/citus_ruleutils.h"
-#include "distributed/colocation_utils.h"
-#include "distributed/commands.h"
-#include "distributed/commands/multi_copy.h"
-#include "distributed/connection_management.h"
-#include "distributed/deparse_shard_query.h"
-#include "distributed/function_call_delegation.h"
-#include "distributed/insert_select_planner.h"
-#include "distributed/citus_custom_scan.h"
-#include "distributed/coordinator_protocol.h"
-#include "distributed/listutils.h"
-#include "distributed/metadata_cache.h"
-#include "distributed/multi_executor.h"
-#include "distributed/multi_physical_planner.h"
-#include "distributed/remote_commands.h"
-#include "distributed/shard_pruning.h"
-#include "distributed/recursive_planning.h"
-#include "distributed/version_compat.h"
-#include "distributed/worker_manager.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/parsenodes.h"
@@ -46,10 +25,33 @@
 #include "optimizer/clauses.h"
 #include "parser/parse_coerce.h"
 #include "parser/parsetree.h"
-#include "miscadmin.h"
 #include "tcop/dest.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
+
+#include "pg_version_constants.h"
+
+#include "distributed/backend_data.h"
+#include "distributed/citus_custom_scan.h"
+#include "distributed/citus_ruleutils.h"
+#include "distributed/colocation_utils.h"
+#include "distributed/commands.h"
+#include "distributed/commands/multi_copy.h"
+#include "distributed/connection_management.h"
+#include "distributed/coordinator_protocol.h"
+#include "distributed/deparse_shard_query.h"
+#include "distributed/function_call_delegation.h"
+#include "distributed/insert_select_planner.h"
+#include "distributed/listutils.h"
+#include "distributed/metadata_cache.h"
+#include "distributed/metadata_utility.h"
+#include "distributed/multi_executor.h"
+#include "distributed/multi_physical_planner.h"
+#include "distributed/recursive_planning.h"
+#include "distributed/remote_commands.h"
+#include "distributed/shard_pruning.h"
+#include "distributed/version_compat.h"
+#include "distributed/worker_manager.h"
 
 struct ParamWalkerContext
 {
@@ -89,6 +91,10 @@ bool InDelegatedFunctionCall = false;
 static bool
 contain_param_walker(Node *node, void *context)
 {
+	if (node == NULL)
+	{
+		return false;
+	}
 	if (IsA(node, Param))
 	{
 		Param *paramNode = (Param *) node;
@@ -116,7 +122,6 @@ contain_param_walker(Node *node, void *context)
 PlannedStmt *
 TryToDelegateFunctionCall(DistributedPlanningContext *planContext)
 {
-	bool colocatedWithReferenceTable = false;
 	ShardPlacement *placement = NULL;
 	struct ParamWalkerContext walkerParamContext = { 0 };
 	bool inTransactionBlock = false;
@@ -337,7 +342,7 @@ TryToDelegateFunctionCall(DistributedPlanningContext *planContext)
 		if (!procedure->forceDelegation)
 		{
 			/* cannot delegate function calls in a multi-statement transaction */
-			ereport(DEBUG1, (errmsg("not pushing down function calls in "
+			ereport(DEBUG4, (errmsg("not pushing down function calls in "
 									"a multi-statement transaction")));
 			return NULL;
 		}
@@ -388,15 +393,8 @@ TryToDelegateFunctionCall(DistributedPlanningContext *planContext)
 	Oid colocatedRelationId = ColocatedTableId(procedure->colocationId);
 	if (colocatedRelationId == InvalidOid)
 	{
-		ereport(DEBUG1, (errmsg("function does not have co-located tables")));
+		ereport(DEBUG4, (errmsg("function does not have co-located tables")));
 		return NULL;
-	}
-
-	CitusTableCacheEntry *distTable = GetCitusTableCacheEntry(colocatedRelationId);
-	Var *partitionColumn = distTable->partitionColumn;
-	if (partitionColumn == NULL)
-	{
-		colocatedWithReferenceTable = true;
 	}
 
 	/*
@@ -410,14 +408,20 @@ TryToDelegateFunctionCall(DistributedPlanningContext *planContext)
 		return NULL;
 	}
 
-	if (colocatedWithReferenceTable)
+	CitusTableCacheEntry *distTable = GetCitusTableCacheEntry(colocatedRelationId);
+	if (IsCitusTableType(colocatedRelationId, REFERENCE_TABLE))
 	{
 		placement = ShardPlacementForFunctionColocatedWithReferenceTable(distTable);
+	}
+	else if (IsCitusTableType(colocatedRelationId, SINGLE_SHARD_DISTRIBUTED))
+	{
+		placement = ShardPlacementForFunctionColocatedWithSingleShardTable(distTable);
 	}
 	else
 	{
 		placement = ShardPlacementForFunctionColocatedWithDistTable(procedure,
 																	funcExpr->args,
+																	distTable->
 																	partitionColumn,
 																	distTable,
 																	planContext->plan);
@@ -567,6 +571,34 @@ ShardPlacementForFunctionColocatedWithDistTable(DistObjectCacheEntry *procedure,
 	}
 
 	return linitial(placementList);
+}
+
+
+/*
+ * ShardPlacementForFunctionColocatedWithSingleShardTable decides on a placement
+ * for delegating a function call that reads from a single shard table.
+ */
+ShardPlacement *
+ShardPlacementForFunctionColocatedWithSingleShardTable(CitusTableCacheEntry *cacheEntry)
+{
+	const ShardInterval *shardInterval = cacheEntry->sortedShardIntervalArray[0];
+
+	if (shardInterval == NULL)
+	{
+		ereport(DEBUG1, (errmsg("cannot push down call, failed to find shard interval")));
+		return NULL;
+	}
+
+	List *placementList = ActiveShardPlacementList(shardInterval->shardId);
+	if (list_length(placementList) != 1)
+	{
+		/* punt on this for now */
+		ereport(DEBUG1, (errmsg(
+							 "cannot push down function call for replicated distributed tables")));
+		return NULL;
+	}
+
+	return (ShardPlacement *) linitial(placementList);
 }
 
 

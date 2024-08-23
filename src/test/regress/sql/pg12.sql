@@ -242,11 +242,13 @@ COMMIT;
 SELECT DISTINCT y FROM test;
 
 -- non deterministic collations
+SET client_min_messages TO WARNING;
 CREATE COLLATION test_pg12.case_insensitive (
 	provider = icu,
 	locale = '@colStrength=secondary',
 	deterministic = false
 );
+RESET client_min_messages;
 
 CREATE TABLE col_test (
 	id int,
@@ -266,8 +268,6 @@ insert into col_test values
 select count(*)
 from col_test
 where val = 'asdf';
-
-SELECT 1 FROM citus_add_node('localhost', :master_port, groupId => 0);
 
 BEGIN;
   CREATE TABLE generated_stored_col_test (x int, y int generated always as (x+1) stored);
@@ -373,8 +373,6 @@ BEGIN;
 
   SELECT * FROM generated_stored_ref;
 ROLLBACK;
-
-SELECT citus_remove_node('localhost', :master_port);
 
 CREATE TABLE superuser_columnar_table (a int) USING columnar;
 

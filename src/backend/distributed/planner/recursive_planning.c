@@ -48,49 +48,49 @@
 
 #include "postgres.h"
 
-#include "distributed/pg_version_constants.h"
-
 #include "funcapi.h"
 
-#include "catalog/pg_type.h"
 #include "catalog/pg_class.h"
+#include "catalog/pg_type.h"
+#include "lib/stringinfo.h"
+#include "nodes/makefuncs.h"
+#include "nodes/nodeFuncs.h"
+#include "nodes/nodes.h"
+#include "nodes/pathnodes.h"
+#include "nodes/pg_list.h"
+#include "nodes/primnodes.h"
+#include "optimizer/clauses.h"
+#include "optimizer/optimizer.h"
+#include "optimizer/planner.h"
+#include "optimizer/prep.h"
+#include "parser/parse_relation.h"
+#include "parser/parsetree.h"
+#include "utils/builtins.h"
+#include "utils/guc.h"
+#include "utils/lsyscache.h"
+
+#include "pg_version_constants.h"
+
 #include "distributed/citus_nodes.h"
 #include "distributed/citus_ruleutils.h"
 #include "distributed/commands/multi_copy.h"
 #include "distributed/distributed_planner.h"
 #include "distributed/errormessage.h"
-#include "distributed/local_distributed_join_planner.h"
 #include "distributed/listutils.h"
+#include "distributed/local_distributed_join_planner.h"
 #include "distributed/log_utils.h"
 #include "distributed/metadata_cache.h"
-#include "distributed/multi_logical_planner.h"
 #include "distributed/multi_logical_optimizer.h"
-#include "distributed/multi_router_planner.h"
+#include "distributed/multi_logical_planner.h"
 #include "distributed/multi_physical_planner.h"
+#include "distributed/multi_router_planner.h"
 #include "distributed/multi_server_executor.h"
 #include "distributed/query_colocation_checker.h"
 #include "distributed/query_pushdown_planning.h"
 #include "distributed/recursive_planning.h"
 #include "distributed/relation_restriction_equivalence.h"
-#include "distributed/log_utils.h"
 #include "distributed/shard_pruning.h"
 #include "distributed/version_compat.h"
-#include "lib/stringinfo.h"
-#include "optimizer/clauses.h"
-#include "optimizer/optimizer.h"
-#include "optimizer/planner.h"
-#include "optimizer/prep.h"
-#include "parser/parsetree.h"
-#include "nodes/makefuncs.h"
-#include "nodes/nodeFuncs.h"
-#include "nodes/nodes.h"
-#include "nodes/nodeFuncs.h"
-#include "nodes/pg_list.h"
-#include "nodes/primnodes.h"
-#include "nodes/pathnodes.h"
-#include "utils/builtins.h"
-#include "utils/guc.h"
-#include "utils/lsyscache.h"
 
 /*
  * RecursivePlanningContext is used to recursively plan subqueries
@@ -188,7 +188,6 @@ static Query * BuildReadIntermediateResultsQuery(List *targetEntryList,
 												 List *columnAliasList,
 												 Const *resultIdConst, Oid functionOid,
 												 bool useBinaryCopyFormat);
-static void UpdateVarNosInNode(Node *node, Index newVarNo);
 static Query * CreateOuterSubquery(RangeTblEntry *rangeTableEntry,
 								   List *outerSubqueryTargetList);
 static List * GenerateRequiredColNamesFromTargetList(List *targetList);
@@ -887,8 +886,19 @@ RecursivelyPlanDistributedJoinNode(Node *node, Query *query,
 		List *requiredAttributes =
 			RequiredAttrNumbersForRelation(distributedRte, restrictionContext);
 
+#if PG_VERSION_NUM >= PG_VERSION_16
+		RTEPermissionInfo *perminfo = NULL;
+		if (distributedRte->perminfoindex)
+		{
+			perminfo = getRTEPermissionInfo(query->rteperminfos, distributedRte);
+		}
+
 		ReplaceRTERelationWithRteSubquery(distributedRte, requiredAttributes,
-										  recursivePlanningContext);
+										  recursivePlanningContext, perminfo);
+#else
+		ReplaceRTERelationWithRteSubquery(distributedRte, requiredAttributes,
+										  recursivePlanningContext, NULL);
+#endif
 	}
 	else if (distributedRte->rtekind == RTE_SUBQUERY)
 	{
@@ -1087,8 +1097,8 @@ RecursivelyPlanCTEs(Query *query, RecursivePlanningContext *planningContext)
 	if (query->hasRecursive)
 	{
 		return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
-							 "recursive CTEs are not supported in distributed "
-							 "queries",
+							 "recursive CTEs are only supported when they "
+							 "contain a filter on the distribution column",
 							 NULL, NULL);
 	}
 
@@ -1752,9 +1762,11 @@ NodeContainsSubqueryReferencingOuterQuery(Node *node)
 void
 ReplaceRTERelationWithRteSubquery(RangeTblEntry *rangeTableEntry,
 								  List *requiredAttrNumbers,
-								  RecursivePlanningContext *context)
+								  RecursivePlanningContext *context,
+								  RTEPermissionInfo *perminfo)
 {
-	Query *subquery = WrapRteRelationIntoSubquery(rangeTableEntry, requiredAttrNumbers);
+	Query *subquery = WrapRteRelationIntoSubquery(rangeTableEntry, requiredAttrNumbers,
+												  perminfo);
 	List *outerQueryTargetList = CreateAllTargetListForRelation(rangeTableEntry->relid,
 																requiredAttrNumbers);
 
@@ -1779,6 +1791,9 @@ ReplaceRTERelationWithRteSubquery(RangeTblEntry *rangeTableEntry,
 
 	/* replace the function with the constructed subquery */
 	rangeTableEntry->rtekind = RTE_SUBQUERY;
+#if PG_VERSION_NUM >= PG_VERSION_16
+	rangeTableEntry->perminfoindex = 0;
+#endif
 	rangeTableEntry->subquery = subquery;
 
 	/*
@@ -1851,6 +1866,15 @@ CreateOuterSubquery(RangeTblEntry *rangeTableEntry, List *outerSubqueryTargetLis
 	innerSubqueryRTE->eref->colnames = innerSubqueryColNames;
 	outerSubquery->rtable = list_make1(innerSubqueryRTE);
 
+#if PG_VERSION_NUM >= PG_VERSION_16
+
+	/* sanity check */
+	Assert(innerSubqueryRTE->rtekind == RTE_SUBQUERY &&
+		   innerSubqueryRTE->perminfoindex == 0);
+	outerSubquery->rteperminfos = NIL;
+#endif
+
+
 	/* set the FROM expression to the subquery */
 	RangeTblRef *newRangeTableRef = makeNode(RangeTblRef);
 	newRangeTableRef->rtindex = 1;
@@ -1891,7 +1915,7 @@ GenerateRequiredColNamesFromTargetList(List *targetList)
  * UpdateVarNosInNode iterates the Vars in the
  * given node and updates the varno's as the newVarNo.
  */
-static void
+void
 UpdateVarNosInNode(Node *node, Index newVarNo)
 {
 	List *varList = pull_var_clause(node, PVC_RECURSE_AGGREGATES |
@@ -2023,6 +2047,15 @@ TransformFunctionRTE(RangeTblEntry *rangeTblEntry)
 
 	/* set the FROM expression to the subquery */
 	subquery->rtable = list_make1(newRangeTableEntry);
+
+#if PG_VERSION_NUM >= PG_VERSION_16
+
+	/* sanity check */
+	Assert(newRangeTableEntry->rtekind == RTE_FUNCTION &&
+		   newRangeTableEntry->perminfoindex == 0);
+	subquery->rteperminfos = NIL;
+#endif
+
 	newRangeTableRef->rtindex = 1;
 	subquery->jointree = makeFromExpr(list_make1(newRangeTableRef), NULL);
 
@@ -2393,6 +2426,9 @@ BuildReadIntermediateResultsQuery(List *targetEntryList, List *columnAliasList,
 	Query *resultQuery = makeNode(Query);
 	resultQuery->commandType = CMD_SELECT;
 	resultQuery->rtable = list_make1(rangeTableEntry);
+#if PG_VERSION_NUM >= PG_VERSION_16
+	resultQuery->rteperminfos = NIL;
+#endif
 	resultQuery->jointree = joinTree;
 	resultQuery->targetList = targetList;
 

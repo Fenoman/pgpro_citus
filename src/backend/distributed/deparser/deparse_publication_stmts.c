@@ -13,19 +13,20 @@
 #include "access/relation.h"
 #include "catalog/namespace.h"
 #include "commands/defrem.h"
-#include "distributed/citus_ruleutils.h"
-#include "distributed/deparser.h"
-#include "distributed/listutils.h"
-#include "distributed/namespace_utils.h"
 #include "lib/stringinfo.h"
+#include "nodes/value.h"
 #include "parser/parse_clause.h"
 #include "parser/parse_collate.h"
 #include "parser/parse_node.h"
 #include "parser/parse_relation.h"
-#include "nodes/value.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/ruleutils.h"
+
+#include "distributed/citus_ruleutils.h"
+#include "distributed/deparser.h"
+#include "distributed/listutils.h"
+#include "distributed/namespace_utils.h"
 
 
 static void AppendCreatePublicationStmt(StringInfo buf, CreatePublicationStmt *stmt,
@@ -307,11 +308,11 @@ AppendWhereClauseExpression(StringInfo buf, RangeVar *tableName,
 
 	List *relationContext = deparse_context_for(tableName->relname, relation->rd_id);
 
-	PushOverrideEmptySearchPath(CurrentMemoryContext);
+	int saveNestLevel = PushEmptySearchPath();
 	char *whereClauseString = deparse_expression(whereClause,
 												 relationContext,
 												 true, true);
-	PopOverrideSearchPath();
+	PopEmptySearchPath(saveNestLevel);
 
 	appendStringInfoString(buf, whereClauseString);
 

@@ -4,12 +4,7 @@ SET search_path TO recurring_outer_join;
 SET citus.next_shard_id TO 1520000;
 SET citus.shard_count TO 32;
 
--- idempotently add node to allow this test to run without add_coordinator
-SET client_min_messages TO WARNING;
-SELECT 1 FROM citus_add_node('localhost', :master_port, groupid => 0);
-
 SET client_min_messages TO DEBUG1;
-
 CREATE TABLE dist_1 (a int, b int);
 SELECT create_distributed_table('dist_1', 'a');
 INSERT INTO dist_1 VALUES
@@ -617,10 +612,9 @@ USING (a);
 
 -- same test using a view, can be recursively planned
 CREATE VIEW my_view_1 AS
-SELECT * FROM dist_1 t2 WHERE EXISTS (
+SELECT * FROM dist_1 table_name_for_view WHERE EXISTS (
     SELECT * FROM dist_1 t4
-    WHERE t4.a = t2.a
-);
+    WHERE t4.a = table_name_for_view.a);
 
 SELECT COUNT(*) FROM ref_1 t1
 LEFT JOIN
@@ -1026,5 +1020,3 @@ ROLLBACK;
 
 SET client_min_messages TO ERROR;
 DROP SCHEMA recurring_outer_join CASCADE;
-
-SELECT master_remove_node('localhost', :master_port);

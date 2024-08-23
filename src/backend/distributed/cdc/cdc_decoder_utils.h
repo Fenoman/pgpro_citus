@@ -12,9 +12,11 @@
 #define CITUS_CDC_DECODER_H
 
 #include "postgres.h"
-#include "fmgr.h"
-#include "replication/logical.h"
+
 #include "c.h"
+#include "fmgr.h"
+
+#include "replication/logical.h"
 
 #define InvalidRepOriginId 0
 #define INVALID_SHARD_ID 0
@@ -25,7 +27,7 @@ uint64 CdcExtractShardIdFromTableName(const char *tableName, bool missingOk);
 
 Oid CdcLookupShardRelationFromCatalog(int64 shardId, bool missingOk);
 
-char CdcPartitionMethodViaCatalog(Oid relationId);
+char CdcIsReferenceTableViaCatalog(Oid relationId);
 
 bool CdcCitusHasBeenLoaded(void);
 

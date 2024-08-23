@@ -10,41 +10,43 @@
  */
 
 #include "postgres.h"
+
 #include "miscadmin.h"
+
+#include "commands/dbcommands.h"
 #include "common/hashfn.h"
-#include "nodes/pg_list.h"
-#include "utils/array.h"
-#include "distributed/utils/array_type.h"
 #include "lib/stringinfo.h"
+#include "nodes/pg_list.h"
+#include "postmaster/postmaster.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
-#include "distributed/shared_library_init.h"
+
 #include "distributed/adaptive_executor.h"
 #include "distributed/colocation_utils.h"
+#include "distributed/connection_management.h"
+#include "distributed/coordinator_protocol.h"
+#include "distributed/deparse_shard_query.h"
 #include "distributed/hash_helpers.h"
 #include "distributed/metadata_cache.h"
-#include "distributed/shardinterval_utils.h"
-#include "distributed/coordinator_protocol.h"
-#include "distributed/connection_management.h"
-#include "distributed/remote_commands.h"
-#include "distributed/shard_split.h"
-#include "distributed/reference_table_utils.h"
-#include "distributed/shard_transfer.h"
-#include "distributed/resource_lock.h"
+#include "distributed/metadata_sync.h"
 #include "distributed/multi_partitioning_utils.h"
+#include "distributed/multi_physical_planner.h"
+#include "distributed/pg_dist_shard.h"
+#include "distributed/reference_table_utils.h"
+#include "distributed/remote_commands.h"
+#include "distributed/resource_lock.h"
+#include "distributed/shard_cleaner.h"
+#include "distributed/shard_rebalancer.h"
+#include "distributed/shard_split.h"
+#include "distributed/shard_transfer.h"
+#include "distributed/shardinterval_utils.h"
+#include "distributed/shardsplit_logical_replication.h"
+#include "distributed/shared_library_init.h"
+#include "distributed/utils/array_type.h"
+#include "distributed/utils/distribution_column_map.h"
 #include "distributed/worker_manager.h"
 #include "distributed/worker_transaction.h"
-#include "distributed/shard_cleaner.h"
-#include "distributed/shared_library_init.h"
-#include "distributed/pg_dist_shard.h"
-#include "distributed/metadata_sync.h"
-#include "distributed/multi_physical_planner.h"
-#include "distributed/utils/distribution_column_map.h"
-#include "commands/dbcommands.h"
-#include "distributed/shardsplit_logical_replication.h"
-#include "distributed/deparse_shard_query.h"
-#include "distributed/shard_rebalancer.h"
-#include "postmaster/postmaster.h"
 
 /*
  * Entry for map that tracks ShardInterval -> Placement Node
@@ -216,7 +218,7 @@ ErrorIfCannotSplitShard(SplitOperation splitOperation, ShardInterval *sourceShar
 
 
 /*
- * Exteded checks before we decide to split the shard.
+ * Extended checks before we decide to split the shard.
  * When all consumers (Example : ISOLATE_TENANT_TO_NEW_SHARD) directly call 'SplitShard' API,
  * this method will be merged with 'ErrorIfCannotSplitShard' above.
  */
@@ -425,7 +427,7 @@ GetWorkerNodesFromWorkerIds(List *nodeIdsForPlacementList)
  * 'shardInterval'              : Source shard interval to be split.
  * 'shardSplitPointsList'		: Split Points list for the source 'shardInterval'.
  * 'nodeIdsForPlacementList'	: Placement list corresponding to split children.
- * 'distributionColumnList'     : Maps relation IDs to distribution columns.
+ * 'distributionColumnOverrides': Maps relation IDs to distribution columns.
  *                                If not specified, the distribution column is read
  *                                from the metadata.
  * 'colocatedShardIntervalList' : Shard interval list for colocation group. (only used for

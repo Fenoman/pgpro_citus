@@ -25,6 +25,9 @@ import utils
 from psycopg import sql
 from utils import USER
 
+# This SQL returns true ( 't' ) if the Citus version >= 11.0.
+IS_CITUS_VERSION_11_SQL = "SELECT (split_part(extversion, '.', 1)::int >= 11) as is_11 FROM pg_extension WHERE extname = 'citus';"
+
 LINUX = False
 MACOS = False
 FREEBSD = False
@@ -45,6 +48,54 @@ TIMEOUT_DEFAULT = timedelta(seconds=int(os.getenv("PG_TEST_TIMEOUT_DEFAULT", "10
 FORCE_PORTS = os.getenv("PG_FORCE_PORTS", "NO").lower() not in ("no", "0", "n", "")
 
 REGRESS_DIR = pathlib.Path(os.path.realpath(__file__)).parent.parent
+REPO_ROOT = REGRESS_DIR.parent.parent.parent
+CI = os.environ.get("CI") == "true"
+
+
+def eprint(*args, **kwargs):
+    """eprint prints to stderr"""
+
+    print(*args, file=sys.stderr, **kwargs)
+
+
+def run(command, *args, check=True, shell=True, silent=False, **kwargs):
+    """run runs the given command and prints it to stderr"""
+
+    if not silent:
+        eprint(f"+ {command} ")
+    if silent:
+        kwargs.setdefault("stdout", subprocess.DEVNULL)
+    return subprocess.run(command, *args, check=check, shell=shell, **kwargs)
+
+
+def capture(command, *args, **kwargs):
+    """runs the given command and returns its output as a string"""
+    return run(command, *args, stdout=subprocess.PIPE, text=True, **kwargs).stdout
+
+
+PG_CONFIG = os.environ.get("PG_CONFIG", "pg_config")
+PG_BINDIR = capture([PG_CONFIG, "--bindir"], shell=False).rstrip()
+os.environ["PATH"] = PG_BINDIR + os.pathsep + os.environ["PATH"]
+
+
+def get_pg_major_version():
+    full_version_string = run(
+        "initdb --version", stdout=subprocess.PIPE, encoding="utf-8", silent=True
+    ).stdout
+    major_version_string = re.search("[0-9]+", full_version_string)
+    assert major_version_string is not None
+    return int(major_version_string.group(0))
+
+
+PG_MAJOR_VERSION = get_pg_major_version()
+
+OLDEST_SUPPORTED_CITUS_VERSION_MATRIX = {
+    14: "10.2.0",
+    15: "11.1.5",
+    16: "12.1devel",
+}
+
+OLDEST_SUPPORTED_CITUS_VERSION = OLDEST_SUPPORTED_CITUS_VERSION_MATRIX[PG_MAJOR_VERSION]
 
 
 def initialize_temp_dir(temp_dir):
@@ -243,6 +294,9 @@ def _run_pg_regress(
         output_dir,
         "--use-existing",
     ]
+    if PG_MAJOR_VERSION >= 16:
+        command.append("--expecteddir")
+        command.append(output_dir)
     if extra_tests != "":
         command.append(extra_tests)
 
@@ -272,9 +326,7 @@ def stop_metadata_to_workers(pg_path, worker_ports, coordinator_port):
 
 
 def add_coordinator_to_metadata(pg_path, coordinator_port):
-    command = "SELECT citus_add_node('localhost', {}, groupId := 0)".format(
-        coordinator_port
-    )
+    command = "SELECT citus_set_coordinator_host('localhost');"
     utils.psql(pg_path, coordinator_port, command)
 
 
@@ -327,6 +379,10 @@ def stop_databases(
             stop(node_name)
 
 
+def is_citus_set_coordinator_host_udf_exist(pg_path, port):
+    return utils.psql_capture(pg_path, port, IS_CITUS_VERSION_11_SQL) == b" t\n\n"
+
+
 def initialize_citus_cluster(bindir, datadir, settings, config):
     # In case there was a leftover from previous runs, stop the databases
     stop_databases(
@@ -339,33 +395,17 @@ def initialize_citus_cluster(bindir, datadir, settings, config):
         bindir, datadir, config.node_name_to_ports, config.name, config.env_variables
     )
     create_citus_extension(bindir, config.node_name_to_ports.values())
+
+    # In upgrade tests, it is possible that Citus version < 11.0
+    # where the citus_set_coordinator_host UDF does not exist.
+    if is_citus_set_coordinator_host_udf_exist(bindir, config.coordinator_port()):
+        add_coordinator_to_metadata(bindir, config.coordinator_port())
+
     add_workers(bindir, config.worker_ports, config.coordinator_port())
     if not config.is_mx:
         stop_metadata_to_workers(bindir, config.worker_ports, config.coordinator_port())
-    if config.add_coordinator_to_metadata:
-        add_coordinator_to_metadata(bindir, config.coordinator_port())
+
     config.setup_steps()
-
-
-def eprint(*args, **kwargs):
-    """eprint prints to stderr"""
-
-    print(*args, file=sys.stderr, **kwargs)
-
-
-def run(command, *args, check=True, shell=True, silent=False, **kwargs):
-    """run runs the given command and prints it to stderr"""
-
-    if not silent:
-        eprint(f"+ {command} ")
-    if silent:
-        kwargs.setdefault("stdout", subprocess.DEVNULL)
-    return subprocess.run(command, *args, check=check, shell=shell, **kwargs)
-
-
-def capture(command, *args, **kwargs):
-    """runs the given command and returns its output as a string"""
-    return run(command, *args, stdout=subprocess.PIPE, text=True, **kwargs).stdout
 
 
 def sudo(command, *args, shell=True, **kwargs):
@@ -392,6 +432,10 @@ PORT_UPPER_BOUND = 32768
 next_port = PORT_LOWER_BOUND
 
 
+def notice_handler(diag: psycopg.errors.Diagnostic):
+    print(f"{diag.severity}: {diag.message_primary}")
+
+
 def cleanup_test_leftovers(nodes):
     """
     Cleaning up test leftovers needs to be done in a specific order, because
@@ -407,7 +451,7 @@ def cleanup_test_leftovers(nodes):
         node.cleanup_publications()
 
     for node in nodes:
-        node.cleanup_logical_replication_slots()
+        node.cleanup_replication_slots()
 
     for node in nodes:
         node.cleanup_schemas()
@@ -489,10 +533,12 @@ class QueryRunner(ABC):
     def conn(self, *, autocommit=True, **kwargs):
         """Open a psycopg connection to this server"""
         self.set_default_connection_options(kwargs)
-        return psycopg.connect(
+        conn = psycopg.connect(
             autocommit=autocommit,
             **kwargs,
         )
+        conn.add_notice_handler(notice_handler)
+        return conn
 
     def aconn(self, *, autocommit=True, **kwargs):
         """Open an asynchronous psycopg connection to this server"""
@@ -534,6 +580,21 @@ class QueryRunner(ABC):
         """
         with self.cur(**kwargs) as cur:
             cur.execute(query, params=params)
+
+    def sql_row(self, query, params=None, allow_empty_result=False, **kwargs):
+        """Run an SQL query that returns a single row and returns this row
+
+        This opens a new connection and closes it once the query is done
+        """
+        with self.cur(**kwargs) as cur:
+            cur.execute(query, params=params)
+            result = cur.fetchall()
+
+            if allow_empty_result and len(result) == 0:
+                return None
+
+            assert len(result) == 1, "sql_row returns more than one row"
+            return result[0]
 
     def sql_value(self, query, params=None, allow_empty_result=False, **kwargs):
         """Run an SQL query that returns a single cell and return this value
@@ -694,7 +755,7 @@ class Postgres(QueryRunner):
         # Used to track objects that we want to clean up at the end of a test
         self.subscriptions = set()
         self.publications = set()
-        self.logical_replication_slots = set()
+        self.replication_slots = set()
         self.schemas = set()
         self.users = set()
 
@@ -946,7 +1007,7 @@ class Postgres(QueryRunner):
     def create_logical_replication_slot(
         self, name, plugin, temporary=False, twophase=False
     ):
-        self.logical_replication_slots.add(name)
+        self.replication_slots.add(name)
         self.sql(
             "SELECT pg_catalog.pg_create_logical_replication_slot(%s,%s,%s,%s)",
             (name, plugin, temporary, twophase),
@@ -978,12 +1039,21 @@ class Postgres(QueryRunner):
                 )
             )
 
-    def cleanup_logical_replication_slots(self):
-        for slot in self.logical_replication_slots:
-            self.sql(
-                "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = %s",
-                (slot,),
-            )
+    def cleanup_replication_slots(self):
+        for slot in self.replication_slots:
+            start = time.time()
+            while True:
+                try:
+                    self.sql(
+                        "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = %s",
+                        (slot,),
+                    )
+                except psycopg.errors.ObjectInUse:
+                    if time.time() < start + 10:
+                        time.sleep(0.5)
+                        continue
+                    raise
+                break
 
     def cleanup_subscriptions(self):
         for subscription in self.subscriptions:

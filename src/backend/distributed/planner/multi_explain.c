@@ -8,10 +8,10 @@
  */
 
 #include "postgres.h"
+
+#include "fmgr.h"
 #include "libpq-fe.h"
 #include "miscadmin.h"
-
-#include "distributed/pg_version_constants.h"
 
 #include "access/htup_details.h"
 #include "access/xact.h"
@@ -24,40 +24,13 @@
 #include "commands/dbcommands.h"
 #include "commands/explain.h"
 #include "commands/tablecmds.h"
-#include "optimizer/cost.h"
-#include "distributed/citus_depended_object.h"
-#include "distributed/citus_nodefuncs.h"
-#include "distributed/connection_management.h"
-#include "distributed/deparse_shard_query.h"
-#include "distributed/executor_util.h"
-#include "distributed/insert_select_planner.h"
-#include "distributed/insert_select_executor.h"
-#include "distributed/listutils.h"
-#include "distributed/multi_executor.h"
-#include "distributed/multi_explain.h"
-#include "distributed/multi_logical_optimizer.h"
-#include "distributed/multi_logical_planner.h"
-#include "distributed/combine_query_planner.h"
-#include "distributed/multi_physical_planner.h"
-#include "distributed/multi_router_planner.h"
-#include "distributed/distributed_planner.h"
-#include "distributed/multi_server_executor.h"
-#include "distributed/remote_commands.h"
-#include "distributed/recursive_planning.h"
-#include "distributed/placement_connection.h"
-#include "distributed/tuple_destination.h"
-#include "distributed/tuplestore.h"
-#include "distributed/worker_protocol.h"
-#include "distributed/version_compat.h"
-#include "distributed/jsonbutils.h"
-#include "distributed/commands/utility_hook.h"
 #include "executor/tstoreReceiver.h"
-#include "fmgr.h"
 #include "lib/stringinfo.h"
 #include "nodes/plannodes.h"
 #include "nodes/primnodes.h"
 #include "nodes/print.h"
 #include "optimizer/clauses.h"
+#include "optimizer/cost.h"
 #include "optimizer/planner.h"
 #include "parser/analyze.h"
 #include "portability/instr_time.h"
@@ -69,6 +42,36 @@
 #include "utils/json.h"
 #include "utils/lsyscache.h"
 #include "utils/snapmgr.h"
+
+#include "pg_version_constants.h"
+
+#include "distributed/citus_depended_object.h"
+#include "distributed/citus_nodefuncs.h"
+#include "distributed/combine_query_planner.h"
+#include "distributed/commands/utility_hook.h"
+#include "distributed/connection_management.h"
+#include "distributed/deparse_shard_query.h"
+#include "distributed/distributed_planner.h"
+#include "distributed/executor_util.h"
+#include "distributed/insert_select_executor.h"
+#include "distributed/insert_select_planner.h"
+#include "distributed/jsonbutils.h"
+#include "distributed/listutils.h"
+#include "distributed/merge_planner.h"
+#include "distributed/multi_executor.h"
+#include "distributed/multi_explain.h"
+#include "distributed/multi_logical_optimizer.h"
+#include "distributed/multi_logical_planner.h"
+#include "distributed/multi_physical_planner.h"
+#include "distributed/multi_router_planner.h"
+#include "distributed/multi_server_executor.h"
+#include "distributed/placement_connection.h"
+#include "distributed/recursive_planning.h"
+#include "distributed/remote_commands.h"
+#include "distributed/tuple_destination.h"
+#include "distributed/tuplestore.h"
+#include "distributed/version_compat.h"
+#include "distributed/worker_protocol.h"
 
 
 /* Config variables that enable printing distributed query plans */
@@ -234,7 +237,7 @@ NonPushableInsertSelectExplainScan(CustomScanState *node, List *ancestors,
 {
 	CitusScanState *scanState = (CitusScanState *) node;
 	DistributedPlan *distributedPlan = scanState->distributedPlan;
-	Query *insertSelectQuery = distributedPlan->insertSelectQuery;
+	Query *insertSelectQuery = distributedPlan->modifyQueryViaCoordinatorOrRepartition;
 	RangeTblEntry *selectRte = ExtractSelectRangeTableEntry(insertSelectQuery);
 
 	/*
@@ -244,8 +247,8 @@ NonPushableInsertSelectExplainScan(CustomScanState *node, List *ancestors,
 	 */
 	Query *queryCopy = copyObject(selectRte->subquery);
 
-	bool repartition = distributedPlan->insertSelectMethod == INSERT_SELECT_REPARTITION;
-
+	bool repartition =
+		distributedPlan->modifyWithSelectMethod == MODIFY_WITH_SELECT_REPARTITION;
 
 	if (es->analyze)
 	{
@@ -278,6 +281,67 @@ NonPushableInsertSelectExplainScan(CustomScanState *node, List *ancestors,
 	ExplainOneQuery(queryCopy, 0, into, es, queryString, params, NULL);
 
 	ExplainCloseGroup("Select Query", "Select Query", false, es);
+}
+
+
+/*
+ * NonPushableMergeSqlExplainScan is a custom scan explain callback function
+ * which is used to print explain information of a Citus plan for MERGE INTO
+ * distributed_table USING (source query/table), where source can be any query
+ * whose results are repartitioned to colocated with the target table.
+ */
+void
+NonPushableMergeCommandExplainScan(CustomScanState *node, List *ancestors,
+								   struct ExplainState *es)
+{
+	CitusScanState *scanState = (CitusScanState *) node;
+	DistributedPlan *distributedPlan = scanState->distributedPlan;
+	Query *mergeQuery = distributedPlan->modifyQueryViaCoordinatorOrRepartition;
+	RangeTblEntry *sourceRte = ExtractMergeSourceRangeTableEntry(mergeQuery, false);
+
+	/*
+	 * Create a copy because ExplainOneQuery can modify the query, and later
+	 * executions of prepared statements might require it. See
+	 * https://github.com/citusdata/citus/issues/3947 for what can happen.
+	 */
+	Query *sourceQueryCopy = copyObject(sourceRte->subquery);
+	bool repartition =
+		distributedPlan->modifyWithSelectMethod == MODIFY_WITH_SELECT_REPARTITION;
+
+	if (es->analyze)
+	{
+		ereport(ERROR, (errmsg("EXPLAIN ANALYZE is currently not supported for "
+							   "MERGE INTO ... commands with repartitioning")));
+	}
+
+	Oid targetRelationId = ModifyQueryResultRelationId(mergeQuery);
+	StringInfo mergeMethodMessage = makeStringInfo();
+	appendStringInfo(mergeMethodMessage,
+					 "MERGE INTO %s method", get_rel_name(targetRelationId));
+
+	if (repartition)
+	{
+		ExplainPropertyText(mergeMethodMessage->data, "repartition", es);
+	}
+	else
+	{
+		ExplainPropertyText(mergeMethodMessage->data, "pull to coordinator", es);
+	}
+
+	ExplainOpenGroup("Source Query", "Source Query", false, es);
+
+	/* explain the MERGE source query */
+	IntoClause *into = NULL;
+	ParamListInfo params = NULL;
+
+	/*
+	 * With PG14, we need to provide a string here, for now we put an empty
+	 * string, which is valid according to postgres.
+	 */
+	char *queryString = pstrdup("");
+	ExplainOneQuery(sourceQueryCopy, 0, into, es, queryString, params, NULL);
+
+	ExplainCloseGroup("Source Query", "Source Query", false, es);
 }
 
 
@@ -930,12 +994,18 @@ BuildRemoteExplainQuery(char *queryString, ExplainState *es)
 	appendStringInfo(explainQuery,
 					 "EXPLAIN (ANALYZE %s, VERBOSE %s, "
 					 "COSTS %s, BUFFERS %s, WAL %s, "
+#if PG_VERSION_NUM >= PG_VERSION_16
+					 "GENERIC_PLAN %s, "
+#endif
 					 "TIMING %s, SUMMARY %s, FORMAT %s) %s",
 					 es->analyze ? "TRUE" : "FALSE",
 					 es->verbose ? "TRUE" : "FALSE",
 					 es->costs ? "TRUE" : "FALSE",
 					 es->buffers ? "TRUE" : "FALSE",
 					 es->wal ? "TRUE" : "FALSE",
+#if PG_VERSION_NUM >= PG_VERSION_16
+					 es->generic ? "TRUE" : "FALSE",
+#endif
 					 es->timing ? "TRUE" : "FALSE",
 					 es->summary ? "TRUE" : "FALSE",
 					 formatStr,
@@ -1039,8 +1109,8 @@ worker_save_query_explain_analyze(PG_FUNCTION_ARGS)
 	TupleDesc tupleDescriptor = NULL;
 	Tuplestorestate *tupleStore = SetupTuplestore(fcinfo, &tupleDescriptor);
 	DestReceiver *tupleStoreDest = CreateTuplestoreDestReceiver();
-	SetTuplestoreDestReceiverParams_compat(tupleStoreDest, tupleStore,
-										   CurrentMemoryContext, false, NULL, NULL);
+	SetTuplestoreDestReceiverParams(tupleStoreDest, tupleStore,
+									CurrentMemoryContext, false, NULL, NULL);
 
 	List *parseTreeList = pg_parse_query(queryString);
 	if (list_length(parseTreeList) != 1)
@@ -1064,15 +1134,9 @@ worker_save_query_explain_analyze(PG_FUNCTION_ARGS)
 	Query *analyzedQuery = parse_analyze_varparams_compat(parseTree, queryString,
 														  &paramTypes, &numParams, NULL);
 
-#if PG_VERSION_NUM >= PG_VERSION_14
-
 	/* pg_rewrite_query is a wrapper around QueryRewrite with some debugging logic */
 	List *queryList = pg_rewrite_query(analyzedQuery);
-#else
 
-	/* pg_rewrite_query is not yet public in PostgreSQL 13 */
-	List *queryList = QueryRewrite(analyzedQuery);
-#endif
 	if (list_length(queryList) != 1)
 	{
 		ereport(ERROR, (errmsg("cannot EXPLAIN ANALYZE a query rewritten "
