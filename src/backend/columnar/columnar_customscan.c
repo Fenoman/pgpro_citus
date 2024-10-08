@@ -980,6 +980,13 @@ FilterPushdownClauses(PlannerInfo *root, RelOptInfo *rel, List *inputClauses)
 			continue;
 		}
 
+#if PG_VERSION_NUM >= PG_VERSION_16
+        if (rinfo->incompatible_relids != NULL)
+        {
+            continue;
+        }
+#endif
+
 		rinfo = copyObject(rinfo);
 		rinfo->clause = pushdownableExpr;
 		filteredClauses = lappend(filteredClauses, rinfo);
