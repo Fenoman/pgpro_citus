@@ -177,7 +177,7 @@ CheckForDistributedDeadlocks(void)
 			 * this node.
 			 */
 			TransactionNode *currentNode = NULL;
-			foreach_ptr(currentNode, deadlockPath)
+			foreach_declared_ptr(currentNode, deadlockPath)
 			{
 				bool transactionAssociatedWithProc =
 					AssociateDistributedTransactionWithBackendProc(currentNode);
@@ -305,7 +305,7 @@ PrependOutgoingNodesToQueue(TransactionNode *transactionNode, int currentStackDe
 
 	/* prepend to the list to continue depth-first search */
 	TransactionNode *waitForTransaction = NULL;
-	foreach_ptr(waitForTransaction, transactionNode->waitsFor)
+	foreach_declared_ptr(waitForTransaction, transactionNode->waitsFor)
 	{
 		QueuedTransactionNode *queuedNode = palloc0(sizeof(QueuedTransactionNode));
 
@@ -375,7 +375,7 @@ AssociateDistributedTransactionWithBackendProc(TransactionNode *transactionNode)
 
 	for (int backendIndex = 0; backendIndex < MaxBackends; ++backendIndex)
 	{
-		PGPROC *currentProc = &ProcGlobal->allProcs[backendIndex];
+		PGPROC *currentProc = GetPGProcByNumber(backendIndex);
 		BackendData currentBackendData;
 
 		/* we're not interested in processes that are not active or waiting on a lock */
@@ -672,7 +672,7 @@ WaitsForToString(List *waitsFor)
 	StringInfo transactionIdStr = makeStringInfo();
 
 	TransactionNode *waitingNode = NULL;
-	foreach_ptr(waitingNode, waitsFor)
+	foreach_declared_ptr(waitingNode, waitsFor)
 	{
 		if (transactionIdStr->len != 0)
 		{

@@ -1,3 +1,78 @@
+### citus v13.0.2 (March 12th, 2025) ###
+
+* Fixes a crash in columnar custom scan that happens when a columnar table is
+  used in a join. (#7647)
+
+* Fixes a bug that breaks `UPDATE SET (...) = (SELECT some_func(),... )`
+  type of queries on Citus tables (#7914)
+
+* Fixes a planning error caused by a redundant WHERE clause (#7907)
+
+* Fixes a crash in left outer joins that can happen when there is an aggregate
+  on a column from the inner side of the join. (#7901)
+
+* Fixes deadlock with transaction recovery that is possible during Citus
+  upgrades. (#7910)
+
+* Fixes a bug that prevents inserting into Citus tables that uses
+  a GENERATED ALWAYS AS IDENTITY column. (#7920)
+
+* Ensures that a MERGE command on a distributed table with a WHEN NOT MATCHED BY
+  SOURCE clause runs against all shards of the distributed table. (#7900)
+
+* Fixes a bug that breaks router updates on distributed tables
+  when a reference table is used in the subquery (#7897)
+
+### citus v13.0.1 (February 4th, 2025) ###
+
+* Drops support for PostgreSQL 14 (#7753)
+
+### citus v13.0.0 (January 22, 2025) ###
+
+* Adds support for PostgreSQL 17 (#7699, #7661)
+
+* Adds `JSON_TABLE()` support in distributed queries (#7816)
+
+* Propagates `MERGE ... WHEN NOT MATCHED BY SOURCE` (#7807)
+
+* Propagates `MEMORY` and `SERIALIZE` options of `EXPLAIN` (#7802)
+
+* Adds support for identity columns in distributed partitioned tables (#7785)
+
+* Allows specifying an access method for distributed partitioned tables (#7818)
+
+* Allows exclusion constraints on distributed partitioned tables (#7733)
+
+* Allows configuring sslnegotiation using `citus.node_conn_info` (#7821)
+
+* Avoids wal receiver timeouts during large shard splits (#7229)
+
+* Fixes a bug causing incorrect writing of data to target `MERGE` repartition
+  command (#7659)
+
+* Fixes a crash that happens because of unsafe catalog access when re-assigning
+  the global pid after `application_name` changes (#7791)
+
+* Fixes incorrect `VALID UNTIL` setting assumption made for roles when syncing
+  them to new nodes (#7534)
+
+* Fixes segfault when calling distributed procedure with a parameterized
+  distribution argument (#7242)
+
+* Fixes server crash when trying to execute `activate_node_snapshot()` on a
+  single-node cluster (#7552)
+
+* Improves `citus_move_shard_placement()` to fail early if there is a new node
+  without reference tables yet (#7467)
+
+### citus v12.1.5 (July 17, 2024) ###
+
+* Adds support for MERGE commands with single shard distributed target tables
+  (#7643)
+
+* Fixes an error with MERGE commands when insert value does not have source
+  distribution column (#7627)
+
 ### citus v12.1.4 (May 28, 2024) ###
 
 * Adds null check for node in HasRangeTableRef (#7604)

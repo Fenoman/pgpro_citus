@@ -588,7 +588,7 @@ ErrorIfOptionListHasNoTableName(List *optionList)
 {
 	char *table_nameString = "table_name";
 	DefElem *option = NULL;
-	foreach_ptr(option, optionList)
+	foreach_declared_ptr(option, optionList)
 	{
 		char *optionName = option->defname;
 		if (strcmp(optionName, table_nameString) == 0)
@@ -613,7 +613,7 @@ ForeignTableDropsTableNameOption(List *optionList)
 {
 	char *table_nameString = "table_name";
 	DefElem *option = NULL;
-	foreach_ptr(option, optionList)
+	foreach_declared_ptr(option, optionList)
 	{
 		char *optionName = option->defname;
 		DefElemAction optionAction = option->defaction;
@@ -732,7 +732,7 @@ UpdateAutoConvertedForConnectedRelations(List *relationIds, bool autoConverted)
 
 	List *relationIdList = NIL;
 	Oid relid = InvalidOid;
-	foreach_oid(relid, relationIds)
+	foreach_declared_oid(relid, relationIds)
 	{
 		List *connectedRelations = GetForeignKeyConnectedRelationIdList(relid);
 		relationIdList = list_concat_unique_oid(relationIdList, connectedRelations);
@@ -740,7 +740,7 @@ UpdateAutoConvertedForConnectedRelations(List *relationIds, bool autoConverted)
 
 	relationIdList = SortList(relationIdList, CompareOids);
 
-	foreach_oid(relid, relationIdList)
+	foreach_declared_oid(relid, relationIdList)
 	{
 		UpdatePgDistPartitionAutoConverted(relid, autoConverted);
 	}
@@ -776,7 +776,7 @@ GetShellTableDDLEventsForCitusLocalTable(Oid relationId)
 
 	List *shellTableDDLEvents = NIL;
 	TableDDLCommand *tableDDLCommand = NULL;
-	foreach_ptr(tableDDLCommand, tableDDLCommands)
+	foreach_declared_ptr(tableDDLCommand, tableDDLCommands)
 	{
 		Assert(CitusIsA(tableDDLCommand, TableDDLCommand));
 		shellTableDDLEvents = lappend(shellTableDDLEvents,
@@ -863,7 +863,7 @@ RenameShardRelationConstraints(Oid shardRelationId, uint64 shardId)
 	List *constraintNameList = GetConstraintNameList(shardRelationId);
 
 	char *constraintName = NULL;
-	foreach_ptr(constraintName, constraintNameList)
+	foreach_declared_ptr(constraintName, constraintNameList)
 	{
 		const char *commandString =
 			GetRenameShardConstraintCommand(shardRelationId, constraintName, shardId);
@@ -958,7 +958,7 @@ RenameShardRelationIndexes(Oid shardRelationId, uint64 shardId)
 	List *indexOidList = GetExplicitIndexOidList(shardRelationId);
 
 	Oid indexOid = InvalidOid;
-	foreach_oid(indexOid, indexOidList)
+	foreach_declared_oid(indexOid, indexOidList)
 	{
 		const char *commandString = GetRenameShardIndexCommand(indexOid, shardId);
 		ExecuteAndLogUtilityCommand(commandString);
@@ -1008,7 +1008,7 @@ RenameShardRelationStatistics(Oid shardRelationId, uint64 shardId)
 	List *statsCommandList = GetRenameStatsCommandList(statsOidList, shardId);
 
 	char *command = NULL;
-	foreach_ptr(command, statsCommandList)
+	foreach_declared_ptr(command, statsCommandList)
 	{
 		ExecuteAndLogUtilityCommand(command);
 	}
@@ -1044,7 +1044,7 @@ RenameShardRelationNonTruncateTriggers(Oid shardRelationId, uint64 shardId)
 	List *triggerIdList = GetExplicitTriggerIdList(shardRelationId);
 
 	Oid triggerId = InvalidOid;
-	foreach_oid(triggerId, triggerIdList)
+	foreach_declared_oid(triggerId, triggerIdList)
 	{
 		bool missingOk = false;
 		HeapTuple triggerTuple = GetTriggerTupleById(triggerId, missingOk);
@@ -1097,7 +1097,7 @@ DropRelationTruncateTriggers(Oid relationId)
 	List *triggerIdList = GetExplicitTriggerIdList(relationId);
 
 	Oid triggerId = InvalidOid;
-	foreach_oid(triggerId, triggerIdList)
+	foreach_declared_oid(triggerId, triggerIdList)
 	{
 		bool missingOk = false;
 		HeapTuple triggerTuple = GetTriggerTupleById(triggerId, missingOk);
@@ -1160,9 +1160,7 @@ DropIdentitiesOnTable(Oid relationId)
 
 		if (attributeForm->attidentity)
 		{
-			char *tableName = get_rel_name(relationId);
-			char *schemaName = get_namespace_name(get_rel_namespace(relationId));
-			char *qualifiedTableName = quote_qualified_identifier(schemaName, tableName);
+			char *qualifiedTableName = generate_qualified_relation_name(relationId);
 
 			StringInfo dropCommand = makeStringInfo();
 
@@ -1177,7 +1175,7 @@ DropIdentitiesOnTable(Oid relationId)
 	relation_close(relation, NoLock);
 
 	char *dropCommand = NULL;
-	foreach_ptr(dropCommand, dropCommandList)
+	foreach_declared_ptr(dropCommand, dropCommandList)
 	{
 		/*
 		 * We need to disable/enable ddl propagation for this command, to prevent
@@ -1220,11 +1218,9 @@ DropViewsOnTable(Oid relationId)
 	List *reverseOrderedViews = ReversedOidList(views);
 
 	Oid viewId = InvalidOid;
-	foreach_oid(viewId, reverseOrderedViews)
+	foreach_declared_oid(viewId, reverseOrderedViews)
 	{
-		char *viewName = get_rel_name(viewId);
-		char *schemaName = get_namespace_name(get_rel_namespace(viewId));
-		char *qualifiedViewName = quote_qualified_identifier(schemaName, viewName);
+		char *qualifiedViewName = generate_qualified_relation_name(viewId);
 
 		StringInfo dropCommand = makeStringInfo();
 		appendStringInfo(dropCommand, "DROP %sVIEW IF EXISTS %s",
@@ -1245,7 +1241,7 @@ ReversedOidList(List *oidList)
 {
 	List *reversed = NIL;
 	Oid oid = InvalidOid;
-	foreach_oid(oid, oidList)
+	foreach_declared_oid(oid, oidList)
 	{
 		reversed = lcons_oid(oid, reversed);
 	}
@@ -1297,7 +1293,7 @@ GetRenameStatsCommandList(List *statsOidList, uint64 shardId)
 {
 	List *statsCommandList = NIL;
 	Oid statsOid;
-	foreach_oid(statsOid, statsOidList)
+	foreach_declared_oid(statsOid, statsOidList)
 	{
 		HeapTuple tup = SearchSysCache1(STATEXTOID, ObjectIdGetDatum(statsOid));
 

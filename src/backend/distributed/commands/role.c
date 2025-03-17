@@ -22,6 +22,7 @@
 #include "catalog/pg_auth_members.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_db_role_setting.h"
+#include "catalog/pg_shseclabel.h"
 #include "catalog/pg_type.h"
 #include "commands/dbcommands.h"
 #include "nodes/makefuncs.h"
@@ -65,13 +66,16 @@ static DefElem * makeDefElemBool(char *name, bool value);
 static List * GenerateRoleOptionsList(HeapTuple tuple);
 static List * GenerateGrantRoleStmtsFromOptions(RoleSpec *roleSpec, List *options);
 static List * GenerateGrantRoleStmtsOfRole(Oid roleid);
+static List * GenerateSecLabelOnRoleStmts(Oid roleid, char *rolename);
 static void EnsureSequentialModeForRoleDDL(void);
 
 static char * GetRoleNameFromDbRoleSetting(HeapTuple tuple,
 										   TupleDesc DbRoleSettingDescription);
 static char * GetDatabaseNameFromDbRoleSetting(HeapTuple tuple,
 											   TupleDesc DbRoleSettingDescription);
+#if PG_VERSION_NUM < PG_VERSION_17
 static Node * makeStringConst(char *str, int location);
+#endif
 static Node * makeIntConst(int val, int location);
 static Node * makeFloatConst(char *str, int location);
 static const char * WrapQueryInAlterRoleIfExistsCall(const char *query, RoleSpec *role);
@@ -161,7 +165,7 @@ PostprocessAlterRoleStmt(Node *node, const char *queryString)
 	AlterRoleStmt *stmt = castNode(AlterRoleStmt, node);
 
 	DefElem *option = NULL;
-	foreach_ptr(option, stmt->options)
+	foreach_declared_ptr(option, stmt->options)
 	{
 		if (strcasecmp(option->defname, "password") == 0)
 		{
@@ -489,18 +493,17 @@ GenerateRoleOptionsList(HeapTuple tuple)
 		options = lappend(options, makeDefElem("password", NULL, -1));
 	}
 
-	/* load valid unitl data from the heap tuple, use default of infinity if not set */
+	/* load valid until data from the heap tuple */
 	Datum rolValidUntilDatum = SysCacheGetAttr(AUTHNAME, tuple,
 											   Anum_pg_authid_rolvaliduntil, &isNull);
-	char *rolValidUntil = "infinity";
 	if (!isNull)
 	{
-		rolValidUntil = pstrdup((char *) timestamptz_to_str(rolValidUntilDatum));
-	}
+		char *rolValidUntil = pstrdup((char *) timestamptz_to_str(rolValidUntilDatum));
 
-	Node *validUntilStringNode = (Node *) makeString(rolValidUntil);
-	DefElem *validUntilOption = makeDefElem("validUntil", validUntilStringNode, -1);
-	options = lappend(options, validUntilOption);
+		Node *validUntilStringNode = (Node *) makeString(rolValidUntil);
+		DefElem *validUntilOption = makeDefElem("validUntil", validUntilStringNode, -1);
+		options = lappend(options, validUntilOption);
+	}
 
 	return options;
 }
@@ -515,13 +518,14 @@ GenerateCreateOrAlterRoleCommand(Oid roleOid)
 {
 	HeapTuple roleTuple = SearchSysCache1(AUTHOID, ObjectIdGetDatum(roleOid));
 	Form_pg_authid role = ((Form_pg_authid) GETSTRUCT(roleTuple));
+	char *rolename = pstrdup(NameStr(role->rolname));
 
 	CreateRoleStmt *createRoleStmt = NULL;
 	if (EnableCreateRolePropagation)
 	{
 		createRoleStmt = makeNode(CreateRoleStmt);
 		createRoleStmt->stmt_type = ROLESTMT_ROLE;
-		createRoleStmt->role = pstrdup(NameStr(role->rolname));
+		createRoleStmt->role = rolename;
 		createRoleStmt->options = GenerateRoleOptionsList(roleTuple);
 	}
 
@@ -532,7 +536,7 @@ GenerateCreateOrAlterRoleCommand(Oid roleOid)
 		alterRoleStmt->role = makeNode(RoleSpec);
 		alterRoleStmt->role->roletype = ROLESPEC_CSTRING;
 		alterRoleStmt->role->location = -1;
-		alterRoleStmt->role->rolename = pstrdup(NameStr(role->rolname));
+		alterRoleStmt->role->rolename = rolename;
 		alterRoleStmt->action = 1;
 		alterRoleStmt->options = GenerateRoleOptionsList(roleTuple);
 	}
@@ -544,7 +548,7 @@ GenerateCreateOrAlterRoleCommand(Oid roleOid)
 	{
 		/* add a worker_create_or_alter_role command if any of them are set */
 		char *createOrAlterRoleQuery = CreateCreateOrAlterRoleCommand(
-			pstrdup(NameStr(role->rolname)),
+			rolename,
 			createRoleStmt,
 			alterRoleStmt);
 
@@ -562,7 +566,21 @@ GenerateCreateOrAlterRoleCommand(Oid roleOid)
 	{
 		List *grantRoleStmts = GenerateGrantRoleStmtsOfRole(roleOid);
 		Node *stmt = NULL;
-		foreach_ptr(stmt, grantRoleStmts)
+		foreach_declared_ptr(stmt, grantRoleStmts)
+		{
+			completeRoleList = lappend(completeRoleList, DeparseTreeNode(stmt));
+		}
+
+		/*
+		 * append SECURITY LABEL ON ROLE commands for this specific user
+		 * When we propagate user creation, we also want to make sure that we propagate
+		 * all the security labels it has been given. For this, we check pg_shseclabel
+		 * for the ROLE entry corresponding to roleOid, and generate the relevant
+		 * SecLabel stmts to be run in the new node.
+		 */
+		List *secLabelOnRoleStmts = GenerateSecLabelOnRoleStmts(roleOid, rolename);
+		stmt = NULL;
+		foreach_declared_ptr(stmt, secLabelOnRoleStmts)
 		{
 			completeRoleList = lappend(completeRoleList, DeparseTreeNode(stmt));
 		}
@@ -760,7 +778,7 @@ MakeSetStatementArguments(char *configurationName, char *configurationValue)
 				}
 
 				char *configuration = NULL;
-				foreach_ptr(configuration, configurationList)
+				foreach_declared_ptr(configuration, configurationList)
 				{
 					Node *arg = makeStringConst(configuration, -1);
 					args = lappend(args, arg);
@@ -796,7 +814,7 @@ GenerateGrantRoleStmtsFromOptions(RoleSpec *roleSpec, List *options)
 	List *stmts = NIL;
 
 	DefElem *option = NULL;
-	foreach_ptr(option, options)
+	foreach_declared_ptr(option, options)
 	{
 		if (strcmp(option->defname, "adminmembers") != 0 &&
 			strcmp(option->defname, "rolemembers") != 0 &&
@@ -896,6 +914,54 @@ GenerateGrantRoleStmtsOfRole(Oid roleid)
 
 
 /*
+ * GenerateSecLabelOnRoleStmts generates the SecLabelStmts for the role
+ * whose oid is roleid.
+ */
+static List *
+GenerateSecLabelOnRoleStmts(Oid roleid, char *rolename)
+{
+	List *secLabelStmts = NIL;
+
+	/*
+	 * Note that roles are shared database objects, therefore their
+	 * security labels are stored in pg_shseclabel instead of pg_seclabel.
+	 */
+	Relation pg_shseclabel = table_open(SharedSecLabelRelationId, AccessShareLock);
+	ScanKeyData skey[1];
+	ScanKeyInit(&skey[0], Anum_pg_shseclabel_objoid, BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(roleid));
+	SysScanDesc scan = systable_beginscan(pg_shseclabel, SharedSecLabelObjectIndexId,
+										  true, NULL, 1, &skey[0]);
+
+	HeapTuple tuple = NULL;
+	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+	{
+		SecLabelStmt *secLabelStmt = makeNode(SecLabelStmt);
+		secLabelStmt->objtype = OBJECT_ROLE;
+		secLabelStmt->object = (Node *) makeString(pstrdup(rolename));
+
+		Datum datumArray[Natts_pg_shseclabel];
+		bool isNullArray[Natts_pg_shseclabel];
+
+		heap_deform_tuple(tuple, RelationGetDescr(pg_shseclabel), datumArray,
+						  isNullArray);
+
+		secLabelStmt->provider = TextDatumGetCString(
+			datumArray[Anum_pg_shseclabel_provider - 1]);
+		secLabelStmt->label = TextDatumGetCString(
+			datumArray[Anum_pg_shseclabel_label - 1]);
+
+		secLabelStmts = lappend(secLabelStmts, secLabelStmt);
+	}
+
+	systable_endscan(scan);
+	table_close(pg_shseclabel, AccessShareLock);
+
+	return secLabelStmts;
+}
+
+
+/*
  * PreprocessCreateRoleStmt creates a worker_create_or_alter_role query for the
  * role that is being created. With that query we can create the role in the
  * workers or if they exist we alter them to the way they are being created
@@ -938,7 +1004,7 @@ PreprocessCreateRoleStmt(Node *node, const char *queryString,
 
 	/* deparse all grant statements and add them to the commands list */
 	Node *stmt = NULL;
-	foreach_ptr(stmt, grantRoleStmts)
+	foreach_declared_ptr(stmt, grantRoleStmts)
 	{
 		commands = lappend(commands, DeparseTreeNode(stmt));
 	}
@@ -948,6 +1014,8 @@ PreprocessCreateRoleStmt(Node *node, const char *queryString,
 	return NodeDDLTaskList(NON_COORDINATOR_NODES, commands);
 }
 
+
+#if PG_VERSION_NUM < PG_VERSION_17
 
 /*
  * makeStringConst creates a Const Node that stores a given string
@@ -959,17 +1027,15 @@ makeStringConst(char *str, int location)
 {
 	A_Const *n = makeNode(A_Const);
 
-#if PG_VERSION_NUM >= PG_VERSION_15
 	n->val.sval.type = T_String;
 	n->val.sval.sval = str;
-#else
-	n->val.type = T_String;
-	n->val.val.str = str;
-#endif
 	n->location = location;
 
 	return (Node *) n;
 }
+
+
+#endif
 
 
 /*
@@ -982,13 +1048,8 @@ makeIntConst(int val, int location)
 {
 	A_Const *n = makeNode(A_Const);
 
-#if PG_VERSION_NUM >= PG_VERSION_15
 	n->val.ival.type = T_Integer;
 	n->val.ival.ival = val;
-#else
-	n->val.type = T_Integer;
-	n->val.val.ival = val;
-#endif
 	n->location = location;
 
 	return (Node *) n;
@@ -1005,13 +1066,8 @@ makeFloatConst(char *str, int location)
 {
 	A_Const *n = makeNode(A_Const);
 
-#if PG_VERSION_NUM >= PG_VERSION_15
 	n->val.fval.type = T_Float;
 	n->val.fval.fval = str;
-#else
-	n->val.type = T_Float;
-	n->val.val.str = str;
-#endif
 	n->location = location;
 
 	return (Node *) n;
@@ -1064,7 +1120,7 @@ void
 UnmarkRolesDistributed(List *roles)
 {
 	Node *roleNode = NULL;
-	foreach_ptr(roleNode, roles)
+	foreach_declared_ptr(roleNode, roles)
 	{
 		RoleSpec *role = castNode(RoleSpec, roleNode);
 		ObjectAddress roleAddress = { 0 };
@@ -1094,7 +1150,7 @@ FilterDistributedRoles(List *roles)
 {
 	List *distributedRoles = NIL;
 	Node *roleNode = NULL;
-	foreach_ptr(roleNode, roles)
+	foreach_declared_ptr(roleNode, roles)
 	{
 		RoleSpec *role = castNode(RoleSpec, roleNode);
 		Oid roleOid = get_rolespec_oid(role, true);
@@ -1189,7 +1245,7 @@ PostprocessGrantRoleStmt(Node *node, const char *queryString)
 	GrantRoleStmt *stmt = castNode(GrantRoleStmt, node);
 
 	RoleSpec *role = NULL;
-	foreach_ptr(role, stmt->grantee_roles)
+	foreach_declared_ptr(role, stmt->grantee_roles)
 	{
 		Oid roleOid = get_rolespec_oid(role, false);
 		ObjectAddress *roleAddress = palloc0(sizeof(ObjectAddress));
@@ -1213,7 +1269,7 @@ IsGrantRoleWithInheritOrSetOption(GrantRoleStmt *stmt)
 {
 #if PG_VERSION_NUM >= PG_VERSION_16
 	DefElem *opt = NULL;
-	foreach_ptr(opt, stmt->opt)
+	foreach_declared_ptr(opt, stmt->opt)
 	{
 		if (strcmp(opt->defname, "inherit") == 0 || strcmp(opt->defname, "set") == 0)
 		{

@@ -379,7 +379,7 @@ EnsureModificationsCanRun(void)
 
 
 /*
- * EnsureModificationsCanRunOnRelation firsts calls into EnsureModificationsCanRun() and
+ * EnsureModificationsCanRunOnRelation first calls into EnsureModificationsCanRun() and
  * then does one more additional check. The additional check is to give a proper error
  * message if any relation that is modified is replicated, as replicated tables use
  * 2PC and 2PC cannot happen when recovery is in progress.
@@ -660,6 +660,18 @@ GetTableTypeName(Oid tableId)
 bool
 IsCitusTable(Oid relationId)
 {
+	/*
+	 * PostgreSQL's OID generator assigns user operation OIDs starting
+	 * from FirstNormalObjectId. This means no user object can have
+	 * an OID lower than FirstNormalObjectId. Therefore, if the
+	 * relationId is less than FirstNormalObjectId
+	 * (i.e. in PostgreSQL's reserved range), we can immediately
+	 * return false, since such objects cannot be Citus tables.
+	 */
+	if (relationId < FirstNormalObjectId)
+	{
+		return false;
+	}
 	return LookupCitusTableCacheEntry(relationId) != NULL;
 }
 
@@ -919,7 +931,7 @@ CitusTableList(void)
 	List *citusTableIdList = CitusTableTypeIdList(ANY_CITUS_TABLE_TYPE);
 
 	Oid relationId = InvalidOid;
-	foreach_oid(relationId, citusTableIdList)
+	foreach_declared_oid(relationId, citusTableIdList)
 	{
 		CitusTableCacheEntry *cacheEntry = GetCitusTableCacheEntry(relationId);
 
@@ -1890,7 +1902,7 @@ BuildCachedShardList(CitusTableCacheEntry *cacheEntry)
 								   sizeof(int));
 
 		HeapTuple shardTuple = NULL;
-		foreach_ptr(shardTuple, distShardTupleList)
+		foreach_declared_ptr(shardTuple, distShardTupleList)
 		{
 			ShardInterval *shardInterval = TupleToShardInterval(shardTuple,
 																distShardTupleDesc,
@@ -2028,7 +2040,7 @@ BuildCachedShardList(CitusTableCacheEntry *cacheEntry)
 		GroupShardPlacement *placementArray = palloc0(numberOfPlacements *
 													  sizeof(GroupShardPlacement));
 		GroupShardPlacement *srcPlacement = NULL;
-		foreach_ptr(srcPlacement, placementList)
+		foreach_declared_ptr(srcPlacement, placementList)
 		{
 			placementArray[placementOffset] = *srcPlacement;
 			placementOffset++;
@@ -2521,6 +2533,8 @@ AvailableExtensionVersion(void)
 
 	ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 					errmsg("citus extension is not found")));
+
+	return NULL; /* keep compiler happy */
 }
 
 
@@ -4332,7 +4346,7 @@ InitializeWorkerNodeCache(void)
 
 	/* iterate over the worker node list */
 	WorkerNode *currentNode = NULL;
-	foreach_ptr(currentNode, workerNodeList)
+	foreach_declared_ptr(currentNode, workerNodeList)
 	{
 		bool handleFound = false;
 
@@ -4509,7 +4523,7 @@ GetLocalNodeId(void)
 	List *workerNodeList = ReadDistNode(includeNodesFromOtherClusters);
 
 	WorkerNode *workerNode = NULL;
-	foreach_ptr(workerNode, workerNodeList)
+	foreach_declared_ptr(workerNode, workerNodeList)
 	{
 		if (workerNode->groupId == localGroupId &&
 			workerNode->isActive)
@@ -5097,7 +5111,7 @@ CitusTableCacheFlushInvalidatedEntries()
 	if (DistTableCacheHash != NULL && DistTableCacheExpired != NIL)
 	{
 		CitusTableCacheEntry *cacheEntry = NULL;
-		foreach_ptr(cacheEntry, DistTableCacheExpired)
+		foreach_declared_ptr(cacheEntry, DistTableCacheExpired)
 		{
 			ResetCitusTableCacheEntry(cacheEntry);
 		}

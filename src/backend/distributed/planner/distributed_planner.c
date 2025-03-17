@@ -151,7 +151,10 @@ static RouterPlanType GetRouterPlanType(Query *query,
 										bool hasUnresolvedParams);
 static void ConcatenateRTablesAndPerminfos(PlannedStmt *mainPlan,
 										   PlannedStmt *concatPlan);
-
+static bool CheckPostPlanDistribution(bool isDistributedQuery,
+									  Query *origQuery,
+									  List *rangeTableList,
+									  Query *plannedQuery);
 
 /* Distributed planner hook */
 PlannedStmt *
@@ -272,6 +275,11 @@ distributed_planner(Query *parse,
 			planContext.plan = standard_planner(planContext.query, NULL,
 												planContext.cursorOptions,
 												planContext.boundParams);
+			needsDistributedPlanning = CheckPostPlanDistribution(needsDistributedPlanning,
+																 planContext.originalQuery,
+																 rangeTableList,
+																 planContext.query);
+
 			if (needsDistributedPlanning)
 			{
 				result = PlanDistributedStmt(&planContext, rteIdCounter);
@@ -703,6 +711,7 @@ DissuadePlannerFromUsingPlan(PlannedStmt *plan)
 	 * Arbitrarily high cost, but low enough that it can be added up
 	 * without overflowing by choose_custom_plan().
 	 */
+	Assert(plan != NULL);
 	plan->planTree->total_cost = FLT_MAX / 100000000;
 }
 
@@ -1441,13 +1450,8 @@ FinalizePlan(PlannedStmt *localPlan, DistributedPlan *distributedPlan)
 
 	customScan->custom_private = list_make1(distributedPlanData);
 
-#if (PG_VERSION_NUM >= PG_VERSION_15)
-
 	/* necessary to avoid extra Result node in PG15 */
 	customScan->flags = CUSTOMPATH_SUPPORT_BACKWARD_SCAN | CUSTOMPATH_SUPPORT_PROJECTION;
-#else
-	customScan->flags = CUSTOMPATH_SUPPORT_BACKWARD_SCAN;
-#endif
 
 	/*
 	 * Fast path queries cannot have any subplans by definition, so skip
@@ -1545,7 +1549,7 @@ FinalizeRouterPlan(PlannedStmt *localPlan, CustomScan *customScan)
 
 	/* extract the column names from the final targetlist*/
 	TargetEntry *targetEntry = NULL;
-	foreach_ptr(targetEntry, customScan->scan.plan.targetlist)
+	foreach_declared_ptr(targetEntry, customScan->scan.plan.targetlist)
 	{
 		String *columnName = makeString(targetEntry->resname);
 		columnNameList = lappend(columnNameList, columnName);
@@ -1586,7 +1590,7 @@ makeCustomScanTargetlistFromExistingTargetList(List *existingTargetlist)
 
 	/* build a targetlist to read from the custom scan output */
 	TargetEntry *targetEntry = NULL;
-	foreach_ptr(targetEntry, existingTargetlist)
+	foreach_declared_ptr(targetEntry, existingTargetlist)
 	{
 		Assert(IsA(targetEntry, TargetEntry));
 
@@ -1636,7 +1640,7 @@ makeTargetListFromCustomScanList(List *custom_scan_tlist)
 	List *targetList = NIL;
 	TargetEntry *targetEntry = NULL;
 	int resno = 1;
-	foreach_ptr(targetEntry, custom_scan_tlist)
+	foreach_declared_ptr(targetEntry, custom_scan_tlist)
 	{
 		/*
 		 * INDEX_VAR is used to reference back to the TargetEntry in custom_scan_tlist by
@@ -2105,7 +2109,7 @@ TranslatedVars(PlannerInfo *root, int relationIndex)
 		{
 			/* postgres deletes translated_vars, hence we deep copy them here */
 			Node *targetNode = NULL;
-			foreach_ptr(targetNode, targetAppendRelInfo->translated_vars)
+			foreach_declared_ptr(targetNode, targetAppendRelInfo->translated_vars)
 			{
 				translatedVars =
 					lappend(translatedVars, copyObject(targetNode));
@@ -2126,7 +2130,7 @@ FindTargetAppendRelInfo(PlannerInfo *root, int relationRteIndex)
 	AppendRelInfo *appendRelInfo = NULL;
 
 	/* iterate on the queries that are part of UNION ALL subselects */
-	foreach_ptr(appendRelInfo, root->append_rel_list)
+	foreach_declared_ptr(appendRelInfo, root->append_rel_list)
 	{
 		/*
 		 * We're only interested in the child rel that is equal to the
@@ -2449,7 +2453,7 @@ TranslatedVarsForRteIdentity(int rteIdentity)
 		currentPlannerRestrictionContext->relationRestrictionContext->
 		relationRestrictionList;
 	RelationRestriction *relationRestriction = NULL;
-	foreach_ptr(relationRestriction, relationRestrictionList)
+	foreach_declared_ptr(relationRestriction, relationRestrictionList)
 	{
 		if (GetRTEIdentity(relationRestriction->rte) == rteIdentity)
 		{
@@ -2619,7 +2623,7 @@ GetRTEListProperties(List *rangeTableList)
 	RTEListProperties *rteListProperties = palloc0(sizeof(RTEListProperties));
 
 	RangeTblEntry *rangeTableEntry = NULL;
-	foreach_ptr(rangeTableEntry, rangeTableList)
+	foreach_declared_ptr(rangeTableEntry, rangeTableList)
 	{
 		if (rangeTableEntry->rtekind != RTE_RELATION)
 		{
@@ -2712,7 +2716,7 @@ WarnIfListHasForeignDistributedTable(List *rangeTableList)
 	static bool DistributedForeignTableWarningPrompted = false;
 
 	RangeTblEntry *rangeTableEntry = NULL;
-	foreach_ptr(rangeTableEntry, rangeTableList)
+	foreach_declared_ptr(rangeTableEntry, rangeTableList)
 	{
 		if (DistributedForeignTableWarningPrompted)
 		{
@@ -2732,4 +2736,42 @@ WarnIfListHasForeignDistributedTable(List *rangeTableList)
 								   "citus_add_local_table_to_metadata()"))));
 		}
 	}
+}
+
+
+static bool
+CheckPostPlanDistribution(bool isDistributedQuery,
+						  Query *origQuery, List *rangeTableList,
+						  Query *plannedQuery)
+{
+	if (isDistributedQuery)
+	{
+		Node *origQuals = origQuery->jointree->quals;
+		Node *plannedQuals = plannedQuery->jointree->quals;
+
+		#if PG_VERSION_NUM >= PG_VERSION_17
+		if (IsMergeQuery(origQuery))
+		{
+			origQuals = origQuery->mergeJoinCondition;
+			plannedQuals = plannedQuery->mergeJoinCondition;
+		}
+		#endif
+
+		/*
+		 * The WHERE quals have been eliminated by the Postgres planner, possibly by
+		 * an OR clause that was simplified to TRUE. In such cases, we need to check
+		 * if the planned query still requires distributed planning.
+		 */
+		if (origQuals != NULL && plannedQuals == NULL)
+		{
+			List *rtesPostPlan = ExtractRangeTableEntryList(plannedQuery);
+			if (list_length(rtesPostPlan) < list_length(rangeTableList))
+			{
+				isDistributedQuery = ListContainsDistributedTableRTE(
+					rtesPostPlan, NULL);
+			}
+		}
+	}
+
+	return isDistributedQuery;
 }

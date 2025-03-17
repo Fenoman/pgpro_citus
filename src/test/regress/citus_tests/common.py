@@ -92,7 +92,8 @@ PG_MAJOR_VERSION = get_pg_major_version()
 OLDEST_SUPPORTED_CITUS_VERSION_MATRIX = {
     14: "10.2.0",
     15: "11.1.5",
-    16: "12.1devel",
+    16: "12.1.5",
+    17: "13.0.1",
 }
 
 OLDEST_SUPPORTED_CITUS_VERSION = OLDEST_SUPPORTED_CITUS_VERSION_MATRIX[PG_MAJOR_VERSION]
@@ -580,6 +581,14 @@ class QueryRunner(ABC):
         """
         with self.cur(**kwargs) as cur:
             cur.execute(query, params=params)
+
+    def sql_prepared(self, query, params=None, **kwargs):
+        """Run an SQL query, with prepare=True
+
+        This opens a new connection and closes it once the query is done
+        """
+        with self.cur(**kwargs) as cur:
+            cur.execute(query, params=params, prepare=True)
 
     def sql_row(self, query, params=None, allow_empty_result=False, **kwargs):
         """Run an SQL query that returns a single row and returns this row

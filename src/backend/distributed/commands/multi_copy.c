@@ -301,6 +301,7 @@ static SelectStmt * CitusCopySelect(CopyStmt *copyStatement);
 static void CitusCopyTo(CopyStmt *copyStatement, QueryCompletion *completionTag);
 static int64 ForwardCopyDataFromConnection(CopyOutState copyOutState,
 										   MultiConnection *connection);
+static void ErrorIfCopyHasOnErrorLogVerbosity(CopyStmt *copyStatement);
 
 /* Private functions copied and adapted from copy.c in PostgreSQL */
 static void SendCopyBegin(CopyOutState cstate);
@@ -346,6 +347,7 @@ static LocalCopyStatus GetLocalCopyStatus(void);
 static bool ShardIntervalListHasLocalPlacements(List *shardIntervalList);
 static void LogLocalCopyToRelationExecution(uint64 shardId);
 static void LogLocalCopyToFileExecution(uint64 shardId);
+static void ErrorIfMergeInCopy(CopyStmt *copyStatement);
 
 
 /* exports for SQL callable functions */
@@ -1957,7 +1959,7 @@ ShardIntervalListHasLocalPlacements(List *shardIntervalList)
 {
 	int32 localGroupId = GetLocalGroupId();
 	ShardInterval *shardInterval = NULL;
-	foreach_ptr(shardInterval, shardIntervalList)
+	foreach_declared_ptr(shardInterval, shardIntervalList)
 	{
 		if (ActiveShardPlacementOnGroup(localGroupId, shardInterval->shardId) != NULL)
 		{
@@ -2452,7 +2454,7 @@ ProcessAppendToShardOption(Oid relationId, CopyStmt *copyStatement)
 	bool appendToShardSet = false;
 
 	DefElem *defel = NULL;
-	foreach_ptr(defel, copyStatement->options)
+	foreach_declared_ptr(defel, copyStatement->options)
 	{
 		if (strncmp(defel->defname, APPEND_TO_SHARD_OPTION, NAMEDATALEN) == 0)
 		{
@@ -2547,12 +2549,8 @@ ShardIdForTuple(CitusCopyDestReceiver *copyDest, Datum *columnValues, bool *colu
 
 		if (columnNulls[partitionColumnIndex])
 		{
-			Oid relationId = copyDest->distributedRelationId;
-			char *relationName = get_rel_name(relationId);
-			Oid schemaOid = get_rel_namespace(relationId);
-			char *schemaName = get_namespace_name(schemaOid);
-			char *qualifiedTableName = quote_qualified_identifier(schemaName,
-																  relationName);
+			char *qualifiedTableName = generate_qualified_relation_name(
+				copyDest->distributedRelationId);
 
 			ereport(ERROR, (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
 							errmsg("the partition column of table %s cannot be NULL",
@@ -2572,7 +2570,7 @@ ShardIdForTuple(CitusCopyDestReceiver *copyDest, Datum *columnValues, bool *colu
 	 * Find the shard interval and id for the partition column value for
 	 * non-reference tables.
 	 *
-	 * For reference table, this function blindly returns the tables single
+	 * For reference table, and single shard distributed table this function blindly returns the tables single
 	 * shard.
 	 */
 	ShardInterval *shardInterval = FindShardInterval(partitionColumnValue, cacheEntry);
@@ -2829,6 +2827,70 @@ CopyStatementHasFormat(CopyStmt *copyStatement, char *formatName)
 
 
 /*
+ * ErrorIfCopyHasOnErrorLogVerbosity errors out if the COPY statement
+ * has on_error option or log_verbosity option specified
+ */
+static void
+ErrorIfCopyHasOnErrorLogVerbosity(CopyStmt *copyStatement)
+{
+#if PG_VERSION_NUM >= PG_VERSION_17
+	bool log_verbosity = false;
+	foreach_ptr(DefElem, option, copyStatement->options)
+	{
+		if (strcmp(option->defname, "on_error") == 0)
+		{
+			ereport(ERROR, (errmsg(
+								"Citus does not support COPY FROM with ON_ERROR option.")));
+		}
+		else if (strcmp(option->defname, "log_verbosity") == 0)
+		{
+			log_verbosity = true;
+		}
+	}
+
+	/*
+	 * Given that log_verbosity is currently used in COPY FROM
+	 * when ON_ERROR option is set to ignore, it makes more
+	 * sense to error out for ON_ERROR option first. For this reason,
+	 * we don't error out in the previous loop directly.
+	 * Relevant PG17 commit: https://github.com/postgres/postgres/commit/f5a227895
+	 */
+	if (log_verbosity)
+	{
+		ereport(ERROR, (errmsg(
+							"Citus does not support COPY FROM with LOG_VERBOSITY option.")));
+	}
+#endif
+}
+
+
+/*
+ * ErrorIfMergeInCopy Raises an exception if the MERGE is called in the COPY
+ * where Citus tables are involved, as we don't support this yet
+ * Relevant PG17 commit: c649fa24a
+ */
+static void
+ErrorIfMergeInCopy(CopyStmt *copyStatement)
+{
+#if PG_VERSION_NUM < 170000
+	return;
+#else
+	if (!copyStatement->relation && (IsA(copyStatement->query, MergeStmt)))
+	{
+		/*
+		 * This path is currently not reachable because Merge in COPY can
+		 * only work with a RETURNING clause, and a RETURNING check
+		 * will error out sooner for Citus
+		 */
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("MERGE with Citus tables "
+							   "is not yet supported in COPY")));
+	}
+#endif
+}
+
+
+/*
  * ProcessCopyStmt handles Citus specific concerns for COPY like supporting
  * COPYing from distributed tables and preventing unsupported actions. The
  * function returns a modified COPY statement to be executed, or NULL if no
@@ -2865,6 +2927,8 @@ ProcessCopyStmt(CopyStmt *copyStatement, QueryCompletion *completionTag, const
 	 */
 	if (copyStatement->relation != NULL)
 	{
+		ErrorIfMergeInCopy(copyStatement);
+
 		bool isFrom = copyStatement->is_from;
 
 		/* consider using RangeVarGetRelidExtended to check perms before locking */
@@ -2901,6 +2965,8 @@ ProcessCopyStmt(CopyStmt *copyStatement, QueryCompletion *completionTag, const
 					ereport(ERROR, (errmsg(
 										"Citus does not support COPY FROM with WHERE")));
 				}
+
+				ErrorIfCopyHasOnErrorLogVerbosity(copyStatement);
 
 				/* check permissions, we're bypassing postgres' normal checks */
 				CheckCopyPermissions(copyStatement);

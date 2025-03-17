@@ -93,7 +93,7 @@ worker_drop_distributed_table(PG_FUNCTION_ARGS)
 		 */
 		List *partitionList = PartitionList(relationId);
 		Oid partitionOid = InvalidOid;
-		foreach_oid(partitionOid, partitionList)
+		foreach_declared_oid(partitionOid, partitionList)
 		{
 			WorkerDropDistributedTable(partitionOid);
 		}
@@ -128,7 +128,7 @@ WorkerDropDistributedTable(Oid relationId)
 	List *ownedSequences = getOwnedSequences(relationId);
 
 	Oid ownedSequenceOid = InvalidOid;
-	foreach_oid(ownedSequenceOid, ownedSequences)
+	foreach_declared_oid(ownedSequenceOid, ownedSequences)
 	{
 		ObjectAddress ownedSequenceAddress = { 0 };
 		ObjectAddressSet(ownedSequenceAddress, RelationRelationId, ownedSequenceOid);
@@ -144,13 +144,13 @@ WorkerDropDistributedTable(Oid relationId)
 	 */
 	List *shardList = LoadShardList(relationId);
 	uint64 *shardIdPointer = NULL;
-	foreach_ptr(shardIdPointer, shardList)
+	foreach_declared_ptr(shardIdPointer, shardList)
 	{
 		uint64 shardId = *shardIdPointer;
 
 		List *shardPlacementList = ShardPlacementList(shardId);
 		ShardPlacement *placement = NULL;
-		foreach_ptr(placement, shardPlacementList)
+		foreach_declared_ptr(placement, shardPlacementList)
 		{
 			/* delete the row from pg_dist_placement */
 			DeleteShardPlacementRow(placement->placementId);
@@ -170,14 +170,10 @@ WorkerDropDistributedTable(Oid relationId)
 	 */
 	if (!IsAnyObjectAddressOwnedByExtension(list_make1(distributedTableObject), NULL))
 	{
-		char *relName = get_rel_name(relationId);
-		Oid schemaId = get_rel_namespace(relationId);
-		char *schemaName = get_namespace_name(schemaId);
-
 		StringInfo dropCommand = makeStringInfo();
 		appendStringInfo(dropCommand, "DROP%sTABLE %s CASCADE",
 						 IsForeignTable(relationId) ? " FOREIGN " : " ",
-						 quote_qualified_identifier(schemaName, relName));
+						 generate_qualified_relation_name(relationId));
 
 		Node *dropCommandNode = ParseTreeNode(dropCommand->data);
 
@@ -240,7 +236,7 @@ worker_drop_shell_table(PG_FUNCTION_ARGS)
 	List *ownedSequences = getOwnedSequences(relationId);
 
 	Oid ownedSequenceOid = InvalidOid;
-	foreach_oid(ownedSequenceOid, ownedSequences)
+	foreach_declared_oid(ownedSequenceOid, ownedSequences)
 	{
 		ObjectAddress ownedSequenceAddress = { 0 };
 		ObjectAddressSet(ownedSequenceAddress, RelationRelationId, ownedSequenceOid);
@@ -288,7 +284,7 @@ worker_drop_sequence_dependency(PG_FUNCTION_ARGS)
 	List *ownedSequences = getOwnedSequences(relationId);
 
 	Oid ownedSequenceOid = InvalidOid;
-	foreach_oid(ownedSequenceOid, ownedSequences)
+	foreach_declared_oid(ownedSequenceOid, ownedSequences)
 	{
 		/* the caller doesn't want to drop the sequence, so break the dependency */
 		deleteDependencyRecordsForSpecific(RelationRelationId, ownedSequenceOid,

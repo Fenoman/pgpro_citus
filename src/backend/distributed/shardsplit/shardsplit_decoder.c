@@ -14,6 +14,8 @@
 #include "utils/lsyscache.h"
 #include "utils/typcache.h"
 
+#include "pg_version_constants.h"
+
 #include "distributed/listutils.h"
 #include "distributed/metadata/distobject.h"
 #include "distributed/shardinterval_utils.h"
@@ -93,6 +95,42 @@ replication_origin_filter_cb(LogicalDecodingContext *ctx, RepOriginId origin_id)
 
 
 /*
+ * update_replication_progress is copied from Postgres 15. We use it to send keepalive
+ * messages when we are filtering out the wal changes resulting from the initial copy.
+ * If we do not send out messages long enough, wal reciever will time out.
+ * Postgres 16 has refactored this code such that keepalive messages are sent during
+ * reordering phase which is above change_cb. So we do not need to send keepalive in
+ * change_cb.
+ */
+#if (PG_VERSION_NUM < PG_VERSION_16)
+static void
+update_replication_progress(LogicalDecodingContext *ctx, bool skipped_xact)
+{
+	static int changes_count = 0;
+
+	/*
+	 * We don't want to try sending a keepalive message after processing each
+	 * change as that can have overhead. Tests revealed that there is no
+	 * noticeable overhead in doing it after continuously processing 100 or so
+	 * changes.
+	 */
+#define CHANGES_THRESHOLD 100
+
+	/*
+	 * After continuously processing CHANGES_THRESHOLD changes, we
+	 * try to send a keepalive message if required.
+	 */
+	if (ctx->end_xact || ++changes_count >= CHANGES_THRESHOLD)
+	{
+		OutputPluginUpdateProgress(ctx, skipped_xact);
+		changes_count = 0;
+	}
+}
+
+
+#endif
+
+/*
  * shard_split_change_cb function emits the incoming tuple change
  * to the appropriate destination shard.
  */
@@ -109,6 +147,12 @@ shard_split_change_cb(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 		pgOutputPluginChangeCB(ctx, txn, relation, change);
 		return;
 	}
+
+#if (PG_VERSION_NUM < PG_VERSION_16)
+
+	/* Send replication keepalive. */
+	update_replication_progress(ctx, false);
+#endif
 
 	/* check if the relation is publishable.*/
 	if (!is_publishable_relation(relation))
@@ -134,6 +178,43 @@ shard_split_change_cb(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 	}
 
 	Oid targetRelationOid = InvalidOid;
+
+#if PG_VERSION_NUM >= PG_VERSION_17
+	switch (change->action)
+	{
+		case REORDER_BUFFER_CHANGE_INSERT:
+		{
+			HeapTuple newTuple = change->data.tp.newtuple;
+			targetRelationOid = FindTargetRelationOid(relation, newTuple,
+													  replicationSlotName);
+			break;
+		}
+
+		/* updating non-partition column value */
+		case REORDER_BUFFER_CHANGE_UPDATE:
+		{
+			HeapTuple newTuple = change->data.tp.newtuple;
+			targetRelationOid = FindTargetRelationOid(relation, newTuple,
+													  replicationSlotName);
+			break;
+		}
+
+		case REORDER_BUFFER_CHANGE_DELETE:
+		{
+			HeapTuple oldTuple = change->data.tp.oldtuple;
+			targetRelationOid = FindTargetRelationOid(relation, oldTuple,
+													  replicationSlotName);
+
+			break;
+		}
+
+		/* Only INSERT/DELETE/UPDATE actions are visible in the replication path of split shard */
+		default:
+			ereport(ERROR, errmsg(
+						"Unexpected Action :%d. Expected action is INSERT/DELETE/UPDATE",
+						change->action));
+	}
+#else
 	switch (change->action)
 	{
 		case REORDER_BUFFER_CHANGE_INSERT:
@@ -168,6 +249,7 @@ shard_split_change_cb(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 						"Unexpected Action :%d. Expected action is INSERT/DELETE/UPDATE",
 						change->action));
 	}
+#endif
 
 	/* Current replication slot is not responsible for handling the change */
 	if (targetRelationOid == InvalidOid)
@@ -185,6 +267,62 @@ shard_split_change_cb(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 	TupleDesc targetRelationDesc = RelationGetDescr(targetRelation);
 	if (sourceRelationDesc->natts > targetRelationDesc->natts)
 	{
+#if PG_VERSION_NUM >= PG_VERSION_17
+		switch (change->action)
+		{
+			case REORDER_BUFFER_CHANGE_INSERT:
+			{
+				HeapTuple sourceRelationNewTuple = change->data.tp.newtuple;
+				HeapTuple targetRelationNewTuple = GetTupleForTargetSchema(
+					sourceRelationNewTuple, sourceRelationDesc, targetRelationDesc);
+
+				change->data.tp.newtuple = targetRelationNewTuple;
+				break;
+			}
+
+			case REORDER_BUFFER_CHANGE_UPDATE:
+			{
+				HeapTuple sourceRelationNewTuple = change->data.tp.newtuple;
+				HeapTuple targetRelationNewTuple = GetTupleForTargetSchema(
+					sourceRelationNewTuple, sourceRelationDesc, targetRelationDesc);
+
+				change->data.tp.newtuple = targetRelationNewTuple;
+
+				/*
+				 * Format oldtuple according to the target relation. If the column values of replica
+				 * identiy change, then the old tuple is non-null and needs to be formatted according
+				 * to the target relation schema.
+				 */
+				if (change->data.tp.oldtuple != NULL)
+				{
+					HeapTuple sourceRelationOldTuple = change->data.tp.oldtuple;
+					HeapTuple targetRelationOldTuple = GetTupleForTargetSchema(
+						sourceRelationOldTuple,
+						sourceRelationDesc,
+						targetRelationDesc);
+
+					change->data.tp.oldtuple = targetRelationOldTuple;
+				}
+				break;
+			}
+
+			case REORDER_BUFFER_CHANGE_DELETE:
+			{
+				HeapTuple sourceRelationOldTuple = change->data.tp.oldtuple;
+				HeapTuple targetRelationOldTuple = GetTupleForTargetSchema(
+					sourceRelationOldTuple, sourceRelationDesc, targetRelationDesc);
+
+				change->data.tp.oldtuple = targetRelationOldTuple;
+				break;
+			}
+
+			/* Only INSERT/DELETE/UPDATE actions are visible in the replication path of split shard */
+			default:
+				ereport(ERROR, errmsg(
+							"Unexpected Action :%d. Expected action is INSERT/DELETE/UPDATE",
+							change->action));
+		}
+#else
 		switch (change->action)
 		{
 			case REORDER_BUFFER_CHANGE_INSERT:
@@ -239,6 +377,7 @@ shard_split_change_cb(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 							"Unexpected Action :%d. Expected action is INSERT/DELETE/UPDATE",
 							change->action));
 		}
+#endif
 	}
 
 	pgOutputPluginChangeCB(ctx, txn, targetRelation, change);
@@ -291,7 +430,7 @@ FindTargetRelationOid(Relation sourceShardRelation,
 												 shardSplitInfo->distributedTableOid);
 
 	shardSplitInfo = NULL;
-	foreach_ptr(shardSplitInfo, entry->shardSplitInfoList)
+	foreach_declared_ptr(shardSplitInfo, entry->shardSplitInfoList)
 	{
 		if (shardSplitInfo->shardMinValue <= hashValue &&
 			shardSplitInfo->shardMaxValue >= hashValue)

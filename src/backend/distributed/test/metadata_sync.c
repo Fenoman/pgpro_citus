@@ -50,6 +50,13 @@ activate_node_snapshot(PG_FUNCTION_ARGS)
 	 * so we are using first primary worker node just for test purposes.
 	 */
 	WorkerNode *dummyWorkerNode = GetFirstPrimaryWorkerNode();
+	if (dummyWorkerNode == NULL)
+	{
+		ereport(ERROR, (errmsg("no worker nodes found"),
+						errdetail("Function activate_node_snapshot is meant to be "
+								  "used when running tests on a multi-node cluster "
+								  "with workers.")));
+	}
 
 	/*
 	 * Create MetadataSyncContext which is used throughout nodes' activation.
@@ -73,7 +80,7 @@ activate_node_snapshot(PG_FUNCTION_ARGS)
 												   sizeof(Datum));
 
 	const char *activateNodeSnapshotCommand = NULL;
-	foreach_ptr(activateNodeSnapshotCommand, activateNodeCommandList)
+	foreach_declared_ptr(activateNodeSnapshotCommand, activateNodeCommandList)
 	{
 		Datum activateNodeSnapshotCommandDatum = CStringGetTextDatum(
 			activateNodeSnapshotCommand);
@@ -105,7 +112,7 @@ wait_until_metadata_sync(PG_FUNCTION_ARGS)
 	bool waitNotifications = false;
 
 	WorkerNode *workerNode = NULL;
-	foreach_ptr(workerNode, workerList)
+	foreach_declared_ptr(workerNode, workerList)
 	{
 		/* if already has metadata, no need to do it again */
 		if (workerNode->hasMetadata && !workerNode->metadataSynced)

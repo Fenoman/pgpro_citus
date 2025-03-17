@@ -172,6 +172,19 @@ DEPS = {
     ),
     "grant_on_schema_propagation": TestDeps("minimal_schedule"),
     "propagate_extension_commands": TestDeps("minimal_schedule"),
+    "multi_size_queries": TestDeps("base_schedule", ["multi_copy"]),
+    "multi_mx_node_metadata": TestDeps(
+        None,
+        [
+            "multi_extension",
+            "multi_test_helpers",
+            "multi_test_helpers_superuser",
+        ],
+    ),
+    "foreign_key_to_reference_shard_rebalance": TestDeps(
+        "minimal_schedule", ["remove_coordinator_from_metadata"]
+    ),
+    "limit_intermediate_size": TestDeps("base_schedule"),
 }
 
 
