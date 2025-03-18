@@ -399,24 +399,6 @@ _PG_init(void)
 	set_str_constraint_handler_s(ereport_constraint_handler);
 	set_mem_constraint_handler_s(ereport_constraint_handler);
 
-	/*
-	 * Perform checks before registering any hooks, to avoid erroring out in a
-	 * partial state.
-	 *
-	 * In many cases (e.g. planner and utility hook, to run inside
-	 * pg_stat_statements et. al.) we have to be loaded before other hooks
-	 * (thus as the innermost/last running hook) to be able to do our
-	 * duties. For simplicity insist that all hooks are previously unused.
-	 */
-	if (planner_hook != NULL || ProcessUtility_hook != NULL ||
-		ExecutorStart_hook != NULL || ExecutorRun_hook != NULL ||
-		ExplainOneQuery_hook != NULL)
-	{
-		ereport(ERROR, (errmsg("Citus has to be loaded first"),
-						errhint("Place citus at the beginning of "
-								"shared_preload_libraries.")));
-	}
-
 	ResizeStackToMaximumDepth();
 
 	/*
