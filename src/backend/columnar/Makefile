@@ -21,12 +21,12 @@ PG_CPPFLAGS += -I$(libpq_srcdir) -I$(safestringlib_srcdir)/include
 
 include $(citus_top_builddir)/Makefile.global
 
-# GCC 13 can ICE in the columnar module when PostgreSQL's inherited build
-# flags enable LTO. Keep the workaround local to citus_columnar and make it
-# opt-in so unaffected Linux builds retain their original optimization setup.
-CITUS_COLUMNAR_DISABLE_LTO ?= 0
+# GCC 13 can ICE when PostgreSQL's inherited build flags enable LTO.
+# Keep the workaround local to the Citus shared libraries and make it opt-in
+# so unaffected Linux builds retain their original optimization setup.
+CITUS_DISABLE_LTO ?= 0
 
-ifeq ($(CITUS_COLUMNAR_DISABLE_LTO),1)
+ifeq ($(CITUS_DISABLE_LTO),1)
 LTO_FILTER_PATTERNS = -flto -flto=% -ffat-lto-objects
 
 override CFLAGS := $(filter-out $(LTO_FILTER_PATTERNS),$(CFLAGS)) -fno-lto
