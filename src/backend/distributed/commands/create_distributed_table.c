@@ -220,6 +220,7 @@ Datum
 create_distributed_table(PG_FUNCTION_ARGS)
 {
 	CheckCitusVersion(ERROR);
+	ErrorIfDistributedEngineMetadataOperationDisabled("create distributed tables");
 
 	if (PG_ARGISNULL(0) || PG_ARGISNULL(3))
 	{
@@ -319,6 +320,7 @@ Datum
 create_distributed_table_concurrently(PG_FUNCTION_ARGS)
 {
 	CheckCitusVersion(ERROR);
+	ErrorIfDistributedEngineMetadataOperationDisabled("distribute tables concurrently");
 
 	if (PG_ARGISNULL(0) || PG_ARGISNULL(2) || PG_ARGISNULL(3))
 	{
@@ -923,6 +925,7 @@ Datum
 create_reference_table(PG_FUNCTION_ARGS)
 {
 	CheckCitusVersion(ERROR);
+	ErrorIfDistributedEngineMetadataOperationDisabled("create reference tables");
 	Oid relationId = PG_GETARG_OID(0);
 
 	CreateReferenceTable(relationId);
@@ -989,6 +992,8 @@ CreateDistributedTable(Oid relationId, char *distributionColumnName,
 					   int shardCount, bool shardCountIsStrict,
 					   char *colocateWithTableName)
 {
+	ErrorIfDistributedEngineMetadataOperationDisabled("create distributed tables");
+
 	CitusTableType tableType;
 	switch (distributionMethod)
 	{
@@ -1037,6 +1042,8 @@ CreateDistributedTable(Oid relationId, char *distributionColumnName,
 void
 CreateReferenceTable(Oid relationId)
 {
+	ErrorIfDistributedEngineMetadataOperationDisabled("create reference tables");
+
 	if (IsCitusTableType(relationId, CITUS_LOCAL_TABLE))
 	{
 		/*
@@ -1059,6 +1066,8 @@ CreateReferenceTable(Oid relationId)
 void
 CreateSingleShardTable(Oid relationId, ColocationParam colocationParam)
 {
+	ErrorIfDistributedEngineMetadataOperationDisabled("create single-shard distributed tables");
+
 	DistributedTableParams distributedTableParams = {
 		.colocationParam = colocationParam,
 		.shardCount = 1,

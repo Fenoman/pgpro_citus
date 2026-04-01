@@ -58,6 +58,7 @@
 #include "distributed/relation_access_tracking.h"
 #include "distributed/remote_commands.h"
 #include "distributed/resource_lock.h"
+#include "distributed/shared_library_init.h"
 #include "distributed/transaction_management.h"
 #include "distributed/version_compat.h"
 #include "distributed/worker_manager.h"
@@ -94,6 +95,7 @@ Datum
 master_create_empty_shard(PG_FUNCTION_ARGS)
 {
 	CheckCitusVersion(ERROR);
+	ErrorIfDistributedEngineOperationDisabled("manage distributed shard placements");
 
 	text *relationNameText = PG_GETARG_TEXT_P(0);
 	char *relationName = text_to_cstring(relationNameText);
@@ -221,6 +223,7 @@ Datum
 citus_update_shard_statistics(PG_FUNCTION_ARGS)
 {
 	CheckCitusVersion(ERROR);
+	ErrorIfDistributedEngineOperationDisabled("manage distributed shard placements");
 
 	int64 shardId = PG_GETARG_INT64(0);
 
@@ -238,6 +241,7 @@ Datum
 citus_update_table_statistics(PG_FUNCTION_ARGS)
 {
 	CheckCitusVersion(ERROR);
+	ErrorIfDistributedEngineOperationDisabled("manage distributed shard placements");
 
 	Oid distributedTableId = PG_GETARG_OID(0);
 

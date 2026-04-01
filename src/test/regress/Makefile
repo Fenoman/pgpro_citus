@@ -38,10 +38,12 @@ MULTI_INSTALLDIR=$(CURDIR)/tmp_check/install
 pg_regress_multi_check = $(PERL) $(citus_abs_srcdir)/pg_regress_multi.pl --pgxsdir="$(pgxsdir)" --bindir="$(bindir)" --libdir="$(libdir)" --majorversion="$(MAJORVERSION)" --postgres-builddir="$(postgres_abs_builddir)" --postgres-srcdir="$(postgres_abs_srcdir)" --citus_abs_srcdir="$(citus_abs_srcdir)" --citus-version=$(CITUSVERSION) --citus-libdir="$(CITUSLIBDIR)"
 MULTI_REGRESS_OPTS = --inputdir=$(citus_abs_srcdir) $(pg_regress_locale_flags) --launcher="$(citus_abs_srcdir)/log_test_times"
 
-pg_upgrade_check = $(citus_abs_srcdir)/citus_tests/upgrade/pg_upgrade_test.py
-citus_upgrade_check =CITUS_OLD_VERSION=$(citus-old-version) $(citus_abs_srcdir)/citus_tests/upgrade/citus_upgrade_test.py
-arbitrary_config_check = $(citus_abs_srcdir)/citus_tests/arbitrary_configs/citus_arbitrary_configs.py
-query_generator_check = $(citus_abs_srcdir)/citus_tests/query_generator/bin/run_query_compare_test.py
+PYTHON := $(if $(wildcard $(CURDIR)/.venv/bin/python),$(CURDIR)/.venv/bin/python,python3)
+
+pg_upgrade_check = $(PYTHON) $(citus_abs_srcdir)/citus_tests/upgrade/pg_upgrade_test.py
+citus_upgrade_check =CITUS_OLD_VERSION=$(citus-old-version) $(PYTHON) $(citus_abs_srcdir)/citus_tests/upgrade/citus_upgrade_test.py
+arbitrary_config_check = $(PYTHON) $(citus_abs_srcdir)/citus_tests/arbitrary_configs/citus_arbitrary_configs.py
+query_generator_check = $(PYTHON) $(citus_abs_srcdir)/citus_tests/query_generator/bin/run_query_compare_test.py
 
 template_isolation_files = $(shell find $(citus_abs_srcdir)/spec/ -name '*.spec')
 generated_isolation_files = $(patsubst $(citus_abs_srcdir)/spec/%,$(citus_abs_srcdir)/build/specs/%,$(template_isolation_files))

@@ -57,6 +57,7 @@
 #include "distributed/resource_lock.h"
 #include "distributed/shardinterval_utils.h"
 #include "distributed/shared_connection_stats.h"
+#include "distributed/shared_library_init.h"
 #include "distributed/string_utils.h"
 #include "distributed/transaction_recovery.h"
 #include "distributed/version_compat.h"
@@ -210,6 +211,7 @@ Datum
 citus_set_coordinator_host(PG_FUNCTION_ARGS)
 {
 	CheckCitusVersion(ERROR);
+	ErrorIfDistributedEngineMetadataOperationDisabled("manage Citus node metadata");
 
 	text *nodeName = PG_GETARG_TEXT_P(0);
 	int32 nodePort = PG_GETARG_INT32(1);
@@ -293,6 +295,7 @@ Datum
 citus_add_node(PG_FUNCTION_ARGS)
 {
 	CheckCitusVersion(ERROR);
+	ErrorIfDistributedEngineMetadataOperationDisabled("manage Citus node metadata");
 
 	EnsureSuperUser();
 	EnsureCoordinator();
@@ -378,6 +381,7 @@ Datum
 citus_add_inactive_node(PG_FUNCTION_ARGS)
 {
 	CheckCitusVersion(ERROR);
+	ErrorIfDistributedEngineMetadataOperationDisabled("manage Citus node metadata");
 
 	text *nodeName = PG_GETARG_TEXT_P(0);
 	int32 nodePort = PG_GETARG_INT32(1);
@@ -431,6 +435,7 @@ Datum
 citus_add_secondary_node(PG_FUNCTION_ARGS)
 {
 	CheckCitusVersion(ERROR);
+	ErrorIfDistributedEngineMetadataOperationDisabled("manage Citus node metadata");
 
 	text *nodeName = PG_GETARG_TEXT_P(0);
 	int32 nodePort = PG_GETARG_INT32(1);
@@ -487,6 +492,7 @@ Datum
 citus_remove_node(PG_FUNCTION_ARGS)
 {
 	CheckCitusVersion(ERROR);
+	ErrorIfDistributedEngineMetadataOperationDisabled("manage Citus node metadata");
 
 	text *nodeNameText = PG_GETARG_TEXT_P(0);
 	int32 nodePort = PG_GETARG_INT32(1);
@@ -523,6 +529,9 @@ master_remove_node(PG_FUNCTION_ARGS)
 Datum
 citus_disable_node(PG_FUNCTION_ARGS)
 {
+	CheckCitusVersion(ERROR);
+	ErrorIfDistributedEngineMetadataOperationDisabled("manage Citus node metadata");
+
 	text *nodeNameText = PG_GETARG_TEXT_P(0);
 	int32 nodePort = PG_GETARG_INT32(1);
 
@@ -701,6 +710,9 @@ master_disable_node(PG_FUNCTION_ARGS)
 Datum
 citus_set_node_property(PG_FUNCTION_ARGS)
 {
+	CheckCitusVersion(ERROR);
+	ErrorIfDistributedEngineMetadataOperationDisabled("manage Citus node metadata");
+
 	text *nodeNameText = PG_GETARG_TEXT_P(0);
 	int32 nodePort = PG_GETARG_INT32(1);
 	text *propertyText = PG_GETARG_TEXT_P(2);
@@ -774,6 +786,9 @@ ModifiableWorkerNode(const char *nodeName, int32 nodePort)
 Datum
 citus_activate_node(PG_FUNCTION_ARGS)
 {
+	CheckCitusVersion(ERROR);
+	ErrorIfDistributedEngineMetadataOperationDisabled("manage Citus node metadata");
+
 	text *nodeNameText = PG_GETARG_TEXT_P(0);
 	int32 nodePort = PG_GETARG_INT32(1);
 
@@ -1331,6 +1346,7 @@ Datum
 citus_update_node(PG_FUNCTION_ARGS)
 {
 	CheckCitusVersion(ERROR);
+	ErrorIfDistributedEngineMetadataOperationDisabled("manage Citus node metadata");
 
 	int32 nodeId = PG_GETARG_INT32(0);
 
@@ -1445,6 +1461,7 @@ Datum
 citus_pause_node_within_txn(PG_FUNCTION_ARGS)
 {
 	CheckCitusVersion(ERROR);
+	ErrorIfDistributedEngineMetadataOperationDisabled("manage Citus node metadata");
 
 	int32 nodeId = PG_GETARG_INT32(0);
 	bool force = PG_GETARG_BOOL(1);
@@ -1480,6 +1497,7 @@ Datum
 citus_add_clone_node(PG_FUNCTION_ARGS)
 {
 	CheckCitusVersion(ERROR);
+	ErrorIfDistributedEngineMetadataOperationDisabled("manage Citus node metadata");
 	EnsureSuperUser();
 	EnsureCoordinator();
 
@@ -1518,6 +1536,7 @@ Datum
 citus_add_clone_node_with_nodeid(PG_FUNCTION_ARGS)
 {
 	CheckCitusVersion(ERROR);
+	ErrorIfDistributedEngineMetadataOperationDisabled("manage Citus node metadata");
 	EnsureSuperUser();
 	EnsureCoordinator();
 
@@ -1685,6 +1704,7 @@ Datum
 citus_remove_clone_node(PG_FUNCTION_ARGS)
 {
 	CheckCitusVersion(ERROR);
+	ErrorIfDistributedEngineMetadataOperationDisabled("manage Citus node metadata");
 	EnsureSuperUser();
 	EnsureCoordinator();
 
@@ -1714,6 +1734,7 @@ Datum
 citus_remove_clone_node_with_nodeid(PG_FUNCTION_ARGS)
 {
 	CheckCitusVersion(ERROR);
+	ErrorIfDistributedEngineMetadataOperationDisabled("manage Citus node metadata");
 	EnsureSuperUser();
 	EnsureCoordinator();
 

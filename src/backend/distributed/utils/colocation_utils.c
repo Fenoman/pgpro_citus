@@ -37,6 +37,7 @@
 #include "distributed/multi_partitioning_utils.h"
 #include "distributed/pg_dist_colocation.h"
 #include "distributed/resource_lock.h"
+#include "distributed/shared_library_init.h"
 #include "distributed/shardinterval_utils.h"
 #include "distributed/tenant_schema_metadata.h"
 #include "distributed/utils/array_type.h"
@@ -87,6 +88,7 @@ Datum
 update_distributed_table_colocation(PG_FUNCTION_ARGS)
 {
 	CheckCitusVersion(ERROR);
+	ErrorIfDistributedEngineOperationDisabled("alter distributed table colocation");
 	EnsureCoordinator();
 
 	Oid targetRelationId = PG_GETARG_OID(0);

@@ -27,6 +27,7 @@
 #include "distributed/metadata/distobject.h"
 #include "distributed/metadata_sync.h"
 #include "distributed/multi_partitioning_utils.h"
+#include "distributed/shared_library_init.h"
 #include "distributed/shard_transfer.h"
 #include "distributed/tenant_schema_metadata.h"
 #include "distributed/worker_shard_visibility.h"
@@ -609,6 +610,7 @@ Datum
 citus_schema_distribute(PG_FUNCTION_ARGS)
 {
 	CheckCitusVersion(ERROR);
+	ErrorIfDistributedEngineOperationDisabled("run schema-based sharding operations");
 	EnsureCoordinator();
 
 	Oid schemaId = PG_GETARG_OID(0);
@@ -712,6 +714,7 @@ Datum
 citus_schema_undistribute(PG_FUNCTION_ARGS)
 {
 	CheckCitusVersion(ERROR);
+	ErrorIfDistributedEngineOperationDisabled("run schema-based sharding operations");
 	EnsureCoordinator();
 
 	Oid schemaId = PG_GETARG_OID(0);
@@ -784,6 +787,7 @@ Datum
 citus_schema_move(PG_FUNCTION_ARGS)
 {
 	CheckCitusVersion(ERROR);
+	ErrorIfDistributedEngineOperationDisabled("run schema-based sharding operations");
 	EnsureCoordinator();
 
 	Oid schemaId = PG_GETARG_OID(0);
@@ -809,6 +813,7 @@ Datum
 citus_schema_move_with_nodeid(PG_FUNCTION_ARGS)
 {
 	CheckCitusVersion(ERROR);
+	ErrorIfDistributedEngineOperationDisabled("run schema-based sharding operations");
 	EnsureCoordinator();
 
 	Oid schemaId = PG_GETARG_OID(0);

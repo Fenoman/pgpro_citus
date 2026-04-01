@@ -22,9 +22,12 @@
 #include "miscadmin.h"
 #include "safe_lib.h"
 
+#include "access/table.h"
 #include "catalog/objectaccess.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_extension.h"
+#include "catalog/pg_namespace_d.h"
+#include "commands/dbcommands.h"
 #include "commands/explain.h"
 #include "commands/extension.h"
 #include "commands/seclabel.h"
@@ -165,6 +168,8 @@ static char *MitmfifoEmptyString = "";
 static bool DeprecatedDeferShardDeleteOnMove = true;
 static bool DeprecatedDeferShardDeleteOnSplit = true;
 static bool DeprecatedReplicateReferenceTablesOnActivate = false;
+bool EnableDistributedEngine = false;
+static bool CheckedDistributedEngineCompatibility = false;
 
 /* deprecated GUC value that should not be used anywhere outside this file */
 static int ReplicationModel = REPLICATION_MODEL_STREAMING;
@@ -221,9 +226,152 @@ static void CitusAuthHook(Port *port, int status);
 static bool IsSuperuser(char *userName);
 static void AdjustDynamicLibraryPathForCdcDecoders(void);
 static void EnableChangeDataCaptureAssignHook(bool newval, void *extra);
+static bool CitusExtensionScriptInProgress(void);
+static bool DatabaseContainsCitusManagedTables(void);
 
 static ClientAuthentication_hook_type original_client_auth_hook = NULL;
 static emit_log_hook_type original_emit_log_hook = NULL;
+
+
+bool
+CitusDistributedEngineEnabled(void)
+{
+	/*
+	 * Avoid catalog lookups on hot paths when the distributed engine is
+	 * disabled. We only need the extension-script exception while Postgres is
+	 * actively executing CREATE/ALTER EXTENSION citus.
+	 */
+	return EnableDistributedEngine ||
+		   (creating_extension && CitusExtensionScriptInProgress());
+}
+
+
+void
+ErrorIfDistributedEngineOperationDisabled(const char *operationName)
+{
+	/*
+	 * Use the postmaster GUC directly here. The extension-script exception in
+	 * CitusDistributedEngineEnabled() exists only so CREATE/ALTER/DROP
+	 * EXTENSION citus can run their lifecycle code while the distributed
+	 * engine is otherwise disabled. It must not reopen user-facing
+	 * distributed-administration APIs.
+	 */
+	if (EnableDistributedEngine)
+	{
+		return;
+	}
+
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("cannot %s when citus.enable_distributed_engine is disabled",
+					operationName),
+			 errdetail("This server is running with the Citus distributed engine disabled."),
+			 errhint("Set citus.enable_distributed_engine = on and restart the server "
+					 "to enable distributed tables and related metadata operations.")));
+}
+
+
+void
+ErrorIfDistributedEngineMetadataOperationDisabled(const char *operationName)
+{
+	/*
+	 * Internal metadata maintenance can still run as part of
+	 * CREATE/ALTER/DROP EXTENSION citus while the distributed engine is
+	 * otherwise disabled.
+	 */
+	if (CitusDistributedEngineEnabled())
+	{
+		return;
+	}
+
+	ErrorIfDistributedEngineOperationDisabled(operationName);
+}
+
+
+static bool
+CitusExtensionScriptInProgress(void)
+{
+	Oid citusExtensionOid = InvalidOid;
+
+	if (!creating_extension)
+	{
+		return false;
+	}
+
+	citusExtensionOid = get_extension_oid("citus", true);
+
+	return OidIsValid(citusExtensionOid) &&
+		   CurrentExtensionObject == citusExtensionOid;
+}
+
+
+/*
+ * EnsureDistributedEngineCanBeDisabledForCurrentDatabase terminates the
+ * backend with FATAL when the current database contains Citus-managed
+ * tables (rows in pg_dist_partition) while the distributed engine is off.
+ *
+ * The result is cached in CheckedDistributedEngineCompatibility for the
+ * lifetime of the backend.  This is safe because citus.enable_distributed_engine
+ * is PGC_POSTMASTER — changing it requires a full server restart, which
+ * resets every backend.  While the engine is disabled, the distributed
+ * hook stack is inactive and no new distributed metadata can be created
+ * within the same session.
+ */
+void
+EnsureDistributedEngineCanBeDisabledForCurrentDatabase(void)
+{
+	Oid citusExtensionOid = InvalidOid;
+
+	if (EnableDistributedEngine || CheckedDistributedEngineCompatibility)
+	{
+		return;
+	}
+
+	citusExtensionOid = get_extension_oid("citus", true);
+	if (!OidIsValid(citusExtensionOid))
+	{
+		CheckedDistributedEngineCompatibility = true;
+		return;
+	}
+
+	if (!DatabaseContainsCitusManagedTables())
+	{
+		CheckedDistributedEngineCompatibility = true;
+		return;
+	}
+
+	ereport(FATAL,
+			(errmsg("citus.enable_distributed_engine cannot be disabled for database \"%s\"",
+					get_database_name(MyDatabaseId)),
+			 errdetail("The database contains Citus-managed tables recorded in pg_dist_partition."),
+			 errhint("Enable citus.enable_distributed_engine and restart the server, "
+					 "or remove Citus-managed tables from this database before "
+					 "disabling the distributed engine.")));
+}
+
+
+static bool
+DatabaseContainsCitusManagedTables(void)
+{
+	Oid distPartitionRelid =
+		get_relname_relid("pg_dist_partition", PG_CATALOG_NAMESPACE);
+
+	if (!OidIsValid(distPartitionRelid))
+	{
+		return false;
+	}
+
+	Relation distPartitionRelation = table_open(distPartitionRelid, AccessShareLock);
+	SysScanDesc scanDescriptor =
+		systable_beginscan(distPartitionRelation, InvalidOid, false, NULL, 0, NULL);
+	HeapTuple heapTuple = systable_getnext(scanDescriptor);
+	bool hasCitusManagedTables = HeapTupleIsValid(heapTuple);
+
+	systable_endscan(scanDescriptor);
+	table_close(distPartitionRelation, AccessShareLock);
+
+	return hasCitusManagedTables;
+}
 
 /* *INDENT-OFF* */
 /* GUC enum definitions */
@@ -458,70 +606,80 @@ _PG_init(void)
 	 */
 	RegisterCitusConfigVariables();
 
-	/* make our additional node types known */
-	RegisterNodes();
-
-	/* make our custom scan nodes known */
-	RegisterCitusCustomScanMethods();
-
-	/* intercept planner */
-	planner_hook = distributed_planner;
-
-	/* register for planner hook */
-	set_rel_pathlist_hook = multi_relation_restriction_hook;
-	get_relation_info_hook = multi_get_relation_info_hook;
-	set_join_pathlist_hook = multi_join_restriction_hook;
-	ExecutorStart_hook = CitusExecutorStart;
-	ExecutorRun_hook = citus_executor_run_adapter;
-	ExplainOneQuery_hook = CitusExplainOneQuery;
-	prev_ExecutorEnd = ExecutorEnd_hook;
-	ExecutorEnd_hook = CitusAttributeToEnd;
-
-	/* register hook for error messages */
-	original_emit_log_hook = emit_log_hook;
-	emit_log_hook = multi_log_hook;
-
-
 	/*
-	 * Register hook for counting client backends that
-	 * are successfully authenticated.
+	 * Keep the local transaction/connection housekeeping initialized even in
+	 * columnar-only mode so CREATE/ALTER/DROP EXTENSION citus can complete
+	 * cleanly without bringing back the distributed planner/executor hooks.
 	 */
-	original_client_auth_hook = ClientAuthentication_hook;
-	ClientAuthentication_hook = CitusAuthHook;
-
-	prev_shmem_request_hook = shmem_request_hook;
-	shmem_request_hook = citus_shmem_request;
-
-	InitializeMaintenanceDaemon();
-	InitializeMaintenanceDaemonForMainDb();
-
-	/* initialize coordinated transaction management */
 	InitializeTransactionManagement();
-	InitializeBackendManagement();
 	InitializeConnectionManagement();
 	InitPlacementConnectionManagement();
 	InitRelationAccessHash();
-	InitializeCitusQueryStats();
-	InitializeSharedConnectionStats();
 	InitializeLocallyReservedSharedConnections();
-	InitializeClusterClockMem();
 
 	/*
-	 * Adjust the Dynamic Library Path to prepend citus_decodes to the dynamic
-	 * library path. This is needed to make sure that the citus decoders are
-	 * loaded before the default decoders for CDC.
+	 * Keep a lightweight planner entry hook even when the distributed engine is
+	 * disabled so backends can reject databases that still contain Citus
+	 * metadata before ordinary SELECT/INSERT/UPDATE/DELETE execution.
 	 */
-	if (EnableChangeDataCapture)
+	planner_hook = distributed_planner;
+
+	if (EnableDistributedEngine)
 	{
-		AdjustDynamicLibraryPathForCdcDecoders();
+		/* make our additional node types known */
+		RegisterNodes();
+
+		/* make our custom scan nodes known */
+		RegisterCitusCustomScanMethods();
+
+		/* register for planner hook */
+		set_rel_pathlist_hook = multi_relation_restriction_hook;
+		get_relation_info_hook = multi_get_relation_info_hook;
+		set_join_pathlist_hook = multi_join_restriction_hook;
+		ExecutorStart_hook = CitusExecutorStart;
+		ExecutorRun_hook = citus_executor_run_adapter;
+		ExplainOneQuery_hook = CitusExplainOneQuery;
+		prev_ExecutorEnd = ExecutorEnd_hook;
+		ExecutorEnd_hook = CitusAttributeToEnd;
+
+		/* register hook for error messages */
+		original_emit_log_hook = emit_log_hook;
+		emit_log_hook = multi_log_hook;
+
+		/*
+		 * Register hook for counting client backends that
+		 * are successfully authenticated.
+		 */
+		original_client_auth_hook = ClientAuthentication_hook;
+		ClientAuthentication_hook = CitusAuthHook;
+
+		prev_shmem_request_hook = shmem_request_hook;
+		shmem_request_hook = citus_shmem_request;
+
+		InitializeMaintenanceDaemon();
+		InitializeMaintenanceDaemonForMainDb();
+
+		InitializeBackendManagement();
+		InitializeCitusQueryStats();
+		InitializeSharedConnectionStats();
+		InitializeClusterClockMem();
+
+		/*
+		 * Adjust the Dynamic Library Path to prepend citus_decodes to the dynamic
+		 * library path. This is needed to make sure that the citus decoders are
+		 * loaded before the default decoders for CDC.
+		 */
+		if (EnableChangeDataCapture)
+		{
+			AdjustDynamicLibraryPathForCdcDecoders();
+		}
+
+		/* initialize shard split shared memory handle management */
+		InitializeShardSplitSMHandleManagement();
+
+		InitializeMultiTenantMonitorSMHandleManagement();
+		InitializeStatCountersShmem();
 	}
-
-
-	/* initialize shard split shared memory handle management */
-	InitializeShardSplitSMHandleManagement();
-
-	InitializeMultiTenantMonitorSMHandleManagement();
-	InitializeStatCountersShmem();
 
 
 	/* enable modification of pg_catalog tables during pg_upgrade */
@@ -537,11 +695,18 @@ _PG_init(void)
 	 * there will be parallel queries and we might do a cleanup for things that are
 	 * already in use. This is only needed in Windows.
 	 */
-	if (!IsUnderPostmaster)
+	if (EnableDistributedEngine && !IsUnderPostmaster)
 	{
 		DoInitialCleanup();
 	}
 
+	/*
+	 * Registered unconditionally.  When the distributed engine is disabled the
+	 * hook performs a fast early-return for all non-extension access types, so
+	 * the per-call overhead is negligible (two comparisons).  This could be
+	 * moved inside the EnableDistributedEngine block in a future cleanup
+	 * without behavioural change.
+	 */
 	PrevObjectAccessHook = object_access_hook;
 	object_access_hook = CitusObjectAccessHook;
 
@@ -571,6 +736,14 @@ _PG_init(void)
 															"ColumnarSupportsIndexAM",
 															true, &handle);
 
+	/*
+	 * Registered unconditionally.  The callback functions
+	 * (InvalidateDistTableCache, InvalidateDistObjectCache,
+	 * InvalidateMetadataSystemCache / InvalidateConnParamsHashEntries)
+	 * are all NULL-safe: they check whether the corresponding hash tables
+	 * have been initialized and return immediately when they have not, so
+	 * this is safe when the distributed engine is disabled.
+	 */
 	CacheRegisterRelcacheCallback(InvalidateDistRelationCacheCallback,
 								  (Datum) 0);
 
@@ -626,6 +799,11 @@ citus_shmem_request(void)
 	if (prev_shmem_request_hook)
 	{
 		prev_shmem_request_hook();
+	}
+
+	if (!EnableDistributedEngine)
+	{
+		return;
 	}
 
 	RequestAddinShmemSpace(BackendManagementShmemSize());
@@ -710,6 +888,21 @@ static void
 multi_log_hook(ErrorData *edata)
 {
 	/*
+	 * Distributed log-state is initialized only when the postmaster starts
+	 * with the distributed engine enabled, so do not consult the
+	 * extension-script exception here.
+	 */
+	if (!EnableDistributedEngine)
+	{
+		if (original_emit_log_hook)
+		{
+			original_emit_log_hook(edata);
+		}
+
+		return;
+	}
+
+	/*
 	 * Show the user a meaningful error message when a backend is cancelled
 	 * by the distributed deadlock detection. Also reset the state for this,
 	 * since the next cancelation of the backend might have another reason.
@@ -789,6 +982,15 @@ IsSequenceOverflowError(ErrorData *edata)
 void
 StartupCitusBackend(void)
 {
+	/*
+	 * Backend-local distributed infrastructure is initialized only when the
+	 * postmaster started with the distributed engine enabled.
+	 */
+	if (!EnableDistributedEngine)
+	{
+		return;
+	}
+
 	InitializeMaintenanceDaemonBackend();
 
 	/*
@@ -1343,6 +1545,18 @@ RegisterCitusConfigVariables(void)
 		true,
 		PGC_USERSET,
 		GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE,
+		NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		"citus.enable_distributed_engine",
+		gettext_noop("Enables Citus distributed planner, executor, and DDL hooks."),
+		gettext_noop("When disabled, Citus keeps columnar support loaded but bypasses "
+					 "distributed planning, distributed execution, and distributed DDL "
+					 "interception except while creating or updating the citus extension."),
+		&EnableDistributedEngine,
+		false,
+		PGC_POSTMASTER,
+		GUC_STANDARD,
 		NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
@@ -2795,7 +3009,7 @@ OverridePostgresConfigProperties(void)
 	{
 		struct config_generic *var = (struct config_generic *) guc_vars[gucIndex];
 
-		if (strcmp(var->name, "application_name") == 0)
+		if (EnableDistributedEngine && strcmp(var->name, "application_name") == 0)
 		{
 			struct config_string *stringVar = (struct config_string *) var;
 
@@ -3001,6 +3215,17 @@ ShowShardsForAppNamePrefixesAssignHook(const char *newval, void *extra)
 static void
 ApplicationNameAssignHook(const char *newval, void *extra)
 {
+	/*
+	 * This hook is installed only when the distributed engine is enabled at
+	 * postmaster startup, so extension-script exceptions are intentionally not
+	 * considered here.
+	 */
+	if (!EnableDistributedEngine)
+	{
+		OldApplicationNameAssignHook(newval, extra);
+		return;
+	}
+
 	ResetHideShardsDecision();
 	DetermineCitusBackendType(newval);
 
@@ -3224,6 +3449,20 @@ static void
 CitusAuthHook(Port *port, int status)
 {
 	/*
+	 * Shared backend-management state is initialized only when the distributed
+	 * engine is enabled at postmaster startup, so use the raw GUC here.
+	 */
+	if (!EnableDistributedEngine)
+	{
+		if (original_client_auth_hook)
+		{
+			original_client_auth_hook(port, status);
+		}
+
+		return;
+	}
+
+	/*
 	 * We determine the backend type here because other calls in this hook rely
 	 * on it, both IsExternalClientBackend and InitializeBackendData. These
 	 * calls would normally initialize its value based on the application_name
@@ -3343,13 +3582,32 @@ CitusObjectAccessHook(ObjectAccessType access, Oid classId, Oid objectId, int su
 		PrevObjectAccessHook(access, classId, objectId, subId, arg);
 	}
 
-	/* Checks if the access is post_create and that it's an extension id */
 	if (access == OAT_POST_CREATE && classId == ExtensionRelationId)
 	{
-		/* There's currently an engine bug that makes it difficult to check
+		if (!EnableDistributedEngine)
+		{
+			/*
+			 * SetCreateCitusTransactionLevel is intentionally skipped: the
+			 * distributed hook stack is not active, so no distributed-side
+			 * metadata changes are made beyond what the extension SQL script
+			 * writes transactionally.  Standard PostgreSQL rollback is
+			 * sufficient to undo those catalog writes.
+			 */
+			return;
+		}
+
+		/*
+		 * There's currently an engine bug that makes it difficult to check
 		 * the provided objectId with extension oid so we will set the value
-		 * regardless if it's citus being created */
+		 * regardless if it's citus being created.
+		 */
 		SetCreateCitusTransactionLevel(GetCurrentTransactionNestLevel());
+		return;
+	}
+
+	if (!CitusDistributedEngineEnabled())
+	{
+		return;
 	}
 }
 

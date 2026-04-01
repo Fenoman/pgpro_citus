@@ -22,7 +22,13 @@ extern PGDLLEXPORT CompressionTypeStr_type extern_CompressionTypeStr;
 extern PGDLLEXPORT IsColumnarTableAmTable_type extern_IsColumnarTableAmTable;
 extern PGDLLEXPORT ReadColumnarOptions_type extern_ReadColumnarOptions;
 
+extern bool EnableDistributedEngine;
+
 extern void StartupCitusBackend(void);
+extern bool CitusDistributedEngineEnabled(void);
+extern void ErrorIfDistributedEngineOperationDisabled(const char *operationName);
+extern void ErrorIfDistributedEngineMetadataOperationDisabled(const char *operationName);
+extern void EnsureDistributedEngineCanBeDisabledForCurrentDatabase(void);
 extern const char * GetClientMinMessageLevelNameForValue(int minMessageLevel);
 
 #endif /* SHARED_LIBRARY_INIT_H */

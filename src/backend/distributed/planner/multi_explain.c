@@ -74,6 +74,7 @@
 #include "distributed/placement_connection.h"
 #include "distributed/recursive_planning.h"
 #include "distributed/remote_commands.h"
+#include "distributed/shared_library_init.h"
 #include "distributed/subplan_execution.h"
 #include "distributed/tuple_destination.h"
 #include "distributed/tuplestore.h"
@@ -1610,6 +1611,26 @@ CitusExplainOneQuery(Query *query, int cursorOptions, IntoClause *into,
 					 ExplainState *es, const char *queryString, ParamListInfo params,
 					 QueryEnvironment *queryEnv)
 {
+	/* Defensive: this hook is only installed when EnableDistributedEngine is true. */
+	if (!CitusDistributedEngineEnabled())
+	{
+		ExplainOneQuery_hook_type savedExplainHook = ExplainOneQuery_hook;
+
+		PG_TRY();
+		{
+			ExplainOneQuery_hook = NULL;
+			ExplainOneQuery(query, cursorOptions, into, es, queryString, params,
+							queryEnv);
+		}
+		PG_FINALLY();
+		{
+			ExplainOneQuery_hook = savedExplainHook;
+		}
+		PG_END_TRY();
+
+		return;
+	}
+
 	/* save the flags of current EXPLAIN command */
 	CurrentDistributedQueryExplainOptions.costs = es->costs;
 	CurrentDistributedQueryExplainOptions.buffers = es->buffers;

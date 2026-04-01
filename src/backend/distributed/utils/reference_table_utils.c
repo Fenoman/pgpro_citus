@@ -38,6 +38,7 @@
 #include "distributed/relation_access_tracking.h"
 #include "distributed/remote_commands.h"
 #include "distributed/resource_lock.h"
+#include "distributed/shared_library_init.h"
 #include "distributed/shard_transfer.h"
 #include "distributed/shardinterval_utils.h"
 #include "distributed/transaction_management.h"
@@ -71,6 +72,8 @@ PG_FUNCTION_INFO_V1(replicate_reference_tables);
 Datum
 replicate_reference_tables(PG_FUNCTION_ARGS)
 {
+	ErrorIfDistributedEngineOperationDisabled("replicate reference tables");
+
 	Oid shardReplicationModeOid = PG_GETARG_OID(0);
 	char shardReplicationMode = LookupShardTransferMode(shardReplicationModeOid);
 

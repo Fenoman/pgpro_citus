@@ -78,6 +78,7 @@
 #include "distributed/multi_join_order.h"
 #include "distributed/multi_partitioning_utils.h"
 #include "distributed/multi_physical_planner.h"
+#include "distributed/shared_library_init.h"
 #include "distributed/pg_dist_colocation.h"
 #include "distributed/pg_dist_node.h"
 #include "distributed/pg_dist_schema.h"
@@ -203,6 +204,7 @@ Datum
 start_metadata_sync_to_node(PG_FUNCTION_ARGS)
 {
 	CheckCitusVersion(ERROR);
+	ErrorIfDistributedEngineOperationDisabled("manage metadata synchronization");
 
 	text *nodeName = PG_GETARG_TEXT_P(0);
 	int32 nodePort = PG_GETARG_INT32(1);
@@ -240,6 +242,7 @@ Datum
 start_metadata_sync_to_all_nodes(PG_FUNCTION_ARGS)
 {
 	CheckCitusVersion(ERROR);
+	ErrorIfDistributedEngineOperationDisabled("manage metadata synchronization");
 
 	EnsureSuperUser();
 	EnsureCoordinator();
@@ -429,6 +432,7 @@ Datum
 stop_metadata_sync_to_node(PG_FUNCTION_ARGS)
 {
 	CheckCitusVersion(ERROR);
+	ErrorIfDistributedEngineOperationDisabled("manage metadata synchronization");
 	EnsureCoordinator();
 	EnsureSuperUser();
 

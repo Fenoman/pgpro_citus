@@ -62,6 +62,7 @@
 #include "distributed/reference_table_utils.h"
 #include "distributed/remote_commands.h"
 #include "distributed/resource_lock.h"
+#include "distributed/shared_library_init.h"
 #include "distributed/shard_cleaner.h"
 #include "distributed/shard_rebalancer.h"
 #include "distributed/shard_transfer.h"
@@ -987,6 +988,7 @@ Datum
 rebalance_table_shards(PG_FUNCTION_ARGS)
 {
 	CheckCitusVersion(ERROR);
+	ErrorIfDistributedEngineOperationDisabled("run shard rebalancing operations");
 	List *relationIdList = NIL;
 	if (!PG_ARGISNULL(0))
 	{
@@ -1042,6 +1044,7 @@ Datum
 citus_rebalance_start(PG_FUNCTION_ARGS)
 {
 	CheckCitusVersion(ERROR);
+	ErrorIfDistributedEngineOperationDisabled("run shard rebalancing operations");
 	List *relationIdList = NonColocatedDistRelationIdList();
 	Form_pg_dist_rebalance_strategy strategy =
 		GetRebalanceStrategy(PG_GETARG_NAME_OR_NULL(0));
@@ -1087,6 +1090,7 @@ Datum
 citus_rebalance_stop(PG_FUNCTION_ARGS)
 {
 	CheckCitusVersion(ERROR);
+	ErrorIfDistributedEngineOperationDisabled("run shard rebalancing operations");
 
 	int64 jobId = 0;
 	if (!HasNonTerminalJobOfType("rebalance", &jobId))
@@ -1108,6 +1112,7 @@ Datum
 citus_rebalance_wait(PG_FUNCTION_ARGS)
 {
 	CheckCitusVersion(ERROR);
+	ErrorIfDistributedEngineOperationDisabled("run shard rebalancing operations");
 
 	int64 jobId = 0;
 	if (!HasNonTerminalJobOfType("rebalance", &jobId))
@@ -1187,6 +1192,7 @@ Datum
 citus_drain_node(PG_FUNCTION_ARGS)
 {
 	CheckCitusVersion(ERROR);
+	ErrorIfDistributedEngineOperationDisabled("run shard rebalancing operations");
 	PG_ENSURE_ARGNOTNULL(0, "nodename");
 	PG_ENSURE_ARGNOTNULL(1, "nodeport");
 	PG_ENSURE_ARGNOTNULL(2, "shard_transfer_mode");
@@ -1231,6 +1237,7 @@ Datum
 replicate_table_shards(PG_FUNCTION_ARGS)
 {
 	CheckCitusVersion(ERROR);
+	ErrorIfDistributedEngineOperationDisabled("run shard rebalancing operations");
 	Oid relationId = PG_GETARG_OID(0);
 	uint32 shardReplicationFactor = PG_GETARG_INT32(1);
 	int32 maxShardCopies = PG_GETARG_INT32(2);
@@ -1293,6 +1300,7 @@ Datum
 get_rebalance_table_shards_plan(PG_FUNCTION_ARGS)
 {
 	CheckCitusVersion(ERROR);
+	ErrorIfDistributedEngineOperationDisabled("plan shard rebalancing operations");
 	List *relationIdList = NIL;
 	if (!PG_ARGISNULL(0))
 	{
@@ -1373,6 +1381,7 @@ Datum
 get_rebalance_progress(PG_FUNCTION_ARGS)
 {
 	CheckCitusVersion(ERROR);
+	ErrorIfDistributedEngineOperationDisabled("inspect rebalance progress");
 	List *segmentList = NIL;
 	TupleDesc tupdesc;
 	Tuplestorestate *tupstore = SetupTuplestore(fcinfo, &tupdesc);
@@ -3874,6 +3883,7 @@ Datum
 get_snapshot_based_node_split_plan(PG_FUNCTION_ARGS)
 {
 	CheckCitusVersion(ERROR);
+	ErrorIfDistributedEngineOperationDisabled("plan shard rebalancing operations");
 
 	text *primaryNodeNameText = PG_GETARG_TEXT_P(0);
 	int32 primaryNodePort = PG_GETARG_INT32(1);

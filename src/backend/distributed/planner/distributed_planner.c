@@ -69,6 +69,7 @@
 #include "distributed/recursive_planning.h"
 #include "distributed/shard_utils.h"
 #include "distributed/shardinterval_utils.h"
+#include "distributed/shared_library_init.h"
 #include "distributed/stats/stat_tenants.h"
 #include "distributed/version_compat.h"
 #include "distributed/worker_shard_visibility.h"
@@ -157,6 +158,12 @@ distributed_planner(Query *parse,
 					int cursorOptions,
 					ParamListInfo boundParams)
 {
+	if (!CitusDistributedEngineEnabled())
+	{
+		EnsureDistributedEngineCanBeDisabledForCurrentDatabase();
+		return standard_planner(parse, query_string, cursorOptions, boundParams);
+	}
+
 	bool needsDistributedPlanning = false;
 	bool fastPathRouterQuery = false;
 	FastPathRestrictionContext fastPathContext = { 0 };
@@ -367,7 +374,7 @@ ExtractRangeTableEntryList(Query *query)
 bool
 NeedsDistributedPlanning(Query *query)
 {
-	if (!CitusHasBeenLoaded())
+	if (!CitusDistributedEngineEnabled() || !CitusHasBeenLoaded())
 	{
 		return false;
 	}
@@ -1980,6 +1987,12 @@ multi_join_restriction_hook(PlannerInfo *root,
 							JoinType jointype,
 							JoinPathExtraData *extra)
 {
+	/* Defensive: this hook is only installed when EnableDistributedEngine is true. */
+	if (!CitusDistributedEngineEnabled())
+	{
+		return;
+	}
+
 	if (bms_is_empty(innerrel->relids) || bms_is_empty(outerrel->relids))
 	{
 		/*
@@ -2045,6 +2058,12 @@ void
 multi_relation_restriction_hook(PlannerInfo *root, RelOptInfo *relOptInfo,
 								Index restrictionIndex, RangeTblEntry *rte)
 {
+	/* Defensive: this hook is only installed when EnableDistributedEngine is true. */
+	if (!CitusDistributedEngineEnabled())
+	{
+		return;
+	}
+
 	CitusTableCacheEntry *cacheEntry = NULL;
 
 	if (ReplaceCitusExtraDataContainer && IsCitusExtraDataContainerRelation(rte))
@@ -2168,7 +2187,8 @@ void
 multi_get_relation_info_hook(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 							 RelOptInfo *rel)
 {
-	if (!CitusHasBeenLoaded())
+	/* Defensive: this hook is only installed when EnableDistributedEngine is true. */
+	if (!CitusDistributedEngineEnabled() || !CitusHasBeenLoaded())
 	{
 		return;
 	}

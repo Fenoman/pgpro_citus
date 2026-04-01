@@ -81,6 +81,7 @@
 #include "distributed/reference_table_utils.h"
 #include "distributed/remote_commands.h"
 #include "distributed/resource_lock.h"
+#include "distributed/shared_library_init.h"
 #include "distributed/string_utils.h"
 #include "distributed/transaction_management.h"
 #include "distributed/version_compat.h"
@@ -114,6 +115,16 @@ static void PostStandardProcessUtility(Node *parsetree);
 static void DecrementUtilityHookCountersIfNecessary(Node *parsetree);
 static bool IsDropSchemaOrDB(Node *parsetree);
 static bool ShouldCheckUndistributeCitusLocalTables(void);
+static void ProcessCitusExtensionLifecycleWhenEngineDisabled(PlannedStmt *pstmt,
+															 const char *queryString,
+															 bool readOnlyTree,
+															 ProcessUtilityContext context,
+															 ParamListInfo params,
+															 struct QueryEnvironment *queryEnv,
+															 DestReceiver *dest,
+															 QueryCompletion *completionTag);
+static bool CreateCitusExtensionWouldBeNoOp(Node *parsetree);
+static bool DropCitusExtensionWouldBeNoOp(Node *parsetree);
 
 
 /*
@@ -132,6 +143,117 @@ ProcessUtilityParseTree(Node *node, const char *queryString, ProcessUtilityConte
 
 	ProcessUtility(plannedStmt, queryString, false, context, params, NULL, dest,
 				   completionTag);
+}
+
+
+static bool
+CreateCitusExtensionWouldBeNoOp(Node *parsetree)
+{
+	if (!IsA(parsetree, CreateExtensionStmt))
+	{
+		return false;
+	}
+
+	CreateExtensionStmt *createExtensionStmt = castNode(CreateExtensionStmt, parsetree);
+	return createExtensionStmt->if_not_exists &&
+		   get_extension_oid(createExtensionStmt->extname, true) != InvalidOid;
+}
+
+
+static bool
+DropCitusExtensionWouldBeNoOp(Node *parsetree)
+{
+	if (!IsA(parsetree, DropStmt))
+	{
+		return false;
+	}
+
+	DropStmt *dropStmt = castNode(DropStmt, parsetree);
+	return dropStmt->missing_ok && get_extension_oid("citus", true) == InvalidOid;
+}
+
+
+/*
+ * ProcessCitusExtensionLifecycleWhenEngineDisabled handles CREATE, ALTER
+ * UPDATE, and DROP EXTENSION citus while the distributed engine is disabled.
+ *
+ * Only the minimal pre-/post-processing needed for extension lifecycle is
+ * performed here; the full distributed utility path is intentionally
+ * bypassed.  In particular:
+ *
+ *   - PostStandardProcessUtility is not called: the distributed utility
+ *     hook counters (activeAlterTables, activeDropSchemaOrDBs) and FK-graph
+ *     invalidation are irrelevant for extension lifecycle statements.
+ *
+ *   - StopMaintenanceDaemon is not called for DROP EXTENSION: the
+ *     maintenance daemon is never started when EnableDistributedEngine is
+ *     false, so there is nothing to stop.
+ */
+static void
+ProcessCitusExtensionLifecycleWhenEngineDisabled(PlannedStmt *pstmt,
+												 const char *queryString,
+												 bool readOnlyTree,
+												 ProcessUtilityContext context,
+												 ParamListInfo params,
+												 struct QueryEnvironment *queryEnv,
+												 DestReceiver *dest,
+												 QueryCompletion *completionTag)
+{
+	Node *parsetree = pstmt->utilityStmt;
+	bool isCreateAlterExtensionUpdateCitusStmt =
+		IsCreateAlterExtensionUpdateCitusStmt(parsetree);
+	bool isAlterExtensionUpdateCitusStmt = isCreateAlterExtensionUpdateCitusStmt &&
+										   IsA(parsetree, AlterExtensionStmt);
+	bool isDropCitusExtensionStmt = IsDropCitusExtensionStmt(parsetree);
+
+	if (CreateCitusExtensionWouldBeNoOp(parsetree) ||
+		DropCitusExtensionWouldBeNoOp(parsetree))
+	{
+		PrevProcessUtility(pstmt, queryString, readOnlyTree, context,
+						   params, queryEnv, dest, completionTag);
+		return;
+	}
+
+	if (readOnlyTree)
+	{
+		pstmt = copyObject(pstmt);
+		parsetree = pstmt->utilityStmt;
+	}
+
+	if (EnableVersionChecks && isCreateAlterExtensionUpdateCitusStmt)
+	{
+		ErrorIfUnstableCreateOrAlterExtensionStmt(parsetree);
+	}
+
+	if (IsA(parsetree, CreateExtensionStmt))
+	{
+		PreprocessCreateExtensionStmtForCitusColumnar(parsetree);
+	}
+
+	bool citusCanBeUpdatedToAvailableVersion = false;
+	if (isAlterExtensionUpdateCitusStmt)
+	{
+		citusCanBeUpdatedToAvailableVersion = !InstalledAndAvailableVersionsSame();
+		PreprocessAlterExtensionCitusStmtForCitusColumnar(parsetree);
+	}
+
+	if (isCreateAlterExtensionUpdateCitusStmt || isDropCitusExtensionStmt)
+	{
+		CacheInvalidateRelcacheAll();
+	}
+
+	PrevProcessUtility(pstmt, queryString, false, context,
+					   params, queryEnv, dest, completionTag);
+
+	if (isAlterExtensionUpdateCitusStmt)
+	{
+		PostprocessAlterExtensionCitusStmtForCitusColumnar(parsetree);
+
+		if (citusCanBeUpdatedToAvailableVersion)
+		{
+			PostprocessAlterExtensionCitusUpdateStmt(parsetree);
+		}
+	}
 }
 
 
@@ -154,12 +276,40 @@ citus_ProcessUtility(PlannedStmt *pstmt,
 					 DestReceiver *dest,
 					 QueryCompletion *completionTag)
 {
+	Node *parsetree = pstmt->utilityStmt;
+	bool isCreateAlterExtensionUpdateCitusStmt = IsCreateAlterExtensionUpdateCitusStmt(
+		parsetree);
+	bool isDropCitusExtensionStmt = IsDropCitusExtensionStmt(parsetree);
+
+	if (!EnableDistributedEngine)
+	{
+		EnsureDistributedEngineCanBeDisabledForCurrentDatabase();
+
+		/*
+		 * Use the raw postmaster GUC here to keep ordinary utility commands on
+		 * the fast path. Citus extension lifecycle statements are handled
+		 * explicitly below without re-enabling the distributed hook stack.
+		 */
+		if (isCreateAlterExtensionUpdateCitusStmt || isDropCitusExtensionStmt)
+		{
+			ProcessCitusExtensionLifecycleWhenEngineDisabled(pstmt, queryString,
+															 readOnlyTree, context, params,
+															 queryEnv, dest, completionTag);
+		}
+		else
+		{
+			PrevProcessUtility(pstmt, queryString, readOnlyTree, context,
+							   params, queryEnv, dest, completionTag);
+		}
+
+		return;
+	}
+
 	if (readOnlyTree)
 	{
 		pstmt = copyObject(pstmt);
+		parsetree = pstmt->utilityStmt;
 	}
-
-	Node *parsetree = pstmt->utilityStmt;
 
 	if (IsA(parsetree, TransactionStmt))
 	{
@@ -198,9 +348,6 @@ citus_ProcessUtility(PlannedStmt *pstmt,
 		return;
 	}
 
-	bool isCreateAlterExtensionUpdateCitusStmt = IsCreateAlterExtensionUpdateCitusStmt(
-		parsetree);
-
 	if (EnableVersionChecks && isCreateAlterExtensionUpdateCitusStmt)
 	{
 		ErrorIfUnstableCreateOrAlterExtensionStmt(parsetree);
@@ -215,7 +362,7 @@ citus_ProcessUtility(PlannedStmt *pstmt,
 		PreprocessCreateExtensionStmtForCitusColumnar(parsetree);
 	}
 
-	if (isCreateAlterExtensionUpdateCitusStmt || IsDropCitusExtensionStmt(parsetree))
+	if (isCreateAlterExtensionUpdateCitusStmt || isDropCitusExtensionStmt)
 	{
 		/*
 		 * Citus maintains a higher level cache. We use the cache invalidation mechanism

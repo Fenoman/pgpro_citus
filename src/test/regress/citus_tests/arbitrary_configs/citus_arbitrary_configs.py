@@ -19,8 +19,12 @@ import random
 import shutil
 import sys
 import time
+import argparse
 
-from docopt import docopt
+try:
+    from docopt import docopt
+except ModuleNotFoundError:
+    docopt = None
 
 # https://stackoverflow.com/questions/14132789/relative-imports-for-the-billionth-time/14132912#14132912
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -156,10 +160,10 @@ def copy_test_files_with_names(test_names, sql_dir_path, expected_dir_path, conf
         # make empty files for the skipped tests
         if test_name in config.skip_tests:
             expected_sql_file = os.path.join(sql_dir_path, test_name + ".sql")
-            open(expected_sql_file, "x").close()
+            open(expected_sql_file, "w").close()
 
             expected_out_file = os.path.join(expected_dir_path, test_name + ".out")
-            open(expected_out_file, "x").close()
+            open(expected_out_file, "w").close()
 
             continue
 
@@ -209,11 +213,20 @@ def run_tests(configs, sql_schedule_name):
 
 def read_configs(docoptRes):
     configs = []
+    requested_configs = None
+    if "--configs" in docoptRes and docoptRes["--configs"] != "":
+        requested_configs = set(docoptRes["--configs"].split(","))
+
     # We fill the configs from all of the possible classes in config.py so that if we add a new config,
     # we don't need to add it here. And this avoids the problem where we forget to add it here
     for x in cfg.__dict__.values():
-        if cfg.should_include_config(x):
-            configs.append(x(docoptRes))
+        if not cfg.should_include_config(x):
+            continue
+
+        if requested_configs is not None and x.__name__ not in requested_configs:
+            continue
+
+        configs.append(x(docoptRes))
     return configs
 
 
@@ -231,15 +244,6 @@ def read_arguments(docoptRes):
     random.seed(seed)
 
     configs = read_configs(docoptRes)
-    if "--configs" in docoptRes and docoptRes["--configs"] != "":
-        given_configs = docoptRes["--configs"].split(",")
-        new_configs = []
-        for config in configs:
-            if config.name in given_configs:
-                new_configs.append(config)
-        if len(new_configs) > 0:
-            configs = new_configs
-
     sql_schedule_name = cfg.SQL_SCHEDULE
     if "--base" in docoptRes and docoptRes["--base"]:
         sql_schedule_name = cfg.SQL_BASE_SCHEDULE
@@ -263,8 +267,31 @@ def show_results(configs, testResults, runtime, seed):
         sys.exit(1)
 
 
+def parse_arguments():
+    if docopt is not None:
+        return docopt(__doc__)
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--bindir", required=True)
+    parser.add_argument("--pgxsdir", required=True)
+    parser.add_argument("--parallel", required=True)
+    parser.add_argument("--configs", required=True)
+    parser.add_argument("--seed", required=True)
+    parser.add_argument("--base", action="store_true")
+    parsed = parser.parse_args()
+
+    return {
+        "--bindir": parsed.bindir,
+        "--pgxsdir": parsed.pgxsdir,
+        "--parallel": parsed.parallel,
+        "--configs": parsed.configs,
+        "--seed": parsed.seed,
+        "--base": parsed.base,
+    }
+
+
 if __name__ == "__main__":
-    docoptRes = docopt(__doc__)
+    docoptRes = parse_arguments()
 
     start_time = time.time()
     configs, sql_schedule_name, seed = read_arguments(docoptRes)

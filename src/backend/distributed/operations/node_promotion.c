@@ -9,6 +9,7 @@
 #include "distributed/metadata_cache.h"
 #include "distributed/metadata_sync.h"
 #include "distributed/remote_commands.h"
+#include "distributed/shared_library_init.h"
 #include "distributed/shard_rebalancer.h"
 
 
@@ -44,6 +45,7 @@ Datum
 citus_promote_clone_and_rebalance(PG_FUNCTION_ARGS)
 {
 	CheckCitusVersion(ERROR);
+	ErrorIfDistributedEngineOperationDisabled("promote clone nodes and rebalance shards");
 
 	/* Ensure superuser and coordinator */
 	EnsureSuperUser();

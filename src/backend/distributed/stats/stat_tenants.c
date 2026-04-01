@@ -35,6 +35,7 @@
 #include "distributed/log_utils.h"
 #include "distributed/metadata_cache.h"
 #include "distributed/multi_executor.h"
+#include "distributed/shared_library_init.h"
 #include "distributed/stats/stat_tenants.h"
 #include "distributed/tenant_schema_metadata.h"
 #include "distributed/tuplestore.h"
@@ -394,6 +395,24 @@ AnnotateQuery(char *queryString, Const *partitionKeyValue, int colocationId)
 void
 CitusAttributeToEnd(QueryDesc *queryDesc)
 {
+	/*
+	 * This hook is only installed when the distributed engine is enabled at
+	 * postmaster startup, so the raw GUC is the correct guard here.
+	 */
+	if (!EnableDistributedEngine)
+	{
+		if (prev_ExecutorEnd)
+		{
+			prev_ExecutorEnd(queryDesc);
+		}
+		else
+		{
+			standard_ExecutorEnd(queryDesc);
+		}
+
+		return;
+	}
+
 	/*
 	 * At the end of the Executor is the last moment we have to attribute the previous
 	 * attribution to a tenant, if applicable

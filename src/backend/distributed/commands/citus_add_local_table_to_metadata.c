@@ -48,6 +48,7 @@
 #include "distributed/multi_partitioning_utils.h"
 #include "distributed/namespace_utils.h"
 #include "distributed/reference_table_utils.h"
+#include "distributed/shared_library_init.h"
 #include "distributed/worker_protocol.h"
 #include "distributed/worker_shard_visibility.h"
 
@@ -134,6 +135,7 @@ static void
 citus_add_local_table_to_metadata_internal(Oid relationId, bool cascadeViaForeignKeys)
 {
 	CheckCitusVersion(ERROR);
+	ErrorIfDistributedEngineMetadataOperationDisabled("create Citus local tables");
 
 	/* enable citus_add_local_table_to_metadata on an empty node */
 	InsertCoordinatorIfClusterEmpty();
@@ -179,6 +181,7 @@ Datum
 remove_local_tables_from_metadata(PG_FUNCTION_ARGS)
 {
 	CheckCitusVersion(ERROR);
+	ErrorIfDistributedEngineOperationDisabled("remove Citus local tables from metadata");
 	EnsureCoordinator();
 
 	UndistributeDisconnectedCitusLocalTables();
@@ -201,6 +204,8 @@ remove_local_tables_from_metadata(PG_FUNCTION_ARGS)
 void
 CreateCitusLocalTable(Oid relationId, bool cascadeViaForeignKeys, bool autoConverted)
 {
+	ErrorIfDistributedEngineMetadataOperationDisabled("create Citus local tables");
+
 	/*
 	 * These checks should be done before acquiring any locks on relation.
 	 * This is because we don't allow creating citus local tables in worker

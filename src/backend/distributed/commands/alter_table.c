@@ -243,6 +243,7 @@ Datum
 undistribute_table(PG_FUNCTION_ARGS)
 {
 	CheckCitusVersion(ERROR);
+	ErrorIfDistributedEngineOperationDisabled("undistribute tables");
 
 	Oid relationId = PG_GETARG_OID(0);
 	bool cascadeViaForeignKeys = PG_GETARG_BOOL(1);
@@ -268,6 +269,7 @@ Datum
 alter_distributed_table(PG_FUNCTION_ARGS)
 {
 	CheckCitusVersion(ERROR);
+	ErrorIfDistributedEngineOperationDisabled("alter distributed tables");
 
 	Oid relationId = PG_GETARG_OID(0);
 

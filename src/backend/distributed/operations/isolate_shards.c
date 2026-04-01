@@ -37,6 +37,7 @@
 #include "distributed/reference_table_utils.h"
 #include "distributed/remote_commands.h"
 #include "distributed/resource_lock.h"
+#include "distributed/shared_library_init.h"
 #include "distributed/shard_split.h"
 #include "distributed/utils/distribution_column_map.h"
 #include "distributed/version_compat.h"
@@ -57,6 +58,7 @@ Datum
 isolate_tenant_to_new_shard(PG_FUNCTION_ARGS)
 {
 	CheckCitusVersion(ERROR);
+	ErrorIfDistributedEngineOperationDisabled("run shard split operations");
 	EnsureCoordinator();
 
 	Oid relationId = PG_GETARG_OID(0);

@@ -22,6 +22,7 @@
 #include "distributed/coordinator_protocol.h"
 #include "distributed/metadata_cache.h"
 #include "distributed/remote_commands.h"
+#include "distributed/shared_library_init.h"
 #include "distributed/shard_split.h"
 #include "distributed/shardinterval_utils.h"
 #include "distributed/utils/array_type.h"
@@ -42,6 +43,7 @@ Datum
 citus_split_shard_by_split_points(PG_FUNCTION_ARGS)
 {
 	CheckCitusVersion(ERROR);
+	ErrorIfDistributedEngineOperationDisabled("run shard split operations");
 	EnsureCoordinator();
 
 	uint64 shardIdToSplit = DatumGetUInt64(PG_GETARG_DATUM(0));

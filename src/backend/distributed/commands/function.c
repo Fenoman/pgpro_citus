@@ -58,6 +58,7 @@
 #include "distributed/metadata/distobject.h"
 #include "distributed/metadata/pg_dist_object.h"
 #include "distributed/metadata_sync.h"
+#include "distributed/shared_library_init.h"
 #include "distributed/metadata_utility.h"
 #include "distributed/multi_executor.h"
 #include "distributed/namespace_utils.h"
@@ -128,6 +129,8 @@ PG_FUNCTION_INFO_V1(create_distributed_function);
 Datum
 create_distributed_function(PG_FUNCTION_ARGS)
 {
+	ErrorIfDistributedEngineOperationDisabled("create distributed functions");
+
 	RegProcedure funcOid = PG_GETARG_OID(0);
 
 	text *distributionArgumentNameText = NULL; /* optional */

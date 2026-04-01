@@ -51,6 +51,7 @@
 #include "distributed/reference_table_utils.h"
 #include "distributed/remote_commands.h"
 #include "distributed/resource_lock.h"
+#include "distributed/shared_library_init.h"
 #include "distributed/shard_cleaner.h"
 #include "distributed/shard_rebalancer.h"
 #include "distributed/shard_split.h"
@@ -190,6 +191,7 @@ Datum
 citus_copy_shard_placement(PG_FUNCTION_ARGS)
 {
 	CheckCitusVersion(ERROR);
+	ErrorIfDistributedEngineOperationDisabled("manage distributed shard placements");
 	EnsureCoordinator();
 
 	int64 shardId = PG_GETARG_INT64(0);
@@ -220,6 +222,7 @@ Datum
 citus_copy_shard_placement_with_nodeid(PG_FUNCTION_ARGS)
 {
 	CheckCitusVersion(ERROR);
+	ErrorIfDistributedEngineOperationDisabled("manage distributed shard placements");
 	EnsureCoordinator();
 
 	int64 shardId = PG_GETARG_INT64(0);
@@ -248,6 +251,7 @@ Datum
 master_copy_shard_placement(PG_FUNCTION_ARGS)
 {
 	CheckCitusVersion(ERROR);
+	ErrorIfDistributedEngineOperationDisabled("manage distributed shard placements");
 	EnsureCoordinator();
 
 	int64 shardId = PG_GETARG_INT64(0);
@@ -351,6 +355,7 @@ Datum
 citus_move_shard_placement(PG_FUNCTION_ARGS)
 {
 	CheckCitusVersion(ERROR);
+	ErrorIfDistributedEngineOperationDisabled("manage distributed shard placements");
 	EnsureCoordinator();
 
 	List *referenceTableIdList = NIL;
@@ -388,6 +393,7 @@ Datum
 citus_move_shard_placement_with_nodeid(PG_FUNCTION_ARGS)
 {
 	CheckCitusVersion(ERROR);
+	ErrorIfDistributedEngineOperationDisabled("manage distributed shard placements");
 	EnsureCoordinator();
 
 	int64 shardId = PG_GETARG_INT64(0);

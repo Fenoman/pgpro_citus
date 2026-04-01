@@ -16,6 +16,10 @@ REGULAR_USER_NAME = "regularuser"
 SUPER_USER_NAME = "postgres"
 
 DATABASE_NAME = "postgres"
+REGRESS_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+
+ARBITRARY_ENGINE_OFF_CREATE_TEST = "arbitrary_configs_enable_distributed_engine_off_create"
+ARBITRARY_ENGINE_OFF_SQL_TEST = "arbitrary_configs_enable_distributed_engine_off"
 
 ARBITRARY_SCHEDULE_NAMES = [
     "create_schedule",
@@ -91,6 +95,23 @@ def find_free_port():
     raise Exception("Couldn't find a port to use")
 
 
+def read_schedule_test_names(*schedule_paths):
+    test_names = set()
+
+    for schedule_path in schedule_paths:
+        full_path = os.path.join(REGRESS_DIR, schedule_path.lstrip("./"))
+        with open(full_path) as schedule_file:
+            for line in schedule_file:
+                if ":" not in line:
+                    continue
+
+                _, tests = line.split(":", 1)
+                for test_name in tests.strip().split():
+                    test_names.add(test_name)
+
+    return test_names
+
+
 class NewInitCaller(type):
     def __call__(cls, *args, **kwargs):
         obj = type.__call__(cls, *args, **kwargs)
@@ -111,6 +132,7 @@ class CitusBaseClusterConfig(object, metaclass=NewInitCaller):
         self.is_citus = True
         self.all_null_dist_key = False
         self.test_with_columnar = False
+        self.initialize_citus_metadata = True
         self.name = type(self).__name__
         self.settings = {
             "shared_preload_libraries": "citus",
@@ -182,6 +204,8 @@ class CitusDefaultClusterConfig(CitusBaseClusterConfig):
             # Alter Table statement cannot be run from an arbitrary node so this test will fail
             "arbitrary_configs_alter_table_add_constraint_without_name_create",
             "arbitrary_configs_alter_table_add_constraint_without_name",
+            ARBITRARY_ENGINE_OFF_CREATE_TEST,
+            ARBITRARY_ENGINE_OFF_SQL_TEST,
         ]
 
 
@@ -239,6 +263,26 @@ class CitusSingleNodeClusterConfig(CitusDefaultClusterConfig):
 
     def setup_steps(self):
         common.coordinator_should_haveshards(self.bindir, self.coordinator_port())
+
+
+class CitusSingleNodeEngineOffConfig(CitusDefaultClusterConfig):
+    def __init__(self, arguments):
+        super().__init__(arguments)
+        self.worker_amount = 0
+        self.is_mx = False
+        self.user = SUPER_USER_NAME
+        self.new_settings = {
+            "citus.enable_distributed_engine": False,
+            "citus.use_citus_managed_tables": False,
+        }
+        self.initialize_citus_metadata = False
+        self.skip_tests = sorted(
+            read_schedule_test_names(CREATE_SCHEDULE, SQL_SCHEDULE)
+            - {
+                ARBITRARY_ENGINE_OFF_CREATE_TEST,
+                ARBITRARY_ENGINE_OFF_SQL_TEST,
+            }
+        )
 
 
 class CitusSingleWorkerClusterConfig(CitusDefaultClusterConfig):

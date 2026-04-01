@@ -30,6 +30,7 @@
 #include "distributed/pg_dist_cleanup.h"
 #include "distributed/remote_commands.h"
 #include "distributed/resource_lock.h"
+#include "distributed/shared_library_init.h"
 #include "distributed/shard_cleaner.h"
 #include "distributed/shard_rebalancer.h"
 #include "distributed/worker_transaction.h"
@@ -143,6 +144,7 @@ Datum
 citus_cleanup_orphaned_resources(PG_FUNCTION_ARGS)
 {
 	CheckCitusVersion(ERROR);
+	ErrorIfDistributedEngineOperationDisabled("run distributed orphan cleanup");
 	PreventInTransactionBlock(true, "citus_cleanup_orphaned_resources");
 
 	int droppedCount = DropOrphanedResourcesForCleanup();
@@ -165,6 +167,7 @@ Datum
 isolation_cleanup_orphaned_resources(PG_FUNCTION_ARGS)
 {
 	CheckCitusVersion(ERROR);
+	ErrorIfDistributedEngineOperationDisabled("run distributed orphan cleanup");
 	EnsureCoordinator();
 
 	DropOrphanedResourcesForCleanup();

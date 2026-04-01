@@ -51,6 +51,7 @@
 #include "distributed/metadata_cache.h"
 #include "distributed/metadata_sync.h"
 #include "distributed/remote_commands.h"
+#include "distributed/shared_library_init.h"
 #include "distributed/version_compat.h"
 #include "distributed/worker_transaction.h"
 
@@ -74,6 +75,7 @@ Datum
 mark_object_distributed(PG_FUNCTION_ARGS)
 {
 	CheckCitusVersion(ERROR);
+	ErrorIfDistributedEngineMetadataOperationDisabled("manage distributed object metadata");
 	EnsureSuperUser();
 
 	Oid classId = PG_GETARG_OID(0);
@@ -106,6 +108,9 @@ mark_object_distributed(PG_FUNCTION_ARGS)
 Datum
 citus_unmark_object_distributed(PG_FUNCTION_ARGS)
 {
+	CheckCitusVersion(ERROR);
+	ErrorIfDistributedEngineMetadataOperationDisabled("manage distributed object metadata");
+
 	Oid classid = PG_GETARG_OID(0);
 	Oid objid = PG_GETARG_OID(1);
 	int32 objsubid = PG_GETARG_INT32(2);

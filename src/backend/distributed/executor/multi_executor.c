@@ -50,6 +50,7 @@
 #include "distributed/multi_server_executor.h"
 #include "distributed/relation_access_tracking.h"
 #include "distributed/resource_lock.h"
+#include "distributed/shared_library_init.h"
 #include "distributed/transaction_management.h"
 #include "distributed/version_compat.h"
 #include "distributed/worker_protocol.h"
@@ -113,6 +114,13 @@ static bool InTrigger(void);
 void
 CitusExecutorStart(QueryDesc *queryDesc, int eflags)
 {
+	/* Defensive: this hook is only installed when EnableDistributedEngine is true. */
+	if (!CitusDistributedEngineEnabled())
+	{
+		standard_ExecutorStart(queryDesc, eflags);
+		return;
+	}
+
 	PlannedStmt *plannedStmt = queryDesc->plannedstmt;
 
 	/*
@@ -157,6 +165,17 @@ void
 CitusExecutorRun(QueryDesc *queryDesc,
 				 ScanDirection direction, uint64 count, bool execute_once)
 {
+	/* Defensive: this hook is only installed when EnableDistributedEngine is true. */
+	if (!CitusDistributedEngineEnabled())
+	{
+#if PG_VERSION_NUM >= PG_VERSION_18
+		standard_ExecutorRun(queryDesc, direction, count);
+#else
+		standard_ExecutorRun(queryDesc, direction, count, execute_once);
+#endif
+		return;
+	}
+
 	DestReceiver *dest = queryDesc->dest;
 
 	ParamListInfo savedBoundParams = executorBoundParams;
