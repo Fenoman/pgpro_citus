@@ -22,8 +22,11 @@ PG_CPPFLAGS += -I$(libpq_srcdir) -I$(safestringlib_srcdir)/include
 include $(citus_top_builddir)/Makefile.global
 
 # GCC 13 can ICE in the columnar module when PostgreSQL's inherited build
-# flags enable LTO. Keep the workaround local to citus_columnar instead of
-# disabling LTO globally for the whole extension tree or build image.
+# flags enable LTO. Keep the workaround local to citus_columnar and make it
+# opt-in so unaffected Linux builds retain their original optimization setup.
+CITUS_COLUMNAR_DISABLE_LTO ?= 0
+
+ifeq ($(CITUS_COLUMNAR_DISABLE_LTO),1)
 LTO_FILTER_PATTERNS = -flto -flto=% -ffat-lto-objects
 
 override CFLAGS := $(filter-out $(LTO_FILTER_PATTERNS),$(CFLAGS)) -fno-lto
@@ -33,6 +36,7 @@ override LDFLAGS := $(filter-out $(LTO_FILTER_PATTERNS),$(LDFLAGS)) -fno-lto
 override LDFLAGS_SL := $(filter-out $(LTO_FILTER_PATTERNS),$(LDFLAGS_SL))
 override BITCODE_CFLAGS := $(filter-out $(LTO_FILTER_PATTERNS),$(BITCODE_CFLAGS)) -fno-lto
 override SHLIB_LINK := $(filter-out $(LTO_FILTER_PATTERNS),$(SHLIB_LINK))
+endif
 
 SQL_DEPDIR=.deps/sql
 SQL_BUILDDIR=build/sql
