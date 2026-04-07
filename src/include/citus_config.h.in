@@ -34,16 +34,22 @@
 /* Define to 1 to build with lz4 support. (--with-lz4) */
 #undef HAVE_CITUS_LIBLZ4
 
+/* Define to 1 if expression_tree_mutator accepts traversal flags. */
+#undef HAVE_EXPRESSION_TREE_MUTATOR_TRAVERSAL_FLAGS
+
+/* Define to 1 if HeapTupleGetXmin is available. */
+#undef HAVE_HEAPTUPLE_GETXMIN
+
 /* Define to 1 if you have the <inttypes.h> header file. */
 #undef HAVE_INTTYPES_H
 
-/* Define to 1 if you have the `curl' library (-lcurl). */
+/* Define to 1 if you have the 'curl' library (-lcurl). */
 #undef HAVE_LIBCURL
 
-/* Define to 1 if you have the `lz4' library (-llz4). */
+/* Define to 1 if you have the 'lz4' library (-llz4). */
 #undef HAVE_LIBLZ4
 
-/* Define to 1 if you have the `zstd' library (-lzstd). */
+/* Define to 1 if you have the 'zstd' library (-lzstd). */
 #undef HAVE_LIBZSTD
 
 /* Define to 1 if you have the <stdint.h> header file. */
@@ -91,10 +97,10 @@
 /* Base URL for statistics collection and update checks */
 #undef REPORTS_BASE_URL
 
-/* The size of `void *', as computed by sizeof. */
+/* The size of 'void *', as computed by sizeof. */
 #undef SIZEOF_VOID_P
 
-/* Define to 1 if all of the C90 standard headers exist (not just the ones
+/* Define to 1 if all of the C89 standard headers exist (not just the ones
    required in a freestanding environment). This macro is provided for
    backward compatibility; new code need not use it. */
 #undef STDC_HEADERS

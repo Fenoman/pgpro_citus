@@ -45,6 +45,23 @@ SHLIB_LINK = $(libpq)
 
 include $(citus_top_builddir)/Makefile.global
 
+# GCC 13 can ICE when PostgreSQL's inherited build flags enable LTO.
+# Keep the workaround local to the Citus shared libraries and make it opt-in
+# so unaffected Linux builds retain their original optimization setup.
+CITUS_DISABLE_LTO ?= 0
+
+ifeq ($(CITUS_DISABLE_LTO),1)
+LTO_FILTER_PATTERNS = -flto -flto=% -ffat-lto-objects
+
+override CFLAGS := $(filter-out $(LTO_FILTER_PATTERNS),$(CFLAGS)) -fno-lto
+override CXXFLAGS := $(filter-out $(LTO_FILTER_PATTERNS),$(CXXFLAGS)) -fno-lto
+override CFLAGS_SL := $(filter-out $(LTO_FILTER_PATTERNS),$(CFLAGS_SL))
+override LDFLAGS := $(filter-out $(LTO_FILTER_PATTERNS),$(LDFLAGS)) -fno-lto
+override LDFLAGS_SL := $(filter-out $(LTO_FILTER_PATTERNS),$(LDFLAGS_SL))
+override BITCODE_CFLAGS := $(filter-out $(LTO_FILTER_PATTERNS),$(BITCODE_CFLAGS)) -fno-lto
+override SHLIB_LINK := $(filter-out $(LTO_FILTER_PATTERNS),$(SHLIB_LINK))
+endif
+
 # make sure citus_version.o is recompiled whenever any change is made to the binary or any
 # other artifact being installed to reflect the correct gitref for every build
 CITUS_VERSION_INVALIDATE := $(filter-out utils/citus_version.o,$(OBJS))

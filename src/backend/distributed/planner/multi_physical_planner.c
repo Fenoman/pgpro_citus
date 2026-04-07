@@ -912,8 +912,8 @@ WrapUngroupedVarsInAnyValueAggregate(Node *expression, List *groupClauseList,
 	MemoryContext nodeContext = GetMemoryChunkContext(expression);
 	MemoryContext oldContext = MemoryContextSwitchTo(nodeContext);
 
-	Node *result = expression_tree_mutator(expression, AddAnyValueAggregates,
-										   &context);
+	Node *result = expression_tree_mutator_compat(expression, AddAnyValueAggregates,
+												  &context);
 
 	MemoryContextSwitchTo(oldContext);
 
@@ -1009,7 +1009,7 @@ AddAnyValueAggregates(Node *node, AddAnyValueAggregatesContext *context)
 		}
 	}
 
-	return expression_tree_mutator(node, AddAnyValueAggregates, context);
+	return expression_tree_mutator_compat(node, AddAnyValueAggregates, context);
 }
 
 
@@ -5882,7 +5882,7 @@ AdjustImproperForDeparseNodes(Node *inputNode, void *context)
 										   NULL, QTW_DONT_COPY_QUERY);
 	}
 
-	return expression_tree_mutator(inputNode, AdjustImproperForDeparseNodes, NULL);
+	return expression_tree_mutator_compat(inputNode, AdjustImproperForDeparseNodes, NULL);
 }
 
 
