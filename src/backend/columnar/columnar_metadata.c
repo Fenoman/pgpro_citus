@@ -107,7 +107,7 @@ static StripeMetadata * UpdateStripeMetadataRow(uint64 storageId, uint64 stripeI
 static List * ReadDataFileStripeList(uint64 storageId, Snapshot snapshot);
 static StripeMetadata * BuildStripeMetadata(Relation columnarStripes,
 											HeapTuple heapTuple);
-static bool StripeMetadataXminAborted(HeapTupleHeader tupleHeader);
+static bool StripeMetadataXminAborted(HeapTuple heapTuple);
 static uint32 * ReadChunkGroupRowCounts(uint64 storageId, uint64 stripe, uint32
 										chunkGroupCount, Snapshot snapshot);
 static Oid ColumnarStorageIdSequenceRelationId(void);
@@ -1590,8 +1590,8 @@ BuildStripeMetadata(Relation columnarStripes, HeapTuple heapTuple)
 	 * have been flushed already. For this reason, we don't care about
 	 * subtransaction id here.
 	 */
-	TransactionId entryXmin = HeapTupleHeaderGetXmin(heapTuple->t_data);
-	stripeMetadata->aborted = StripeMetadataXminAborted(heapTuple->t_data);
+	TransactionId entryXmin = HeapTupleGetXminCompat(heapTuple);
+	stripeMetadata->aborted = StripeMetadataXminAborted(heapTuple);
 	stripeMetadata->insertedByCurrentXact =
 		TransactionIdIsCurrentTransactionId(entryXmin);
 
@@ -1606,8 +1606,10 @@ BuildStripeMetadata(Relation columnarStripes, HeapTuple heapTuple)
  * given tuple aborted.
  */
 static bool
-StripeMetadataXminAborted(HeapTupleHeader tupleHeader)
+StripeMetadataXminAborted(HeapTuple heapTuple)
 {
+	HeapTupleHeader tupleHeader = heapTuple->t_data;
+
 	/*
 	 * The tuple header status bits are authoritative. Check them before
 	 * consulting pg_xact, since the segment for an old XID may have already
@@ -1623,7 +1625,7 @@ StripeMetadataXminAborted(HeapTupleHeader tupleHeader)
 		return false;
 	}
 
-	TransactionId entryXmin = HeapTupleHeaderGetXmin(tupleHeader);
+	TransactionId entryXmin = HeapTupleGetXminCompat(heapTuple);
 
 	return !TransactionIdIsInProgress(entryXmin) &&
 		   TransactionIdDidAbort(entryXmin);
@@ -1637,12 +1639,14 @@ StripeMetadataXminAborted(HeapTupleHeader tupleHeader)
 Datum
 test_columnar_metadata_xmin_aborted(PG_FUNCTION_ARGS)
 {
-	TransactionId entryXmin = PG_GETARG_UINT32(0);
+	TransactionId entryXmin = PG_GETARG_TRANSACTIONID(0);
 	bool xminCommitted = PG_GETARG_BOOL(1);
 	bool xminInvalid = PG_GETARG_BOOL(2);
 	HeapTupleHeaderData tupleHeader = { 0 };
+	HeapTupleData tuple = { 0 };
 
-	HeapTupleHeaderSetXmin(&tupleHeader, entryXmin);
+	tuple.t_data = &tupleHeader;
+	HeapTupleSetXminCompat(&tuple, entryXmin);
 	if (xminCommitted)
 	{
 		tupleHeader.t_infomask |= HEAP_XMIN_COMMITTED;
@@ -1652,7 +1656,7 @@ test_columnar_metadata_xmin_aborted(PG_FUNCTION_ARGS)
 		tupleHeader.t_infomask |= HEAP_XMIN_INVALID;
 	}
 
-	PG_RETURN_BOOL(StripeMetadataXminAborted(&tupleHeader));
+	PG_RETURN_BOOL(StripeMetadataXminAborted(&tuple));
 }
 
 

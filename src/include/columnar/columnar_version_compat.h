@@ -19,6 +19,8 @@
 
 #include "access/htup_details.h"
 
+#include "citus_feature_compat.h"
+
 
 #define ACLCHECK_OBJECT_TABLE OBJECT_TABLE
 

@@ -1694,12 +1694,12 @@ ReparameterizeMutator(Node *node, RelOptInfo *child_rel)
 	{
 		RestrictInfo *rinfo = castNode(RestrictInfo, node);
 		rinfo = copyObject(rinfo);
-		rinfo->clause = (Expr *) expression_tree_mutator(
+		rinfo->clause = (Expr *) expression_tree_mutator_compat(
 			(Node *) rinfo->clause, ReparameterizeMutator, (void *) child_rel);
 		return (Node *) rinfo;
 	}
-	return expression_tree_mutator(node, ReparameterizeMutator,
-								   (void *) child_rel);
+	return expression_tree_mutator_compat(node, ReparameterizeMutator,
+										  (void *) child_rel);
 }
 
 
@@ -1776,7 +1776,8 @@ EvalParamsMutator(Node *node, ExprContext *econtext)
 								  typByVal);
 	}
 
-	return expression_tree_mutator(node, EvalParamsMutator, (void *) econtext);
+	return expression_tree_mutator_compat(node, EvalParamsMutator,
+										  (void *) econtext);
 }
 
 
