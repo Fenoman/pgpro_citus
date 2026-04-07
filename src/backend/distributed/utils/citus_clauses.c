@@ -150,9 +150,9 @@ PartiallyEvaluateExpression(Node *expression,
 		 */
 		if (!ShouldEvaluateExpression((Expr *) expression))
 		{
-			return (Node *) expression_tree_mutator(expression,
-													PartiallyEvaluateExpression,
-													coordinatorEvaluationContext);
+			return (Node *) expression_tree_mutator_compat(expression,
+														   PartiallyEvaluateExpression,
+														   coordinatorEvaluationContext);
 		}
 
 		if (FindNodeMatchingCheckFunction(expression, IsVariableExpression))
@@ -168,9 +168,9 @@ PartiallyEvaluateExpression(Node *expression,
 			 * value. An exception is function calls that call another stable function
 			 * that should not be re-evaluated, such as now().
 			 */
-			return (Node *) expression_tree_mutator(expression,
-													PartiallyEvaluateExpression,
-													coordinatorEvaluationContext);
+			return (Node *) expression_tree_mutator_compat(expression,
+														   PartiallyEvaluateExpression,
+														   coordinatorEvaluationContext);
 		}
 
 		return (Node *) citus_evaluate_expr((Expr *) expression,
@@ -201,9 +201,9 @@ PartiallyEvaluateExpression(Node *expression,
 	}
 	else
 	{
-		return (Node *) expression_tree_mutator(expression,
-												PartiallyEvaluateExpression,
-												coordinatorEvaluationContext);
+		return (Node *) expression_tree_mutator_compat(expression,
+													   PartiallyEvaluateExpression,
+													   coordinatorEvaluationContext);
 	}
 
 	return expression;

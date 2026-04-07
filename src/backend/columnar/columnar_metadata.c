@@ -1588,7 +1588,7 @@ BuildStripeMetadata(Relation columnarStripes, HeapTuple heapTuple)
 	 * have been flushed already. For this reason, we don't care about
 	 * subtransaction id here.
 	 */
-	TransactionId entryXmin = HeapTupleHeaderGetXmin(heapTuple->t_data);
+	TransactionId entryXmin = HeapTupleGetXminCompat(heapTuple);
 	stripeMetadata->aborted = !TransactionIdIsInProgress(entryXmin) &&
 							  TransactionIdDidAbort(entryXmin);
 	stripeMetadata->insertedByCurrentXact =

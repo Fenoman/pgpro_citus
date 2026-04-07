@@ -24,6 +24,7 @@
 #include "tcop/tcopprot.h"
 
 #include "pg_version_compat.h"
+#include "citus_feature_compat.h"
 
 #include "distributed/citus_ruleutils.h"
 #include "distributed/citus_safe_lib.h"

@@ -131,6 +131,68 @@ AC_DEFINE_UNQUOTED(CITUS_VERSION_STR,
 POSTGRES_SRCDIR=$(grep ^abs_top_srcdir $(dirname $($PG_CONFIG --pgxs))/../Makefile.global|cut -d ' ' -f3-)
 POSTGRES_BUILDDIR=$(grep ^abs_top_builddir $(dirname $($PG_CONFIG --pgxs))/../Makefile.global|cut -d ' ' -f3-)
 
+# Compile-time feature detection for downstream PostgreSQL API drift.
+# These probes intentionally test the headers/compiler of the target
+# PostgreSQL installation instead of inferring behavior from PG_VERSION_NUM.
+PG_SERVER_CPPFLAGS="-I$($PG_CONFIG --includedir-server) $($PG_CONFIG --cppflags)"
+PG_SERVER_CFLAGS="$($PG_CONFIG --cflags)"
+
+citusac_save_CPPFLAGS=$CPPFLAGS
+citusac_save_CFLAGS=$CFLAGS
+CPPFLAGS="$CPPFLAGS $PG_SERVER_CPPFLAGS"
+CFLAGS="$CFLAGS $PG_SERVER_CFLAGS"
+
+AC_CACHE_CHECK([whether expression_tree_mutator supports traversal flags],
+               [citusac_cv_expression_tree_mutator_traversal_flags],
+               [AC_COMPILE_IFELSE(
+                  [AC_LANG_PROGRAM([[
+#include "postgres.h"
+#include "nodes/nodeFuncs.h"
+
+static Node *
+expression_tree_mutator_traversal_flags_test(Node *node, void *context)
+{
+	return node;
+}
+                  ]], [[
+Node *node = NULL;
+(void) expression_tree_mutator(node,
+							   expression_tree_mutator_traversal_flags_test,
+							   NULL,
+							   0);
+                  ]])],
+                  [citusac_cv_expression_tree_mutator_traversal_flags=yes],
+                  [citusac_cv_expression_tree_mutator_traversal_flags=no])])
+
+if test x"$citusac_cv_expression_tree_mutator_traversal_flags" = x"yes"; then
+  AC_DEFINE([HAVE_EXPRESSION_TREE_MUTATOR_TRAVERSAL_FLAGS], 1,
+            [Define to 1 if expression_tree_mutator accepts traversal flags.])
+fi
+
+AC_CACHE_CHECK([whether HeapTupleGetXmin is available],
+               [citusac_cv_have_heaptuple_getxmin],
+               [citusac_save_CFLAGS=$CFLAGS
+                CFLAGS="$CFLAGS -Werror=implicit-function-declaration"
+                AC_COMPILE_IFELSE(
+                  [AC_LANG_PROGRAM([[
+#include "postgres.h"
+#include "access/htup_details.h"
+                  ]], [[
+HeapTupleData tuple = { 0 };
+(void) HeapTupleGetXmin(&tuple);
+                  ]])],
+                  [citusac_cv_have_heaptuple_getxmin=yes],
+                  [citusac_cv_have_heaptuple_getxmin=no])
+                CFLAGS=$citusac_save_CFLAGS])
+
+if test x"$citusac_cv_have_heaptuple_getxmin" = x"yes"; then
+  AC_DEFINE([HAVE_HEAPTUPLE_GETXMIN], 1,
+            [Define to 1 if HeapTupleGetXmin is available.])
+fi
+
+CPPFLAGS=$citusac_save_CPPFLAGS
+CFLAGS=$citusac_save_CFLAGS
+
 
 # check for a number of CFLAGS that make development easier
 
