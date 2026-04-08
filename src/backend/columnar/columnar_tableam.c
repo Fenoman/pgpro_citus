@@ -19,6 +19,7 @@
 #include "catalog/namespace.h"
 #include "catalog/objectaccess.h"
 #include "catalog/pg_am.h"
+#include "catalog/pg_class.h"
 #include "catalog/pg_extension.h"
 #include "catalog/pg_publication.h"
 #include "catalog/pg_trigger.h"
@@ -2392,22 +2393,38 @@ ColumnarSupportsIndexAM(char *indexAMName)
 /*
  * IsColumnarTableAmTable returns true if relation has columnar_tableam
  * access method. This can be called before extension creation.
+ *
+ * Use syscache lookups instead of opening the relation so planner hooks can
+ * cheaply reject heap-only relations.
  */
 bool
 IsColumnarTableAmTable(Oid relationId)
 {
+	Oid columnarTableAmOid = InvalidOid;
+	HeapTuple relationTuple = NULL;
+	Form_pg_class relationForm = NULL;
+	bool result = false;
+
 	if (!OidIsValid(relationId))
 	{
 		return false;
 	}
 
-	/*
-	 * Lock relation to prevent it from being dropped &
-	 * avoid race conditions.
-	 */
-	Relation rel = relation_open(relationId, AccessShareLock);
-	bool result = rel->rd_tableam == GetColumnarTableAmRoutine();
-	relation_close(rel, NoLock);
+	columnarTableAmOid = get_table_am_oid(COLUMNAR_AM_NAME, true);
+	if (!OidIsValid(columnarTableAmOid))
+	{
+		return false;
+	}
+
+	relationTuple = SearchSysCache1(RELOID, ObjectIdGetDatum(relationId));
+	if (!HeapTupleIsValid(relationTuple))
+	{
+		return false;
+	}
+
+	relationForm = (Form_pg_class) GETSTRUCT(relationTuple);
+	result = relationForm->relam == columnarTableAmOid;
+	ReleaseSysCache(relationTuple);
 
 	return result;
 }

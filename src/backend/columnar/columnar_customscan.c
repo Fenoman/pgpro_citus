@@ -287,67 +287,62 @@ ColumnarSetRelPathlistHook(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	 * If that is the case we want to insert an extra path that pushes down the projection
 	 * into the scan of the table to minimize the data read.
 	 */
-	Relation relation = RelationIdGetRelation(rte->relid);
-	if (!RelationIsValid(relation))
+	if (!IsColumnarTableAmTable(rte->relid))
 	{
-		ereport(ERROR, (errmsg("could not open relation with OID %u", rte->relid)));
+		return;
 	}
 
-	if (relation->rd_tableam == GetColumnarTableAmRoutine())
+	if (rte->tablesample != NULL)
 	{
-		if (rte->tablesample != NULL)
-		{
-			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							errmsg("sample scans not supported on columnar tables")));
-		}
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("sample scans not supported on columnar tables")));
+	}
 
-		if (list_length(rel->partial_pathlist) != 0)
-		{
-			/*
-			 * Parallel scans on columnar tables are already discardad by
-			 * ColumnarGetRelationInfoHook but be on the safe side.
-			 */
-			elog(ERROR, "parallel scans on columnar are not supported");
-		}
+	if (list_length(rel->partial_pathlist) != 0)
+	{
+		/*
+		 * Parallel scans on columnar tables are already discardad by
+		 * ColumnarGetRelationInfoHook but be on the safe side.
+		 */
+		elog(ERROR, "parallel scans on columnar are not supported");
+	}
+
+	/*
+	 * There are cases where IndexPath is normally more preferrable over
+	 * SeqPath for heapAM but not for columnarAM. In such cases, an
+	 * IndexPath could wrongly dominate a SeqPath based on the costs
+	 * estimated by postgres earlier. For this reason, here we manually
+	 * create a SeqPath, estimate the cost based on columnarAM and append
+	 * to pathlist.
+	 *
+	 * Before doing that, we first re-cost all the existing paths so that
+	 * add_path makes correct cost comparisons when appending our SeqPath.
+	 */
+	CostColumnarPaths(root, rel, rte->relid);
+
+	Path *seqPath = CreateColumnarSeqScanPath(root, rel, rte->relid);
+	add_path(rel, seqPath);
+
+	if (EnableColumnarCustomScan)
+	{
+		ereport(DEBUG1, (errmsg("pathlist hook for columnar table am")));
 
 		/*
-		 * There are cases where IndexPath is normally more preferrable over
-		 * SeqPath for heapAM but not for columnarAM. In such cases, an
-		 * IndexPath could wrongly dominate a SeqPath based on the costs
-		 * estimated by postgres earlier. For this reason, here we manually
-		 * create a SeqPath, estimate the cost based on columnarAM and append
-		 * to pathlist.
+		 * When columnar custom scan is enabled (columnar.enable_custom_scan),
+		 * we only consider ColumnarScanPath's & IndexPath's. For this reason,
+		 * we remove other paths and re-estimate IndexPath costs to make accurate
+		 * comparisons between them.
 		 *
-		 * Before doing that, we first re-cost all the existing paths so that
-		 * add_path makes correct cost comparisons when appending our SeqPath.
+		 * Even more, we might calculate an equal cost for a
+		 * ColumnarCustomScan and a SeqPath if we are reading all columns
+		 * of given table since we don't consider chunk group filtering
+		 * when costing ColumnarCustomScan.
+		 * In that case, if we don't remove SeqPath's, we might wrongly choose
+		 * SeqPath thinking that its cost would be equal to ColumnarCustomScan.
 		 */
-		CostColumnarPaths(root, rel, rte->relid);
-
-		Path *seqPath = CreateColumnarSeqScanPath(root, rel, rte->relid);
-		add_path(rel, seqPath);
-
-		if (EnableColumnarCustomScan)
-		{
-			ereport(DEBUG1, (errmsg("pathlist hook for columnar table am")));
-
-			/*
-			 * When columnar custom scan is enabled (columnar.enable_custom_scan),
-			 * we only consider ColumnarScanPath's & IndexPath's. For this reason,
-			 * we remove other paths and re-estimate IndexPath costs to make accurate
-			 * comparisons between them.
-			 *
-			 * Even more, we might calculate an equal cost for a
-			 * ColumnarCustomScan and a SeqPath if we are reading all columns
-			 * of given table since we don't consider chunk group filtering
-			 * when costing ColumnarCustomScan.
-			 * In that case, if we don't remove SeqPath's, we might wrongly choose
-			 * SeqPath thinking that its cost would be equal to ColumnarCustomScan.
-			 */
-			RemovePathsByPredicate(rel, IsNotIndexPath);
-			AddColumnarScanPaths(root, rel, rte);
-		}
+		RemovePathsByPredicate(rel, IsNotIndexPath);
+		AddColumnarScanPaths(root, rel, rte);
 	}
-	RelationClose(relation);
 }
 
 
