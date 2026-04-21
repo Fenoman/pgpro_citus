@@ -1626,6 +1626,10 @@ StripeMetadataXminAborted(HeapTuple heapTuple)
 	}
 
 	TransactionId entryXmin = HeapTupleGetXminCompat(heapTuple);
+	if (!TransactionIdIsNormal(entryXmin))
+	{
+		return false;
+	}
 
 	return !TransactionIdIsInProgress(entryXmin) &&
 		   TransactionIdDidAbort(entryXmin);
