@@ -107,6 +107,8 @@ static StripeMetadata * UpdateStripeMetadataRow(uint64 storageId, uint64 stripeI
 static List * ReadDataFileStripeList(uint64 storageId, Snapshot snapshot);
 static StripeMetadata * BuildStripeMetadata(Relation columnarStripes,
 											HeapTuple heapTuple);
+static bool StripeMetadataXminDidAbort(HeapTuple heapTuple,
+									   TransactionId entryXmin);
 static uint32 * ReadChunkGroupRowCounts(uint64 storageId, uint64 stripe, uint32
 										chunkGroupCount, Snapshot snapshot);
 static Oid ColumnarStorageIdSequenceRelationId(void);
@@ -1588,15 +1590,49 @@ BuildStripeMetadata(Relation columnarStripes, HeapTuple heapTuple)
 	 * have been flushed already. For this reason, we don't care about
 	 * subtransaction id here.
 	 */
-	TransactionId entryXmin = HeapTupleGetXminCompat(heapTuple);
-	stripeMetadata->aborted = !TransactionIdIsInProgress(entryXmin) &&
-							  TransactionIdDidAbort(entryXmin);
+	TransactionId entryXmin = HeapTupleHeaderGetXmin(heapTuple->t_data);
+	stripeMetadata->aborted = StripeMetadataXminDidAbort(heapTuple, entryXmin);
 	stripeMetadata->insertedByCurrentXact =
 		TransactionIdIsCurrentTransactionId(entryXmin);
 
 	CheckStripeMetadataConsistency(stripeMetadata);
 
 	return stripeMetadata;
+}
+
+
+/*
+ * StripeMetadataXminDidAbort returns whether the stripe metadata tuple was
+ * inserted by an aborted transaction.
+ *
+ * A frozen or already-hinted tuple must not consult pg_xact.  The original xmin
+ * can be old enough that the corresponding pg_xact segment has been truncated,
+ * and trying to resolve it via TransactionIdDidAbort would error out while
+ * scanning otherwise valid columnar data.
+ */
+static bool
+StripeMetadataXminDidAbort(HeapTuple heapTuple, TransactionId entryXmin)
+{
+	HeapTupleHeader tupleHeader = heapTuple->t_data;
+
+	if (HeapTupleHeaderXminFrozen(tupleHeader) ||
+		HeapTupleHeaderXminCommitted(tupleHeader))
+	{
+		return false;
+	}
+
+	if (HeapTupleHeaderXminInvalid(tupleHeader))
+	{
+		return true;
+	}
+
+	if (!TransactionIdIsNormal(entryXmin) ||
+		TransactionIdIsInProgress(entryXmin))
+	{
+		return false;
+	}
+
+	return TransactionIdDidAbort(entryXmin);
 }
 
 

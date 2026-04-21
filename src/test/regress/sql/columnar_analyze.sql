@@ -17,3 +17,11 @@ INSERT INTO test_analyze SELECT floor(i / 2), floor(i / 10)::text, 5 FROM genera
 
 ANALYZE test_analyze;
 DROP TABLE test_analyze;
+
+-- ANALYZE should not consult pg_xact for frozen columnar stripe metadata
+CREATE TABLE test_analyze_frozen_stripes(a int) USING columnar;
+INSERT INTO test_analyze_frozen_stripes SELECT i FROM generate_series(1, 1000) i;
+VACUUM FREEZE columnar_internal.stripe;
+ANALYZE test_analyze_frozen_stripes;
+SELECT count(*) FROM test_analyze_frozen_stripes;
+DROP TABLE test_analyze_frozen_stripes;
