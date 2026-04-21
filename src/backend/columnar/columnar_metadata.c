@@ -1454,6 +1454,9 @@ UpdateStripeMetadataRow(uint64 storageId, uint64 stripeId, uint64 fileOffset,
 							   storageId, stripeId)));
 	}
 
+	StripeMetadata *modifiedStripeMetadata = BuildStripeMetadata(columnarStripes,
+																 tuple);
+
 	/*
 	 * systable_inplace_update_finish already doesn't allow changing size of the original
 	 * tuple, so we don't allow setting any Datum's to NULL values.
@@ -1481,8 +1484,16 @@ UpdateStripeMetadataRow(uint64 storageId, uint64 stripeId, uint64 fileOffset,
 
 	systable_inplace_update_finish(state, tuple);
 
-	StripeMetadata *modifiedStripeMetadata = BuildStripeMetadata(columnarStripes,
-																 tuple);
+	/*
+	 * heap_modify_tuple() returns a composite-datum tuple.  Its first header
+	 * bytes store the varlena length rather than a valid xmin, so keep the
+	 * transaction state from the real heap tuple and only apply changed fields.
+	 */
+	modifiedStripeMetadata->fileOffset = fileOffset;
+	modifiedStripeMetadata->dataLength = dataLength;
+	modifiedStripeMetadata->rowCount = rowCount;
+	modifiedStripeMetadata->chunkCount = chunkCount;
+	CheckStripeMetadataConsistency(modifiedStripeMetadata);
 
 	CommandCounterIncrement();
 
