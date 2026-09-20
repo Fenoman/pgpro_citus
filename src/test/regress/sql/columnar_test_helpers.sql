@@ -14,7 +14,7 @@ CREATE OR REPLACE FUNCTION columnar_storage_info(
     reserved_row_number OUT int8,
     reserved_offset OUT int8)
   STRICT
-  LANGUAGE c AS 'citus', $$columnar_storage_info$$;
+  LANGUAGE c AS 'citus_columnar', $$columnar_storage_info$$;
 
 CREATE FUNCTION compression_type_supported(type text) RETURNS boolean
 AS $$
@@ -79,7 +79,7 @@ CREATE OR REPLACE FUNCTION columnar_store_memory_stats(
 		          OUT WriteStateContext BIGINT)
     RETURNS RECORD
     LANGUAGE C STRICT VOLATILE
-    AS 'citus', $$columnar_store_memory_stats$$;
+    AS 'citus_columnar', $$columnar_store_memory_stats$$;
 
 CREATE FUNCTION top_memory_context_usage()
 	RETURNS BIGINT AS $$
@@ -174,7 +174,7 @@ CREATE OR REPLACE FUNCTION test_columnar_metadata_xmin_aborted(
     xmin_invalid boolean)
 RETURNS boolean
 LANGUAGE C STRICT
-AS 'citus', $$test_columnar_metadata_xmin_aborted$$;
+AS 'citus_columnar', $$test_columnar_metadata_xmin_aborted$$;
 
 -- XID 2147485000 belongs to pg_xact segment 0800, which does not exist in a
 -- fresh regression cluster. Tuple hint bits must therefore be sufficient to

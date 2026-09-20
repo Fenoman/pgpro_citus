@@ -60,6 +60,17 @@ SELECT TopMemoryContext as top_post,
 	   WriteStateContext write_post
 FROM columnar_test_helpers.columnar_store_memory_stats() \gset
 
+-- inserting another bunch of rows should not grow top memory context
+INSERT INTO t
+ SELECT i, 'last batch', 0 /* no need to record memusage per row */
+ FROM generate_series(1, 50000) i;
+
+-- Use the same measurement query before evaluating assertions: the assertions
+-- themselves populate backend caches and must not count as insert memory growth.
+SELECT TopMemoryContext as top_final,
+	   WriteStateContext write_final
+FROM columnar_test_helpers.columnar_store_memory_stats() \gset
+
 \x
 SELECT (1.0 * :top2/:top1 BETWEEN 0.99 AND 1.01) AS top_growth_ok,
 	   (1.0 * :xact1/:xact0 BETWEEN 0.99 AND 1.01) AND
@@ -68,15 +79,7 @@ SELECT (1.0 * :top2/:top1 BETWEEN 0.99 AND 1.01) AS top_growth_ok,
 	   (1.0 * :write2/:write0 BETWEEN 0.99 AND 1.01) AS write_growth_ok,
 	   :write_pre = 0 AND :write_post = 0 AS write_clear_outside_xact;
 
--- inserting another bunch of rows should not grow top memory context
-INSERT INTO t
- SELECT i, 'last batch', 0 /* no need to record memusage per row */
- FROM generate_series(1, 50000) i;
-
--- FIXME: Somehow, after we stopped creating citus extension for columnar tests,
---        we started observing %38 growth in TopMemoryContext here.
-SELECT CASE WHEN 1.0 * TopMemoryContext / :top_post BETWEEN 0.98 AND 1.40 THEN 1 ELSE 1.0 * TopMemoryContext / :top_post END AS top_growth
-FROM columnar_test_helpers.columnar_store_memory_stats();
+SELECT CASE WHEN 1.0 * :top_final / :top_post BETWEEN 0.98 AND 1.02 THEN 1 ELSE 1.0 * :top_final / :top_post END AS top_growth;
 
 -- before this change, max mem usage while executing inserts was 28MB and
 -- with this change it's less than 9MB.

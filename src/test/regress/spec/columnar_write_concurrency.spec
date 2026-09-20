@@ -4,7 +4,7 @@ setup
 
     CREATE OR REPLACE FUNCTION columnar_relation_storageid(relid oid) RETURNS bigint
         LANGUAGE C STABLE STRICT
-        AS 'citus', $$columnar_relation_storageid$$;
+        AS 'citus_columnar', $$columnar_relation_storageid$$;
 }
 
 teardown
