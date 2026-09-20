@@ -1,0 +1,136 @@
+CREATE SCHEMA columnar_heap_hooks;
+SET search_path TO columnar_heap_hooks, public;
+CREATE TABLE heap_table (id int, payload text) USING heap;
+INSERT INTO heap_table VALUES (1, 'one'), (2, 'two');
+-- Columnar must not add relation locks to unrelated ALTER TABLE commands.
+BEGIN;
+ALTER TABLE heap_table OWNER TO CURRENT_USER;
+SELECT NOT EXISTS (
+    SELECT FROM pg_locks
+    WHERE pid = pg_backend_pid() AND relation = 'heap_table'::regclass
+      AND mode = 'AccessShareLock'
+) AS no_columnar_lock;
+ no_columnar_lock 
+------------------
+ t
+(1 row)
+
+COMMIT;
+CREATE TABLE drop_heap (id int) USING heap;
+SELECT 'drop_heap'::regclass::oid AS drop_heap_oid \gset
+BEGIN;
+DROP TABLE drop_heap;
+SELECT NOT EXISTS (
+    SELECT FROM pg_locks
+    WHERE pid = pg_backend_pid() AND relation = :drop_heap_oid
+      AND mode = 'AccessShareLock'
+) AS no_columnar_lock;
+ no_columnar_lock 
+------------------
+ t
+(1 row)
+
+COMMIT;
+-- SPI reuses the utility trees. Stripping options must not modify cached trees.
+SET columnar.compression TO 'pglz';
+DO $$
+DECLARE
+    compression text;
+BEGIN
+    FOR iteration IN 1..3 LOOP
+        CREATE TEMP TABLE cached_heap USING heap AS SELECT * FROM heap_table;
+        ALTER TABLE cached_heap OWNER TO CURRENT_USER;
+        ALTER TABLE cached_heap ADD COLUMN extra int;
+        CREATE INDEX ON cached_heap (id);
+        DROP TABLE cached_heap;
+
+        CREATE TEMP TABLE cached_columnar (id int) USING columnar
+            WITH (columnar.compression = 'none');
+        SELECT o.compression INTO compression FROM columnar.options o
+            WHERE relation = 'cached_columnar'::regclass;
+        ASSERT compression = 'none', 'CREATE lost its cached columnar options';
+        ALTER TABLE cached_columnar SET (columnar.compression = 'pglz');
+        SELECT o.compression INTO compression FROM columnar.options o
+            WHERE relation = 'cached_columnar'::regclass;
+        ASSERT compression = 'pglz', 'ALTER lost its cached columnar options';
+        DROP TABLE cached_columnar;
+
+        CREATE TEMP TABLE cached_ctas USING columnar
+            WITH (columnar.compression = 'none') AS SELECT * FROM heap_table;
+        SELECT o.compression INTO compression FROM columnar.options o
+            WHERE relation = 'cached_ctas'::regclass;
+        ASSERT compression = 'none', 'CTAS lost its cached columnar options';
+        ASSERT (SELECT count(*) FROM cached_ctas) = 2, 'CTAS lost rows';
+        DROP TABLE cached_ctas;
+    END LOOP;
+END;
+$$;
+-- Unrelated ALTERs must remain valid on columnar tables too.
+CREATE TABLE columnar_table (id int) USING columnar
+    WITH (columnar.compression = 'none');
+INSERT INTO columnar_table VALUES (1), (2);
+ALTER TABLE columnar_table OWNER TO CURRENT_USER;
+ALTER TABLE columnar_table ADD COLUMN payload text DEFAULT 'columnar';
+SELECT h.id, h.payload, c.payload FROM heap_table h
+    JOIN columnar_table c USING (id) ORDER BY h.id;
+ id | payload | payload  
+----+---------+----------
+  1 | one     | columnar
+  2 | two     | columnar
+(2 rows)
+
+BEGIN;
+DROP TABLE columnar_table;
+ROLLBACK;
+SELECT count(*) AS rows_after_rollback FROM columnar_table;
+ rows_after_rollback 
+---------------------
+                   2
+(1 row)
+
+SELECT compression FROM columnar.options
+    WHERE relation = 'columnar_table'::regclass;
+ compression 
+-------------
+ none
+(1 row)
+
+-- Access method transitions still need columnar option processing and cleanup.
+ALTER TABLE columnar_table SET ACCESS METHOD heap;
+SELECT count(*) AS remaining_options FROM columnar.options
+    WHERE relation = 'columnar_table'::regclass;
+ remaining_options 
+-------------------
+                 0
+(1 row)
+
+ALTER TABLE columnar_table SET ACCESS METHOD columnar,
+    SET (columnar.compression = 'none');
+SELECT compression FROM columnar.options
+    WHERE relation = 'columnar_table'::regclass;
+ compression 
+-------------
+ none
+(1 row)
+
+SELECT count(*) AS rows_after_conversion FROM columnar_table;
+ rows_after_conversion 
+-----------------------
+                     2
+(1 row)
+
+SET default_table_access_method TO 'columnar';
+CREATE TEMP TABLE default_columnar AS SELECT * FROM heap_table;
+SELECT count(*) AS default_am_rows FROM default_columnar;
+ default_am_rows 
+-----------------
+               2
+(1 row)
+
+DROP TABLE default_columnar;
+RESET default_table_access_method;
+RESET columnar.compression;
+SET client_min_messages TO warning;
+DROP SCHEMA columnar_heap_hooks CASCADE;
+RESET client_min_messages;
+RESET search_path;

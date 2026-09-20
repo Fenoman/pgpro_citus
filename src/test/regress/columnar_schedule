@@ -29,6 +29,7 @@ test: columnar_join
 test: columnar_pg15
 test: columnar_trigger
 test: columnar_tableoptions
+test: columnar_heap_hooks
 test: columnar_recursive
 test: columnar_transactions
 test: columnar_matview

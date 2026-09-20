@@ -116,6 +116,7 @@ static void ColumnarTableAMObjectAccessHook(ObjectAccessType access, Oid classId
 											void *arg);
 static RangeVar * ColumnarProcessAlterTable(AlterTableStmt *alterTableStmt,
 											List **columnarOptions);
+static bool ColumnarUtilityStmtNeedsMutableTree(Node *parsetree);
 static void ColumnarProcessUtility(PlannedStmt *pstmt,
 								   const char *queryString,
 								   bool readOnlyTree,
@@ -2069,13 +2070,12 @@ static void
 ColumnarTableDropHook(Oid relid)
 {
 	/*
-	 * Lock relation to prevent it from being dropped and to avoid
-	 * race conditions in the next if block.
+	 * PostgreSQL holds the deletion lock before invoking the object access
+	 * hook. Reject other access methods before taking our additional lock.
 	 */
-	LockRelationOid(relid, AccessShareLock);
-
 	if (IsColumnarTableAmTable(relid))
 	{
+		LockRelationOid(relid, AccessShareLock);
 		CheckCitusColumnarVersion(ERROR);
 
 		/*
@@ -2234,6 +2234,51 @@ ColumnarProcessAlterTable(AlterTableStmt *alterTableStmt, List **columnarOptions
 
 
 /*
+ * Only these statements can have columnar options stripped from their trees.
+ * Other ALTER TABLE subcommands do not need columnar preprocessing either.
+ */
+static bool
+ColumnarUtilityStmtNeedsMutableTree(Node *parsetree)
+{
+	switch (nodeTag(parsetree))
+	{
+		case T_CreateStmt:
+		{
+			CreateStmt *stmt = castNode(CreateStmt, parsetree);
+			return stmt->accessMethod != NULL &&
+				   strcmp(stmt->accessMethod, COLUMNAR_AM_NAME) == 0;
+		}
+
+		case T_CreateTableAsStmt:
+		{
+			CreateTableAsStmt *stmt = castNode(CreateTableAsStmt, parsetree);
+			return stmt->into->accessMethod != NULL &&
+				   strcmp(stmt->into->accessMethod, COLUMNAR_AM_NAME) == 0;
+		}
+
+		case T_AlterTableStmt:
+		{
+			AlterTableStmt *stmt = castNode(AlterTableStmt, parsetree);
+			AlterTableCmd *cmd = NULL;
+			foreach_declared_ptr(cmd, stmt->cmds)
+			{
+				if (cmd->subtype == AT_SetRelOptions ||
+					cmd->subtype == AT_ResetRelOptions ||
+					cmd->subtype == AT_SetAccessMethod)
+				{
+					return true;
+				}
+			}
+			return false;
+		}
+
+		default:
+			return false;
+	}
+}
+
+
+/*
  * Utility hook for columnar tables.
  */
 static void
@@ -2246,12 +2291,15 @@ ColumnarProcessUtility(PlannedStmt *pstmt,
 					   DestReceiver *dest,
 					   QueryCompletion *completionTag)
 {
-	if (readOnlyTree)
+	Node *parsetree = pstmt->utilityStmt;
+	bool needsMutableTree = ColumnarUtilityStmtNeedsMutableTree(parsetree);
+
+	if (readOnlyTree && needsMutableTree)
 	{
 		pstmt = copyObject(pstmt);
+		parsetree = pstmt->utilityStmt;
+		readOnlyTree = false;
 	}
-
-	Node *parsetree = pstmt->utilityStmt;
 
 	RangeVar *columnarRangeVar = NULL;
 	List *columnarOptions = NIL;
@@ -2285,6 +2333,11 @@ ColumnarProcessUtility(PlannedStmt *pstmt,
 
 		case T_CreateStmt:
 		{
+			if (!needsMutableTree)
+			{
+				break;
+			}
+
 			CreateStmt *createStmt = castNode(CreateStmt, parsetree);
 			bool no_op = false;
 
@@ -2299,8 +2352,7 @@ ColumnarProcessUtility(PlannedStmt *pstmt,
 				no_op = OidIsValid(existing_relid);
 			}
 
-			if (!no_op && createStmt->accessMethod != NULL &&
-				!strcmp(createStmt->accessMethod, COLUMNAR_AM_NAME))
+			if (!no_op)
 			{
 				columnarRangeVar = createStmt->relation;
 				createStmt->options = ExtractColumnarRelOptions(createStmt->options,
@@ -2311,6 +2363,11 @@ ColumnarProcessUtility(PlannedStmt *pstmt,
 
 		case T_CreateTableAsStmt:
 		{
+			if (!needsMutableTree)
+			{
+				break;
+			}
+
 			CreateTableAsStmt *createTableAsStmt = castNode(CreateTableAsStmt, parsetree);
 			IntoClause *into = createTableAsStmt->into;
 			bool no_op = false;
@@ -2326,8 +2383,7 @@ ColumnarProcessUtility(PlannedStmt *pstmt,
 				no_op = OidIsValid(existing_relid);
 			}
 
-			if (!no_op && into->accessMethod != NULL &&
-				!strcmp(into->accessMethod, COLUMNAR_AM_NAME))
+			if (!no_op)
 			{
 				columnarRangeVar = into->rel;
 				into->options = ExtractColumnarRelOptions(into->options,
@@ -2338,9 +2394,12 @@ ColumnarProcessUtility(PlannedStmt *pstmt,
 
 		case T_AlterTableStmt:
 		{
-			AlterTableStmt *alterTableStmt = castNode(AlterTableStmt, parsetree);
-			columnarRangeVar = ColumnarProcessAlterTable(alterTableStmt,
-														 &columnarOptions);
+			if (needsMutableTree)
+			{
+				AlterTableStmt *alterTableStmt = castNode(AlterTableStmt, parsetree);
+				columnarRangeVar = ColumnarProcessAlterTable(alterTableStmt,
+															 &columnarOptions);
+			}
 			break;
 		}
 
@@ -2367,7 +2426,7 @@ ColumnarProcessUtility(PlannedStmt *pstmt,
 		CheckCitusColumnarAlterExtensionStmt(parsetree);
 	}
 
-	PrevProcessUtilityHook(pstmt, queryString, false, context,
+	PrevProcessUtilityHook(pstmt, queryString, readOnlyTree, context,
 						   params, queryEnv, dest, completionTag);
 
 	if (columnarOptions != NIL)
@@ -2399,18 +2458,9 @@ ColumnarSupportsIndexAM(char *indexAMName)
 bool
 IsColumnarTableAmTable(Oid relationId)
 {
-	Oid columnarTableAmOid = InvalidOid;
 	HeapTuple relationTuple = NULL;
-	Form_pg_class relationForm = NULL;
-	bool result = false;
 
 	if (!OidIsValid(relationId))
-	{
-		return false;
-	}
-
-	columnarTableAmOid = get_table_am_oid(COLUMNAR_AM_NAME, true);
-	if (!OidIsValid(columnarTableAmOid))
 	{
 		return false;
 	}
@@ -2421,11 +2471,16 @@ IsColumnarTableAmTable(Oid relationId)
 		return false;
 	}
 
-	relationForm = (Form_pg_class) GETSTRUCT(relationTuple);
-	result = relationForm->relam == columnarTableAmOid;
+	Oid tableAmOid = ((Form_pg_class) GETSTRUCT(relationTuple))->relam;
 	ReleaseSysCache(relationTuple);
 
-	return result;
+	/* Heap-only queries need no lookup of the columnar access method. */
+	if (tableAmOid == HEAP_TABLE_AM_OID || !OidIsValid(tableAmOid))
+	{
+		return false;
+	}
+
+	return tableAmOid == get_table_am_oid(COLUMNAR_AM_NAME, true);
 }
 
 
