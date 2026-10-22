@@ -277,7 +277,8 @@ StartRemoteTransactionBegin(struct MultiConnection *connection)
 
 		/* ... then append SAVEPOINT to enter this subxact */
 		appendStringInfo(beginAndSetDistributedTransactionId,
-						 "SAVEPOINT savepoint_%u;", subXactState->subId);
+						 "SAVEPOINT savepoint_" UINT64_FORMAT ";",
+						 (uint64) subXactState->subId);
 		transaction->lastQueuedSubXact = subXactState->subId;
 	}
 
@@ -1433,13 +1434,14 @@ StartRemoteTransactionSavepointBegin(MultiConnection *connection, SubTransaction
 	const bool raiseErrors = true;
 
 	/*
-	 * We need to allocate 31 bytes for command buffer (including '\0'):
+	 * We need to allocate 41 bytes for command buffer (including '\0'):
 	 *  - len("SAVEPOINT savepoint_") = 20
-	 *  - maximum length of str(subId) = 10
+	 *  - maximum length of str(subId) = 20, SubTransactionId is 64-bit on
+	 *    some PostgreSQL forks
 	 */
-	char savepointCommand[31];
-	SafeSnprintf(savepointCommand, sizeof(savepointCommand), "SAVEPOINT savepoint_%u",
-				 subId);
+	char savepointCommand[41];
+	SafeSnprintf(savepointCommand, sizeof(savepointCommand),
+				 "SAVEPOINT savepoint_" UINT64_FORMAT, (uint64) subId);
 
 	if (!SendRemoteCommand(connection, savepointCommand))
 	{
@@ -1479,13 +1481,14 @@ StartRemoteTransactionSavepointRelease(MultiConnection *connection,
 	const bool raiseErrors = true;
 
 	/*
-	 * We need to allocate 39 bytes for command buffer (including '\0'):
+	 * We need to allocate 49 bytes for command buffer (including '\0'):
 	 *  - len("RELEASE SAVEPOINT savepoint_") = 28
-	 *  - maximum length of str(subId) = 10
+	 *  - maximum length of str(subId) = 20, SubTransactionId is 64-bit on
+	 *    some PostgreSQL forks
 	 */
-	char savepointCommand[39];
+	char savepointCommand[49];
 	SafeSnprintf(savepointCommand, sizeof(savepointCommand),
-				 "RELEASE SAVEPOINT savepoint_%u", subId);
+				 "RELEASE SAVEPOINT savepoint_" UINT64_FORMAT, (uint64) subId);
 
 	if (!SendRemoteCommand(connection, savepointCommand))
 	{
@@ -1526,13 +1529,14 @@ StartRemoteTransactionSavepointRollback(MultiConnection *connection,
 	const bool raiseErrors = false;
 
 	/*
-	 * We need to allocate 43 bytes for command buffer (including '\0'):
+	 * We need to allocate 53 bytes for command buffer (including '\0'):
 	 *  - len("ROLLBACK TO SAVEPOINT savepoint_") = 32
-	 *  - maximum length of str(subId) = 10
+	 *  - maximum length of str(subId) = 20, SubTransactionId is 64-bit on
+	 *    some PostgreSQL forks
 	 */
-	char savepointCommand[43];
+	char savepointCommand[53];
 	SafeSnprintf(savepointCommand, sizeof(savepointCommand),
-				 "ROLLBACK TO SAVEPOINT savepoint_%u", subId);
+				 "ROLLBACK TO SAVEPOINT savepoint_" UINT64_FORMAT, (uint64) subId);
 
 	if (!SendRemoteCommand(connection, savepointCommand))
 	{

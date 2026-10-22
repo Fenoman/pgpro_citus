@@ -47,6 +47,19 @@
 #endif
 
 
+#ifdef HAVE_PARSE_ANALYZE_VARPARAMS_PARAM_NAMES
+#define parse_analyze_varparams_compat(parseTree, sourceText, paramTypes, \
+									   numParams, queryEnv) \
+	parse_analyze_varparams((parseTree), (sourceText), (paramTypes), \
+							(numParams), (queryEnv), NULL)
+#else
+#define parse_analyze_varparams_compat(parseTree, sourceText, paramTypes, \
+									   numParams, queryEnv) \
+	parse_analyze_varparams((parseTree), (sourceText), (paramTypes), \
+							(numParams), (queryEnv))
+#endif
+
+
 static inline TransactionId
 HeapTupleGetXminCompat(HeapTuple tuple)
 {
