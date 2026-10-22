@@ -55,6 +55,9 @@
 /* Define to 1 if you have the <memory.h> header file. */
 #undef HAVE_MEMORY_H
 
+/* Define to 1 if parse_analyze_varparams accepts parameter names. */
+#undef HAVE_PARSE_ANALYZE_VARPARAMS_PARAM_NAMES
+
 /* Define to 1 if you have the <stdint.h> header file. */
 #undef HAVE_STDINT_H
 

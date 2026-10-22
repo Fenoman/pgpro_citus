@@ -3917,7 +3917,7 @@ if test ${citusac_cv_have_heaptuple_getxmin+y}
 then :
   printf %s "(cached) " >&6
 else case e in #(
-  e) citusac_save_CFLAGS=$CFLAGS
+  e) citusac_getxmin_save_CFLAGS=$CFLAGS
                 CFLAGS="$CFLAGS -Werror=implicit-function-declaration"
                 cat confdefs.h - <<_ACEOF >conftest.$ac_ext
 /* end confdefs.h.  */
@@ -3944,7 +3944,7 @@ else case e in #(
 esac
 fi
 rm -f core conftest.err conftest.$ac_objext conftest.beam conftest.$ac_ext
-                CFLAGS=$citusac_save_CFLAGS ;;
+                CFLAGS=$citusac_getxmin_save_CFLAGS ;;
 esac
 fi
 { printf '%s\n' "$as_me:${as_lineno-$LINENO}: result: $citusac_cv_have_heaptuple_getxmin" >&5
@@ -3953,6 +3953,49 @@ printf '%s\n' "$citusac_cv_have_heaptuple_getxmin" >&6; }
 if test x"$citusac_cv_have_heaptuple_getxmin" = x"yes"; then
 
 printf '%s\n' "#define HAVE_HEAPTUPLE_GETXMIN 1" >>confdefs.h
+
+fi
+
+{ printf '%s\n' "$as_me:${as_lineno-$LINENO}: checking whether parse_analyze_varparams accepts parameter names" >&5
+printf %s "checking whether parse_analyze_varparams accepts parameter names... " >&6; }
+if test ${citusac_cv_parse_analyze_varparams_param_names+y}
+then :
+  printf %s "(cached) " >&6
+else case e in #(
+  e) cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+
+#include "postgres.h"
+#include "parser/analyze.h"
+
+int
+main (void)
+{
+
+Oid *paramTypes = NULL;
+int numParams = 0;
+(void) parse_analyze_varparams(NULL, "", &paramTypes, &numParams, NULL, NULL);
+
+  ;
+  return 0;
+}
+_ACEOF
+if ac_fn_c_try_compile "$LINENO"
+then :
+  citusac_cv_parse_analyze_varparams_param_names=yes
+else case e in #(
+  e) citusac_cv_parse_analyze_varparams_param_names=no ;;
+esac
+fi
+rm -f core conftest.err conftest.$ac_objext conftest.beam conftest.$ac_ext ;;
+esac
+fi
+{ printf '%s\n' "$as_me:${as_lineno-$LINENO}: result: $citusac_cv_parse_analyze_varparams_param_names" >&5
+printf '%s\n' "$citusac_cv_parse_analyze_varparams_param_names" >&6; }
+
+if test x"$citusac_cv_parse_analyze_varparams_param_names" = x"yes"; then
+
+printf '%s\n' "#define HAVE_PARSE_ANALYZE_VARPARAMS_PARAM_NAMES 1" >>confdefs.h
 
 fi
 

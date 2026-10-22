@@ -171,7 +171,7 @@ fi
 
 AC_CACHE_CHECK([whether HeapTupleGetXmin is available],
                [citusac_cv_have_heaptuple_getxmin],
-               [citusac_save_CFLAGS=$CFLAGS
+               [citusac_getxmin_save_CFLAGS=$CFLAGS
                 CFLAGS="$CFLAGS -Werror=implicit-function-declaration"
                 AC_COMPILE_IFELSE(
                   [AC_LANG_PROGRAM([[
@@ -183,11 +183,30 @@ HeapTupleData tuple = { 0 };
                   ]])],
                   [citusac_cv_have_heaptuple_getxmin=yes],
                   [citusac_cv_have_heaptuple_getxmin=no])
-                CFLAGS=$citusac_save_CFLAGS])
+                CFLAGS=$citusac_getxmin_save_CFLAGS])
 
 if test x"$citusac_cv_have_heaptuple_getxmin" = x"yes"; then
   AC_DEFINE([HAVE_HEAPTUPLE_GETXMIN], 1,
             [Define to 1 if HeapTupleGetXmin is available.])
+fi
+
+AC_CACHE_CHECK([whether parse_analyze_varparams accepts parameter names],
+               [citusac_cv_parse_analyze_varparams_param_names],
+               [AC_COMPILE_IFELSE(
+                  [AC_LANG_PROGRAM([[
+#include "postgres.h"
+#include "parser/analyze.h"
+                  ]], [[
+Oid *paramTypes = NULL;
+int numParams = 0;
+(void) parse_analyze_varparams(NULL, "", &paramTypes, &numParams, NULL, NULL);
+                  ]])],
+                  [citusac_cv_parse_analyze_varparams_param_names=yes],
+                  [citusac_cv_parse_analyze_varparams_param_names=no])])
+
+if test x"$citusac_cv_parse_analyze_varparams_param_names" = x"yes"; then
+  AC_DEFINE([HAVE_PARSE_ANALYZE_VARPARAMS_PARAM_NAMES], 1,
+            [Define to 1 if parse_analyze_varparams accepts parameter names.])
 fi
 
 CPPFLAGS=$citusac_save_CPPFLAGS
