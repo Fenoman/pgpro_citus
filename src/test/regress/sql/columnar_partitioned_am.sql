@@ -31,6 +31,12 @@ SELECT relation FROM columnar.options
 SELECT version_major FROM columnar_test_helpers.columnar_storage_info('child_1');
 SELECT version_major FROM columnar_test_helpers.columnar_storage_info('parent');
 
+-- columnar.storage lists the partitioned table without a storage id.
+SELECT relation, storage_id IS NOT NULL AS has_storage_id FROM columnar.storage
+    WHERE relation IN ('parent'::regclass, 'child_1'::regclass, 'child_2'::regclass)
+    ORDER BY relation;
+SELECT columnar.get_storage_id('parent'::regclass);
+
 -- Dropping the partitioned table removes the columnar metadata of its partitions.
 SELECT 'child_1'::regclass::oid AS child_1_oid, 'child_2'::regclass::oid AS child_2_oid \gset
 SELECT storage_id AS child_1_storage_id
@@ -54,6 +60,21 @@ SELECT c.relname, c.relkind, am.amname
 INSERT INTO converted SELECT generate_series(0, 199);
 SELECT count(*) FROM converted;
 DROP TABLE converted;
+
+-- A partitioned table has no storage to apply columnar storage parameters to,
+-- neither on CREATE nor with SET ACCESS METHOD in the same ALTER.
+CREATE TABLE parent_options (id int) PARTITION BY RANGE (id) USING columnar
+    WITH (columnar.compression = 'none');
+SELECT count(*) AS parent_options_tables FROM pg_class WHERE relname = 'parent_options';
+CREATE TABLE converted_options (id int) PARTITION BY RANGE (id);
+ALTER TABLE converted_options SET ACCESS METHOD columnar,
+    SET (columnar.compression = 'none');
+SELECT coalesce(am.amname, '-') AS access_method
+    FROM pg_class c LEFT JOIN pg_am am ON am.oid = c.relam
+    WHERE c.oid = 'converted_options'::regclass;
+SELECT count(*) AS converted_options_rows FROM columnar_internal.options
+    WHERE regclass = 'converted_options'::regclass;
+DROP TABLE converted_options;
 
 SET client_min_messages TO warning;
 DROP SCHEMA columnar_partitioned_am CASCADE;
