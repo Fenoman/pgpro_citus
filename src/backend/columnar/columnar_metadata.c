@@ -369,7 +369,18 @@ SetColumnarRelOptions(RangeVar *rv, List *reloptions)
 
 	Relation rel = relation_openrv(rv, AccessShareLock);
 	Oid relid = RelationGetRelid(rel);
+	char relationKind = rel->rd_rel->relkind;
 	relation_close(rel, NoLock);
+
+	/*
+	 * Options of a relation without storage, such as a partitioned table with
+	 * the columnar access method, would never be used and would outlive it.
+	 */
+	if (!RELKIND_HAS_TABLE_AM(relationKind))
+	{
+		ereport(ERROR,
+				(errmsg("columnar storage parameters specified on non-columnar table")));
+	}
 
 	/* get existing or default options */
 	if (!ReadColumnarOptions(relid, &options))
@@ -2107,7 +2118,8 @@ ColumnarMetadataNewStorageId()
 
 /*
  * columnar_relation_storageid returns storage id associated with the
- * given relation id, or -1 if there is no associated storage id yet.
+ * given relation id, or -1 if there is no associated storage id yet, or NULL
+ * for a partitioned table with the columnar access method.
  */
 Datum
 columnar_relation_storageid(PG_FUNCTION_ARGS)
@@ -2119,6 +2131,18 @@ columnar_relation_storageid(PG_FUNCTION_ARGS)
 	{
 		aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_TABLE,
 					   get_rel_name(relationId));
+	}
+
+	/*
+	 * columnar.storage lists every relation with the columnar access method.
+	 * A partitioned table can carry it since PG17 but has no storage, so it
+	 * gets no storage id instead of failing the whole view.
+	 */
+	if (relation->rd_rel->relkind == RELKIND_PARTITIONED_TABLE &&
+		relation->rd_rel->relam == get_table_am_oid(COLUMNAR_AM_NAME, false))
+	{
+		relation_close(relation, AccessShareLock);
+		PG_RETURN_NULL();
 	}
 
 	if (!IsColumnarTableAmTable(relationId))
