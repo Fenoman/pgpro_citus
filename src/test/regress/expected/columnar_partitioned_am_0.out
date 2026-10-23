@@ -1,0 +1,11 @@
+--
+-- COLUMNAR_PARTITIONED_AM
+-- Since PG17 a partitioned table can carry a table access method. It has no
+-- storage of its own, only its partitions are columnar tables.
+--
+SHOW server_version \gset
+SELECT substring(:'server_version', '\d+')::int >= 17 AS server_version_ge_17
+\gset
+\if :server_version_ge_17
+\else
+\q
