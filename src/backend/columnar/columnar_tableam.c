@@ -2450,7 +2450,8 @@ ColumnarSupportsIndexAM(char *indexAMName)
 
 /*
  * IsColumnarTableAmTable returns true if relation has columnar_tableam
- * access method. This can be called before extension creation.
+ * access method and storage of its own. This can be called before extension
+ * creation.
  *
  * Use syscache lookups instead of opening the relation so planner hooks can
  * cheaply reject heap-only relations.
@@ -2471,8 +2472,20 @@ IsColumnarTableAmTable(Oid relationId)
 		return false;
 	}
 
-	Oid tableAmOid = ((Form_pg_class) GETSTRUCT(relationTuple))->relam;
+	Form_pg_class relationForm = (Form_pg_class) GETSTRUCT(relationTuple);
+	char relationKind = relationForm->relkind;
+	Oid tableAmOid = relationForm->relam;
 	ReleaseSysCache(relationTuple);
+
+	/*
+	 * A partitioned table can carry the columnar access method since PG17, but
+	 * has no storage of its own. Like rd_tableam, only relation kinds with
+	 * table access method storage count.
+	 */
+	if (!RELKIND_HAS_TABLE_AM(relationKind))
+	{
+		return false;
+	}
 
 	/* Heap-only queries need no lookup of the columnar access method. */
 	if (tableAmOid == HEAP_TABLE_AM_OID || !OidIsValid(tableAmOid))
