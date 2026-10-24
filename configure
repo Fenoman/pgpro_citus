@@ -3999,6 +3999,49 @@ printf '%s\n' "#define HAVE_PARSE_ANALYZE_VARPARAMS_PARAM_NAMES 1" >>confdefs.h
 
 fi
 
+{ printf '%s\n' "$as_me:${as_lineno-$LINENO}: checking whether LocalPgBackendStatus points to its backend status" >&5
+printf %s "checking whether LocalPgBackendStatus points to its backend status... " >&6; }
+if test ${citusac_cv_local_backend_status_pointer+y}
+then :
+  printf %s "(cached) " >&6
+else case e in #(
+  e) cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+
+#include "postgres.h"
+#include "utils/backend_status.h"
+
+int
+main (void)
+{
+
+LocalPgBackendStatus localEntry = { 0 };
+PgBackendStatus *backendStatus = localEntry.backendStatus;
+(void) backendStatus;
+
+  ;
+  return 0;
+}
+_ACEOF
+if ac_fn_c_try_compile "$LINENO"
+then :
+  citusac_cv_local_backend_status_pointer=yes
+else case e in #(
+  e) citusac_cv_local_backend_status_pointer=no ;;
+esac
+fi
+rm -f core conftest.err conftest.$ac_objext conftest.beam conftest.$ac_ext ;;
+esac
+fi
+{ printf '%s\n' "$as_me:${as_lineno-$LINENO}: result: $citusac_cv_local_backend_status_pointer" >&5
+printf '%s\n' "$citusac_cv_local_backend_status_pointer" >&6; }
+
+if test x"$citusac_cv_local_backend_status_pointer" = x"yes"; then
+
+printf '%s\n' "#define HAVE_LOCAL_BACKEND_STATUS_POINTER 1" >>confdefs.h
+
+fi
+
 CPPFLAGS=$citusac_save_CPPFLAGS
 CFLAGS=$citusac_save_CFLAGS
 
@@ -6573,4 +6616,5 @@ if test -n "$ac_unrecognized_opts" && test "$enable_option_checking" != no; then
   { printf '%s\n' "$as_me:${as_lineno-$LINENO}: WARNING: unrecognized options: $ac_unrecognized_opts" >&5
 printf '%s\n' "$as_me: WARNING: unrecognized options: $ac_unrecognized_opts" >&2;}
 fi
+
 

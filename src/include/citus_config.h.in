@@ -52,6 +52,9 @@
 /* Define to 1 if you have the 'zstd' library (-lzstd). */
 #undef HAVE_LIBZSTD
 
+/* Define to 1 if LocalPgBackendStatus.backendStatus is a pointer. */
+#undef HAVE_LOCAL_BACKEND_STATUS_POINTER
+
 /* Define to 1 if you have the <memory.h> header file. */
 #undef HAVE_MEMORY_H
 

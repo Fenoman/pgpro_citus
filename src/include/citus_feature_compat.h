@@ -60,6 +60,13 @@
 #endif
 
 
+#ifdef HAVE_LOCAL_BACKEND_STATUS_POINTER
+#define LocalBackendStatusGetEntry(localEntry) ((localEntry)->backendStatus)
+#else
+#define LocalBackendStatusGetEntry(localEntry) (&(localEntry)->backendStatus)
+#endif
+
+
 static inline TransactionId
 HeapTupleGetXminCompat(HeapTuple tuple)
 {

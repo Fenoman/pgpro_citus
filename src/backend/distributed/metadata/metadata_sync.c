@@ -3525,7 +3525,7 @@ SignalMetadataSyncDaemon(Oid database, int sig)
 			continue;
 		}
 
-		PgBackendStatus *beStatus = &localBeEntry->backendStatus;
+		PgBackendStatus *beStatus = LocalBackendStatusGetEntry(localBeEntry);
 		if (beStatus->st_databaseid == database &&
 			strncmp(beStatus->st_appname, METADATA_SYNC_APP_NAME, BGW_MAXLEN) == 0)
 		{

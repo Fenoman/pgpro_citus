@@ -209,6 +209,25 @@ if test x"$citusac_cv_parse_analyze_varparams_param_names" = x"yes"; then
             [Define to 1 if parse_analyze_varparams accepts parameter names.])
 fi
 
+AC_CACHE_CHECK([whether LocalPgBackendStatus points to its backend status],
+               [citusac_cv_local_backend_status_pointer],
+               [AC_COMPILE_IFELSE(
+                  [AC_LANG_PROGRAM([[
+#include "postgres.h"
+#include "utils/backend_status.h"
+                  ]], [[
+LocalPgBackendStatus localEntry = { 0 };
+PgBackendStatus *backendStatus = localEntry.backendStatus;
+(void) backendStatus;
+                  ]])],
+                  [citusac_cv_local_backend_status_pointer=yes],
+                  [citusac_cv_local_backend_status_pointer=no])])
+
+if test x"$citusac_cv_local_backend_status_pointer" = x"yes"; then
+  AC_DEFINE([HAVE_LOCAL_BACKEND_STATUS_POINTER], 1,
+            [Define to 1 if LocalPgBackendStatus.backendStatus is a pointer.])
+fi
+
 CPPFLAGS=$citusac_save_CPPFLAGS
 CFLAGS=$citusac_save_CFLAGS
 
