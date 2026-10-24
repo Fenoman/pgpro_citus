@@ -36,18 +36,12 @@ relation_name      |citus_nodename_for_nodeid|citus_nodeport_for_nodeid|mode
 dist_table         |localhost                |                    57636|AccessExclusiveLock
 dist_table         |localhost                |                    57636|AccessShareLock
 dist_table         |localhost                |                    57637|AccessExclusiveLock
-dist_table         |localhost                |                    57637|AccessShareLock
 dist_table         |localhost                |                    57638|AccessExclusiveLock
-dist_table         |localhost                |                    57638|AccessShareLock
 dist_table_12345000|localhost                |                    57637|AccessExclusiveLock
-dist_table_12345000|localhost                |                    57637|AccessShareLock
 dist_table_12345001|localhost                |                    57638|AccessExclusiveLock
-dist_table_12345001|localhost                |                    57638|AccessShareLock
 dist_table_12345002|localhost                |                    57637|AccessExclusiveLock
-dist_table_12345002|localhost                |                    57637|AccessShareLock
 dist_table_12345003|localhost                |                    57638|AccessExclusiveLock
-dist_table_12345003|localhost                |                    57638|AccessShareLock
-(14 rows)
+(8 rows)
 
 step s1-commit:
  COMMIT;

@@ -21,26 +21,16 @@ ORDER BY 1, 2, 3, 4;
  citus_locks.dist_locked_table      | localhost                 |                     57636 | AccessExclusiveLock | t
  citus_locks.dist_locked_table      | localhost                 |                     57636 | AccessShareLock     | t
  citus_locks.dist_locked_table      | localhost                 |                     57637 | AccessExclusiveLock | t
- citus_locks.dist_locked_table      | localhost                 |                     57637 | AccessShareLock     | t
  citus_locks.dist_locked_table      | localhost                 |                     57638 | AccessExclusiveLock | t
- citus_locks.dist_locked_table      | localhost                 |                     57638 | AccessShareLock     | t
  citus_locks.dist_locked_table_1000 | localhost                 |                     57637 | AccessExclusiveLock | t
- citus_locks.dist_locked_table_1000 | localhost                 |                     57637 | AccessShareLock     | t
  citus_locks.dist_locked_table_1000 | localhost                 |                     57638 | AccessExclusiveLock | t
- citus_locks.dist_locked_table_1000 | localhost                 |                     57638 | AccessShareLock     | t
  citus_locks.dist_locked_table_1001 | localhost                 |                     57637 | AccessExclusiveLock | t
- citus_locks.dist_locked_table_1001 | localhost                 |                     57637 | AccessShareLock     | t
  citus_locks.dist_locked_table_1001 | localhost                 |                     57638 | AccessExclusiveLock | t
- citus_locks.dist_locked_table_1001 | localhost                 |                     57638 | AccessShareLock     | t
  citus_locks.dist_locked_table_1002 | localhost                 |                     57637 | AccessExclusiveLock | t
- citus_locks.dist_locked_table_1002 | localhost                 |                     57637 | AccessShareLock     | t
  citus_locks.dist_locked_table_1002 | localhost                 |                     57638 | AccessExclusiveLock | t
- citus_locks.dist_locked_table_1002 | localhost                 |                     57638 | AccessShareLock     | t
  citus_locks.dist_locked_table_1003 | localhost                 |                     57637 | AccessExclusiveLock | t
- citus_locks.dist_locked_table_1003 | localhost                 |                     57637 | AccessShareLock     | t
  citus_locks.dist_locked_table_1003 | localhost                 |                     57638 | AccessExclusiveLock | t
- citus_locks.dist_locked_table_1003 | localhost                 |                     57638 | AccessShareLock     | t
-(22 rows)
+(12 rows)
 
 ROLLBACK;
 DROP SCHEMA citus_locks CASCADE;
