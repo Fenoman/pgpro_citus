@@ -4042,6 +4042,47 @@ printf '%s\n' "#define HAVE_LOCAL_BACKEND_STATUS_POINTER 1" >>confdefs.h
 
 fi
 
+{ printf '%s\n' "$as_me:${as_lineno-$LINENO}: checking whether enable_self_join_removal is available" >&5
+printf %s "checking whether enable_self_join_removal is available... " >&6; }
+if test ${citusac_cv_have_enable_self_join_removal+y}
+then :
+  printf %s "(cached) " >&6
+else case e in #(
+  e) cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+
+#include "postgres.h"
+#include "optimizer/planmain.h"
+
+int
+main (void)
+{
+
+(void) enable_self_join_removal;
+
+  ;
+  return 0;
+}
+_ACEOF
+if ac_fn_c_try_compile "$LINENO"
+then :
+  citusac_cv_have_enable_self_join_removal=yes
+else case e in #(
+  e) citusac_cv_have_enable_self_join_removal=no ;;
+esac
+fi
+rm -f core conftest.err conftest.$ac_objext conftest.beam conftest.$ac_ext ;;
+esac
+fi
+{ printf '%s\n' "$as_me:${as_lineno-$LINENO}: result: $citusac_cv_have_enable_self_join_removal" >&5
+printf '%s\n' "$citusac_cv_have_enable_self_join_removal" >&6; }
+
+if test x"$citusac_cv_have_enable_self_join_removal" = x"yes"; then
+
+printf '%s\n' "#define HAVE_ENABLE_SELF_JOIN_REMOVAL 1" >>confdefs.h
+
+fi
+
 CPPFLAGS=$citusac_save_CPPFLAGS
 CFLAGS=$citusac_save_CFLAGS
 

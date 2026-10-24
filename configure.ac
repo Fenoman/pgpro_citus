@@ -228,6 +228,23 @@ if test x"$citusac_cv_local_backend_status_pointer" = x"yes"; then
             [Define to 1 if LocalPgBackendStatus.backendStatus is a pointer.])
 fi
 
+AC_CACHE_CHECK([whether enable_self_join_removal is available],
+               [citusac_cv_have_enable_self_join_removal],
+               [AC_COMPILE_IFELSE(
+                  [AC_LANG_PROGRAM([[
+#include "postgres.h"
+#include "optimizer/planmain.h"
+                  ]], [[
+(void) enable_self_join_removal;
+                  ]])],
+                  [citusac_cv_have_enable_self_join_removal=yes],
+                  [citusac_cv_have_enable_self_join_removal=no])])
+
+if test x"$citusac_cv_have_enable_self_join_removal" = x"yes"; then
+  AC_DEFINE([HAVE_ENABLE_SELF_JOIN_REMOVAL], 1,
+            [Define to 1 if the planner has the enable_self_join_removal setting.])
+fi
+
 CPPFLAGS=$citusac_save_CPPFLAGS
 CFLAGS=$citusac_save_CFLAGS
 

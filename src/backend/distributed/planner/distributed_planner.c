@@ -74,6 +74,11 @@
 #include "distributed/worker_shard_visibility.h"
 
 
+/* PG18 self join elimination and the PostgresPro 16 self join removal */
+#if PG_VERSION_NUM >= PG_VERSION_18 || defined(HAVE_ENABLE_SELF_JOIN_REMOVAL)
+#define DISABLE_SELF_JOIN_ELIMINATION
+#endif
+
 static List *plannerRestrictionContextList = NIL;
 int MultiTaskQueryLogLevel = CITUS_LOG_LEVEL_OFF; /* multi-task query log level */
 static uint64 NextPlanId = 1;
@@ -148,7 +153,7 @@ static void ConcatenateRTablesAndPerminfos(PlannedStmt *mainPlan,
 static bool CheckPostPlanDistribution(DistributedPlanningContext *planContext,
 									  bool isDistributedQuery,
 									  List *rangeTableList);
-#if PG_VERSION_NUM >= PG_VERSION_18
+#ifdef DISABLE_SELF_JOIN_ELIMINATION
 static int DisableSelfJoinElimination(void);
 #endif
 
@@ -162,7 +167,7 @@ distributed_planner(Query *parse,
 	bool needsDistributedPlanning = false;
 	bool fastPathRouterQuery = false;
 	FastPathRestrictionContext fastPathContext = { 0 };
-#if PG_VERSION_NUM >= PG_VERSION_18
+#ifdef DISABLE_SELF_JOIN_ELIMINATION
 	int saveNestLevel = -1;
 #endif
 
@@ -229,7 +234,7 @@ distributed_planner(Query *parse,
 			AdjustPartitioningForDistributedPlanning(rangeTableList,
 													 setPartitionedTablesInherited);
 
-#if PG_VERSION_NUM >= PG_VERSION_18
+#ifdef DISABLE_SELF_JOIN_ELIMINATION
 			saveNestLevel = DisableSelfJoinElimination();
 #endif
 		}
@@ -278,12 +283,14 @@ distributed_planner(Query *parse,
 			planContext.plan = standard_planner(planContext.query, NULL,
 												planContext.cursorOptions,
 												planContext.boundParams);
-#if PG_VERSION_NUM >= PG_VERSION_18
+#ifdef DISABLE_SELF_JOIN_ELIMINATION
 			if (needsDistributedPlanning)
 			{
 				Assert(saveNestLevel > 0);
 				AtEOXact_GUC(true, saveNestLevel);
 			}
+#endif
+#if PG_VERSION_NUM >= PG_VERSION_18
 
 			/* Pop the plan context from the current restriction context */
 			planContext.plannerRestrictionContext->planContext = NULL;
@@ -3053,7 +3060,7 @@ CheckPostPlanDistribution(DistributedPlanningContext *planContext, bool
 }
 
 
-#if PG_VERSION_NUM >= PG_VERSION_18
+#ifdef DISABLE_SELF_JOIN_ELIMINATION
 
 /*
  * DisableSelfJoinElimination is used to prevent self join elimination
@@ -3062,14 +3069,25 @@ CheckPostPlanDistribution(DistributedPlanningContext *planContext, bool
  * in a way that can cause problems for queries with a mix of Citus and
  * Postgres tables. Self join elimination is allowed on Postgres tables
  * only so queries involving shards get the benefit of it.
+ *
+ * PostgresPro 16 removes self joins under enable_self_join_removal. The
+ * restriction information then has no required columns for a removed local
+ * table, and recursive planning replaces its columns with NULLs.
  */
 static int
 DisableSelfJoinElimination(void)
 {
 	int NestLevel = NewGUCNestLevel();
+#if PG_VERSION_NUM >= PG_VERSION_18
 	set_config_option("enable_self_join_elimination", "off",
 					  (superuser() ? PGC_SUSET : PGC_USERSET), PGC_S_SESSION,
 					  GUC_ACTION_LOCAL, true, 0, false);
+#endif
+#ifdef HAVE_ENABLE_SELF_JOIN_REMOVAL
+	set_config_option("enable_self_join_removal", "off",
+					  (superuser() ? PGC_SUSET : PGC_USERSET), PGC_S_SESSION,
+					  GUC_ACTION_LOCAL, true, 0, false);
+#endif
 	return NestLevel;
 }
 

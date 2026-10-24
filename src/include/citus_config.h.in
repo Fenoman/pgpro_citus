@@ -34,6 +34,9 @@
 /* Define to 1 to build with lz4 support. (--with-lz4) */
 #undef HAVE_CITUS_LIBLZ4
 
+/* Define to 1 if the planner has the enable_self_join_removal setting. */
+#undef HAVE_ENABLE_SELF_JOIN_REMOVAL
+
 /* Define to 1 if expression_tree_mutator accepts traversal flags. */
 #undef HAVE_EXPRESSION_TREE_MUTATOR_TRAVERSAL_FLAGS
 
