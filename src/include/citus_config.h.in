@@ -31,6 +31,9 @@
 /* A string containing the version number, platform, and C compiler */
 #undef CITUS_VERSION_STR
 
+/* Define to 1 if atx_mark_extension_as_incompatible is available. */
+#undef HAVE_ATX_MARK_EXTENSION_AS_INCOMPATIBLE
+
 /* Define to 1 to build with lz4 support. (--with-lz4) */
 #undef HAVE_CITUS_LIBLZ4
 
@@ -61,8 +64,17 @@
 /* Define to 1 if you have the <memory.h> header file. */
 #undef HAVE_MEMORY_H
 
+/* Define to 1 if relation_nontransactional_truncate accepts drop_buffers. */
+#undef HAVE_NONTRANSACTIONAL_TRUNCATE_DROP_BUFFERS
+
 /* Define to 1 if parse_analyze_varparams accepts parameter names. */
 #undef HAVE_PARSE_ANALYZE_VARPARAMS_PARAM_NAMES
+
+/* Define to 1 if PathNameOpenFilePerm accepts a compressor. */
+#undef HAVE_PATH_NAME_OPEN_FILE_PERM_COMPRESSOR
+
+/* Define to 1 if RelationTruncate accepts drop_buffers. */
+#undef HAVE_RELATION_TRUNCATE_DROP_BUFFERS
 
 /* Define to 1 if you have the <stdint.h> header file. */
 #undef HAVE_STDINT_H
@@ -84,6 +96,12 @@
 
 /* Define to 1 if you have the <unistd.h> header file. */
 #undef HAVE_UNISTD_H
+
+/* Define to 1 if XactEvent has XACT_EVENT_COMMIT_COMMAND. */
+#undef HAVE_XACT_EVENT_COMMIT_COMMAND
+
+/* Define to 1 if XactEvent has XACT_EVENT_START. */
+#undef HAVE_XACT_EVENT_START
 
 /* Define to the address where bug reports for this package should be sent. */
 #undef PACKAGE_BUGREPORT

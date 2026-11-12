@@ -4083,6 +4083,270 @@ printf '%s\n' "#define HAVE_ENABLE_SELF_JOIN_REMOVAL 1" >>confdefs.h
 
 fi
 
+{ printf '%s\n' "$as_me:${as_lineno-$LINENO}: checking whether RelationTruncate accepts drop_buffers" >&5
+printf %s "checking whether RelationTruncate accepts drop_buffers... " >&6; }
+if test ${citusac_cv_relation_truncate_drop_buffers+y}
+then :
+  printf %s "(cached) " >&6
+else case e in #(
+  e) cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+
+#include "postgres.h"
+#include "catalog/storage.h"
+
+int
+main (void)
+{
+
+RelationTruncate(NULL, 0, true);
+
+  ;
+  return 0;
+}
+_ACEOF
+if ac_fn_c_try_compile "$LINENO"
+then :
+  citusac_cv_relation_truncate_drop_buffers=yes
+else case e in #(
+  e) citusac_cv_relation_truncate_drop_buffers=no ;;
+esac
+fi
+rm -f core conftest.err conftest.$ac_objext conftest.beam conftest.$ac_ext ;;
+esac
+fi
+{ printf '%s\n' "$as_me:${as_lineno-$LINENO}: result: $citusac_cv_relation_truncate_drop_buffers" >&5
+printf '%s\n' "$citusac_cv_relation_truncate_drop_buffers" >&6; }
+
+if test x"$citusac_cv_relation_truncate_drop_buffers" = x"yes"; then
+
+printf '%s\n' "#define HAVE_RELATION_TRUNCATE_DROP_BUFFERS 1" >>confdefs.h
+
+fi
+
+{ printf '%s\n' "$as_me:${as_lineno-$LINENO}: checking whether relation_nontransactional_truncate accepts drop_buffers" >&5
+printf %s "checking whether relation_nontransactional_truncate accepts drop_buffers... " >&6; }
+if test ${citusac_cv_nontransactional_truncate_drop_buffers+y}
+then :
+  printf %s "(cached) " >&6
+else case e in #(
+  e) citusac_truncate_save_CFLAGS=$CFLAGS
+                CFLAGS="$CFLAGS -Werror=incompatible-pointer-types"
+                cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+
+#include "postgres.h"
+#include "access/tableam.h"
+
+static void
+nontransactional_truncate_drop_buffers_test(Relation rel, bool drop_buffers)
+{
+}
+
+int
+main (void)
+{
+
+TableAmRoutine routine = {
+	.relation_nontransactional_truncate = nontransactional_truncate_drop_buffers_test
+};
+(void) routine;
+
+  ;
+  return 0;
+}
+_ACEOF
+if ac_fn_c_try_compile "$LINENO"
+then :
+  citusac_cv_nontransactional_truncate_drop_buffers=yes
+else case e in #(
+  e) citusac_cv_nontransactional_truncate_drop_buffers=no ;;
+esac
+fi
+rm -f core conftest.err conftest.$ac_objext conftest.beam conftest.$ac_ext
+                CFLAGS=$citusac_truncate_save_CFLAGS ;;
+esac
+fi
+{ printf '%s\n' "$as_me:${as_lineno-$LINENO}: result: $citusac_cv_nontransactional_truncate_drop_buffers" >&5
+printf '%s\n' "$citusac_cv_nontransactional_truncate_drop_buffers" >&6; }
+
+if test x"$citusac_cv_nontransactional_truncate_drop_buffers" = x"yes"; then
+
+printf '%s\n' "#define HAVE_NONTRANSACTIONAL_TRUNCATE_DROP_BUFFERS 1" >>confdefs.h
+
+fi
+
+{ printf '%s\n' "$as_me:${as_lineno-$LINENO}: checking whether XactEvent has the autonomous transaction event" >&5
+printf %s "checking whether XactEvent has the autonomous transaction event... " >&6; }
+if test ${citusac_cv_xact_event_start+y}
+then :
+  printf %s "(cached) " >&6
+else case e in #(
+  e) cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+
+#include "postgres.h"
+#include "access/xact.h"
+
+int
+main (void)
+{
+
+XactEvent event = XACT_EVENT_START;
+(void) event;
+
+  ;
+  return 0;
+}
+_ACEOF
+if ac_fn_c_try_compile "$LINENO"
+then :
+  citusac_cv_xact_event_start=yes
+else case e in #(
+  e) citusac_cv_xact_event_start=no ;;
+esac
+fi
+rm -f core conftest.err conftest.$ac_objext conftest.beam conftest.$ac_ext ;;
+esac
+fi
+{ printf '%s\n' "$as_me:${as_lineno-$LINENO}: result: $citusac_cv_xact_event_start" >&5
+printf '%s\n' "$citusac_cv_xact_event_start" >&6; }
+
+if test x"$citusac_cv_xact_event_start" = x"yes"; then
+
+printf '%s\n' "#define HAVE_XACT_EVENT_START 1" >>confdefs.h
+
+fi
+
+{ printf '%s\n' "$as_me:${as_lineno-$LINENO}: checking whether XactEvent has the multimaster commit event" >&5
+printf %s "checking whether XactEvent has the multimaster commit event... " >&6; }
+if test ${citusac_cv_xact_event_commit_command+y}
+then :
+  printf %s "(cached) " >&6
+else case e in #(
+  e) cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+
+#include "postgres.h"
+#include "access/xact.h"
+
+int
+main (void)
+{
+
+XactEvent event = XACT_EVENT_COMMIT_COMMAND;
+(void) event;
+
+  ;
+  return 0;
+}
+_ACEOF
+if ac_fn_c_try_compile "$LINENO"
+then :
+  citusac_cv_xact_event_commit_command=yes
+else case e in #(
+  e) citusac_cv_xact_event_commit_command=no ;;
+esac
+fi
+rm -f core conftest.err conftest.$ac_objext conftest.beam conftest.$ac_ext ;;
+esac
+fi
+{ printf '%s\n' "$as_me:${as_lineno-$LINENO}: result: $citusac_cv_xact_event_commit_command" >&5
+printf '%s\n' "$citusac_cv_xact_event_commit_command" >&6; }
+
+if test x"$citusac_cv_xact_event_commit_command" = x"yes"; then
+
+printf '%s\n' "#define HAVE_XACT_EVENT_COMMIT_COMMAND 1" >>confdefs.h
+
+fi
+
+{ printf '%s\n' "$as_me:${as_lineno-$LINENO}: checking whether PathNameOpenFilePerm accepts a compressor" >&5
+printf %s "checking whether PathNameOpenFilePerm accepts a compressor... " >&6; }
+if test ${citusac_cv_path_name_open_file_perm_compressor+y}
+then :
+  printf %s "(cached) " >&6
+else case e in #(
+  e) cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+
+#include "postgres.h"
+#include "storage/fd.h"
+
+int
+main (void)
+{
+
+(void) PathNameOpenFilePerm("", 0, 0, 0);
+
+  ;
+  return 0;
+}
+_ACEOF
+if ac_fn_c_try_compile "$LINENO"
+then :
+  citusac_cv_path_name_open_file_perm_compressor=yes
+else case e in #(
+  e) citusac_cv_path_name_open_file_perm_compressor=no ;;
+esac
+fi
+rm -f core conftest.err conftest.$ac_objext conftest.beam conftest.$ac_ext ;;
+esac
+fi
+{ printf '%s\n' "$as_me:${as_lineno-$LINENO}: result: $citusac_cv_path_name_open_file_perm_compressor" >&5
+printf '%s\n' "$citusac_cv_path_name_open_file_perm_compressor" >&6; }
+
+if test x"$citusac_cv_path_name_open_file_perm_compressor" = x"yes"; then
+
+printf '%s\n' "#define HAVE_PATH_NAME_OPEN_FILE_PERM_COMPRESSOR 1" >>confdefs.h
+
+fi
+
+{ printf '%s\n' "$as_me:${as_lineno-$LINENO}: checking whether atx_mark_extension_as_incompatible is available" >&5
+printf %s "checking whether atx_mark_extension_as_incompatible is available... " >&6; }
+if test ${citusac_cv_have_atx_mark_extension_as_incompatible+y}
+then :
+  printf %s "(cached) " >&6
+else case e in #(
+  e) citusac_atx_save_CFLAGS=$CFLAGS
+                CFLAGS="$CFLAGS -Werror=implicit-function-declaration"
+                cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+
+#include "postgres.h"
+#include "miscadmin.h"
+
+int
+main (void)
+{
+
+atx_mark_extension_as_incompatible("citus_columnar");
+
+  ;
+  return 0;
+}
+_ACEOF
+if ac_fn_c_try_compile "$LINENO"
+then :
+  citusac_cv_have_atx_mark_extension_as_incompatible=yes
+else case e in #(
+  e) citusac_cv_have_atx_mark_extension_as_incompatible=no ;;
+esac
+fi
+rm -f core conftest.err conftest.$ac_objext conftest.beam conftest.$ac_ext
+                CFLAGS=$citusac_atx_save_CFLAGS ;;
+esac
+fi
+{ printf '%s\n' "$as_me:${as_lineno-$LINENO}: result: $citusac_cv_have_atx_mark_extension_as_incompatible" >&5
+printf '%s\n' "$citusac_cv_have_atx_mark_extension_as_incompatible" >&6; }
+
+if test x"$citusac_cv_have_atx_mark_extension_as_incompatible" = x"yes"; then
+
+printf '%s\n' "#define HAVE_ATX_MARK_EXTENSION_AS_INCOMPATIBLE 1" >>confdefs.h
+
+elif test x"$citusac_cv_xact_event_start" = x"yes"; then
+  as_fn_error $? "the server has autonomous transactions, but atx_mark_extension_as_incompatible is missing: citus and citus_columnar cannot refuse them" "$LINENO" 5
+fi
+
 CPPFLAGS=$citusac_save_CPPFLAGS
 CFLAGS=$citusac_save_CFLAGS
 

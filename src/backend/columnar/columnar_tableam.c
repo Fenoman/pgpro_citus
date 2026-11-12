@@ -887,8 +887,13 @@ columnar_relation_set_new_filelocator(Relation rel,
 }
 
 
+#ifdef HAVE_NONTRANSACTIONAL_TRUNCATE_DROP_BUFFERS
+static void
+columnar_relation_nontransactional_truncate(Relation rel, bool dropBuffers)
+#else
 static void
 columnar_relation_nontransactional_truncate(Relation rel)
+#endif
 {
 	CheckCitusColumnarVersion(ERROR);
 	RelFileLocator relfilelocator = rel->rd_locator;
@@ -904,8 +909,14 @@ columnar_relation_nontransactional_truncate(Relation rel)
 	 * can just truncate the relation.
 	 *
 	 * This is similar to what is done in heapam_relation_nontransactional_truncate.
+	 *
+	 * The local buffers of a temporary table are dropped whatever dropBuffers
+	 * says, even when the caller has dropped them already: DeleteMetadataRows
+	 * above reads the metapage back into a local buffer, and
+	 * ColumnarStorageInit below writes the new metapage through smgr, past
+	 * that buffer.
 	 */
-	RelationTruncate(rel, 0);
+	RelationTruncateCompat(rel, 0, true);
 
 	uint64 storageId = ColumnarMetadataNewStorageId();
 	ColumnarStorageInit(RelationGetSmgr(rel), storageId);
@@ -1960,6 +1971,24 @@ ColumnarXactCallback(XactEvent event, void *arg)
 			FlushWriteStateForAllRels(GetCurrentSubTransactionId(), 0);
 			break;
 		}
+
+#if defined(HAVE_XACT_EVENT_START) || defined(HAVE_XACT_EVENT_COMMIT_COMMAND)
+
+		/*
+		 * RegisterXactCallback does not deliver the autonomous transaction and
+		 * multimaster events of PostgresPro Enterprise, the cases only keep the
+		 * switch exhaustive.
+		 */
+#ifdef HAVE_XACT_EVENT_START
+		case XACT_EVENT_START:
+#endif
+#ifdef HAVE_XACT_EVENT_COMMIT_COMMAND
+		case XACT_EVENT_COMMIT_COMMAND:
+#endif
+		{
+			break;
+		}
+#endif
 	}
 }
 
@@ -1997,6 +2026,17 @@ columnar_tableam_init()
 {
 	RegisterXactCallback(ColumnarXactCallback, NULL);
 	RegisterSubXactCallback(ColumnarSubXactCallback, NULL);
+
+#ifdef HAVE_ATX_MARK_EXTENSION_AS_INCOMPATIBLE
+
+	/*
+	 * An autonomous transaction of PostgresPro Enterprise runs in the backend
+	 * of the transaction it suspends and shares its columnar write state:
+	 * rolling the autonomous transaction back discards the pending writes of
+	 * the outer one. With the mark the server refuses autonomous transactions.
+	 */
+	atx_mark_extension_as_incompatible("citus_columnar");
+#endif
 
 	PrevObjectAccessHook = object_access_hook;
 	object_access_hook = ColumnarTableAMObjectAccessHook;

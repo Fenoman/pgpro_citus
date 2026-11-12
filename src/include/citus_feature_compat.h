@@ -67,6 +67,26 @@
 #endif
 
 
+/* compressor 0 opens the file without compression, as PathNameOpenFile does */
+#ifdef HAVE_PATH_NAME_OPEN_FILE_PERM_COMPRESSOR
+#define PathNameOpenFilePermCompat(fileName, fileFlags, fileMode) \
+	PathNameOpenFilePerm((fileName), (fileFlags), (fileMode), 0)
+#else
+#define PathNameOpenFilePermCompat(fileName, fileFlags, fileMode) \
+	PathNameOpenFilePerm((fileName), (fileFlags), (fileMode))
+#endif
+
+
+/* RelationTruncate without drop_buffers always drops the local buffers */
+#ifdef HAVE_RELATION_TRUNCATE_DROP_BUFFERS
+#define RelationTruncateCompat(rel, nblocks, dropBuffers) \
+	RelationTruncate((rel), (nblocks), (dropBuffers))
+#else
+#define RelationTruncateCompat(rel, nblocks, dropBuffers) \
+	((void) (dropBuffers), RelationTruncate((rel), (nblocks)))
+#endif
+
+
 static inline TransactionId
 HeapTupleGetXminCompat(HeapTuple tuple)
 {

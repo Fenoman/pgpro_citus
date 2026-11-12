@@ -245,6 +245,126 @@ if test x"$citusac_cv_have_enable_self_join_removal" = x"yes"; then
             [Define to 1 if the planner has the enable_self_join_removal setting.])
 fi
 
+AC_CACHE_CHECK([whether RelationTruncate accepts drop_buffers],
+               [citusac_cv_relation_truncate_drop_buffers],
+               [AC_COMPILE_IFELSE(
+                  [AC_LANG_PROGRAM([[
+#include "postgres.h"
+#include "catalog/storage.h"
+                  ]], [[
+RelationTruncate(NULL, 0, true);
+                  ]])],
+                  [citusac_cv_relation_truncate_drop_buffers=yes],
+                  [citusac_cv_relation_truncate_drop_buffers=no])])
+
+if test x"$citusac_cv_relation_truncate_drop_buffers" = x"yes"; then
+  AC_DEFINE([HAVE_RELATION_TRUNCATE_DROP_BUFFERS], 1,
+            [Define to 1 if RelationTruncate accepts drop_buffers.])
+fi
+
+AC_CACHE_CHECK([whether relation_nontransactional_truncate accepts drop_buffers],
+               [citusac_cv_nontransactional_truncate_drop_buffers],
+               [citusac_truncate_save_CFLAGS=$CFLAGS
+                CFLAGS="$CFLAGS -Werror=incompatible-pointer-types"
+                AC_COMPILE_IFELSE(
+                  [AC_LANG_PROGRAM([[
+#include "postgres.h"
+#include "access/tableam.h"
+
+static void
+nontransactional_truncate_drop_buffers_test(Relation rel, bool drop_buffers)
+{
+}
+                  ]], [[
+TableAmRoutine routine = {
+	.relation_nontransactional_truncate = nontransactional_truncate_drop_buffers_test
+};
+(void) routine;
+                  ]])],
+                  [citusac_cv_nontransactional_truncate_drop_buffers=yes],
+                  [citusac_cv_nontransactional_truncate_drop_buffers=no])
+                CFLAGS=$citusac_truncate_save_CFLAGS])
+
+if test x"$citusac_cv_nontransactional_truncate_drop_buffers" = x"yes"; then
+  AC_DEFINE([HAVE_NONTRANSACTIONAL_TRUNCATE_DROP_BUFFERS], 1,
+            [Define to 1 if relation_nontransactional_truncate accepts drop_buffers.])
+fi
+
+AC_CACHE_CHECK([whether XactEvent has the autonomous transaction event],
+               [citusac_cv_xact_event_start],
+               [AC_COMPILE_IFELSE(
+                  [AC_LANG_PROGRAM([[
+#include "postgres.h"
+#include "access/xact.h"
+                  ]], [[
+XactEvent event = XACT_EVENT_START;
+(void) event;
+                  ]])],
+                  [citusac_cv_xact_event_start=yes],
+                  [citusac_cv_xact_event_start=no])])
+
+if test x"$citusac_cv_xact_event_start" = x"yes"; then
+  AC_DEFINE([HAVE_XACT_EVENT_START], 1,
+            [Define to 1 if XactEvent has XACT_EVENT_START.])
+fi
+
+AC_CACHE_CHECK([whether XactEvent has the multimaster commit event],
+               [citusac_cv_xact_event_commit_command],
+               [AC_COMPILE_IFELSE(
+                  [AC_LANG_PROGRAM([[
+#include "postgres.h"
+#include "access/xact.h"
+                  ]], [[
+XactEvent event = XACT_EVENT_COMMIT_COMMAND;
+(void) event;
+                  ]])],
+                  [citusac_cv_xact_event_commit_command=yes],
+                  [citusac_cv_xact_event_commit_command=no])])
+
+if test x"$citusac_cv_xact_event_commit_command" = x"yes"; then
+  AC_DEFINE([HAVE_XACT_EVENT_COMMIT_COMMAND], 1,
+            [Define to 1 if XactEvent has XACT_EVENT_COMMIT_COMMAND.])
+fi
+
+AC_CACHE_CHECK([whether PathNameOpenFilePerm accepts a compressor],
+               [citusac_cv_path_name_open_file_perm_compressor],
+               [AC_COMPILE_IFELSE(
+                  [AC_LANG_PROGRAM([[
+#include "postgres.h"
+#include "storage/fd.h"
+                  ]], [[
+(void) PathNameOpenFilePerm("", 0, 0, 0);
+                  ]])],
+                  [citusac_cv_path_name_open_file_perm_compressor=yes],
+                  [citusac_cv_path_name_open_file_perm_compressor=no])])
+
+if test x"$citusac_cv_path_name_open_file_perm_compressor" = x"yes"; then
+  AC_DEFINE([HAVE_PATH_NAME_OPEN_FILE_PERM_COMPRESSOR], 1,
+            [Define to 1 if PathNameOpenFilePerm accepts a compressor.])
+fi
+
+AC_CACHE_CHECK([whether atx_mark_extension_as_incompatible is available],
+               [citusac_cv_have_atx_mark_extension_as_incompatible],
+               [citusac_atx_save_CFLAGS=$CFLAGS
+                CFLAGS="$CFLAGS -Werror=implicit-function-declaration"
+                AC_COMPILE_IFELSE(
+                  [AC_LANG_PROGRAM([[
+#include "postgres.h"
+#include "miscadmin.h"
+                  ]], [[
+atx_mark_extension_as_incompatible("citus_columnar");
+                  ]])],
+                  [citusac_cv_have_atx_mark_extension_as_incompatible=yes],
+                  [citusac_cv_have_atx_mark_extension_as_incompatible=no])
+                CFLAGS=$citusac_atx_save_CFLAGS])
+
+if test x"$citusac_cv_have_atx_mark_extension_as_incompatible" = x"yes"; then
+  AC_DEFINE([HAVE_ATX_MARK_EXTENSION_AS_INCOMPATIBLE], 1,
+            [Define to 1 if atx_mark_extension_as_incompatible is available.])
+elif test x"$citusac_cv_xact_event_start" = x"yes"; then
+  AC_MSG_ERROR([the server has autonomous transactions, but atx_mark_extension_as_incompatible is missing: citus and citus_columnar cannot refuse them])
+fi
+
 CPPFLAGS=$citusac_save_CPPFLAGS
 CFLAGS=$citusac_save_CFLAGS
 

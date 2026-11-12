@@ -166,7 +166,7 @@ FileOpenForTransmitPerm(const char *filename, int fileFlags, int fileMode)
 		}
 	}
 
-	File fileDesc = PathNameOpenFilePerm((char *) filename, fileFlags, fileMode);
+	File fileDesc = PathNameOpenFilePermCompat((char *) filename, fileFlags, fileMode);
 	if (fileDesc < 0)
 	{
 		ereport(ERROR, (errcode_for_file_access(),

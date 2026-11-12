@@ -57,6 +57,15 @@ Benefits of Citus Columnar over cstore_fdw:
 * No support for intra-node parallel scans
 * No support for ``AFTER ... FOR EACH ROW`` triggers
 * No `UNLOGGED` columnar tables
+* No autonomous transactions on PostgresPro Enterprise, since an
+  autonomous transaction shares the columnar write state of the
+  transaction it suspends. With ``citus_columnar`` (or ``citus``) in
+  ``shared_preload_libraries`` the server refuses autonomous
+  transactions, ``BEGIN AUTONOMOUS`` and autonomous blocks of PL/pgSQL
+  alike, in every database of the cluster. A backend that loads
+  ``citus_columnar`` on demand refuses them from that point on. The
+  error names the extension that marked itself last, ``citus``,
+  ``citus_columnar`` or another one such as ``timescaledb``
 
 Future iterations will incrementally lift the limitations listed above.
 

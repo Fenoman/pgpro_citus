@@ -116,6 +116,7 @@
 #include "distributed/transaction_management.h"
 #include "distributed/transaction_recovery.h"
 #include "distributed/utils/directory.h"
+#include "distributed/version_compat.h"
 #include "distributed/worker_log_messages.h"
 #include "distributed/worker_manager.h"
 #include "distributed/worker_protocol.h"
@@ -565,6 +566,18 @@ _PG_init(void)
 
 	/* ensure columnar module is loaded at the right time */
 	load_file(COLUMNAR_MODULE_NAME, false);
+
+#ifdef HAVE_ATX_MARK_EXTENSION_AS_INCOMPATIBLE
+
+	/*
+	 * The coordinated transaction state of citus lives in backend globals too,
+	 * so citus refuses autonomous transactions of PostgresPro Enterprise on its
+	 * own rather than through the mark of citus_columnar. The server keeps one
+	 * mark, the last one names the extension in the error, so it goes after
+	 * load_file above.
+	 */
+	atx_mark_extension_as_incompatible("citus");
+#endif
 
 	/*
 	 * Register utility hook. This must be done after loading columnar, so

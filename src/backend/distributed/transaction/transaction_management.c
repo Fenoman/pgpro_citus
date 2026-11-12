@@ -597,6 +597,24 @@ CoordinatedTransactionCallback(XactEvent event, void *arg)
 			EnsurePrepareTransactionIsAllowed();
 			break;
 		}
+
+#if defined(HAVE_XACT_EVENT_START) || defined(HAVE_XACT_EVENT_COMMIT_COMMAND)
+
+		/*
+		 * RegisterXactCallback does not deliver the autonomous transaction and
+		 * multimaster events of PostgresPro Enterprise, the cases only keep the
+		 * switch exhaustive.
+		 */
+#ifdef HAVE_XACT_EVENT_START
+		case XACT_EVENT_START:
+#endif
+#ifdef HAVE_XACT_EVENT_COMMIT_COMMAND
+		case XACT_EVENT_COMMIT_COMMAND:
+#endif
+		{
+			break;
+		}
+#endif
 	}
 }
 

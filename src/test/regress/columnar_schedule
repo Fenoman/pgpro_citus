@@ -31,6 +31,8 @@ test: columnar_trigger
 test: columnar_tableoptions
 test: columnar_heap_hooks
 test: columnar_partitioned_am
+test: columnar_temp_truncate
+test: columnar_autonomous
 test: columnar_recursive
 test: columnar_transactions
 test: columnar_matview

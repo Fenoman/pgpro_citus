@@ -48,6 +48,7 @@
 
 #include "columnar/columnar.h"
 #include "columnar/columnar_storage.h"
+#include "columnar/columnar_version_compat.h"
 
 
 /*
@@ -587,11 +588,12 @@ ColumnarStorageTruncate(Relation rel, uint64 newDataReservation)
 
 	/*
 	 * Truncate the storage. Note that RelationTruncate() takes care of
-	 * Write Ahead Logging.
+	 * Write Ahead Logging. Like VACUUM of heap, the truncate drops the local
+	 * buffers of a temporary table.
 	 */
 	if (new_rel_pages < old_rel_pages)
 	{
-		RelationTruncate(rel, new_rel_pages);
+		RelationTruncateCompat(rel, new_rel_pages, true);
 		return true;
 	}
 

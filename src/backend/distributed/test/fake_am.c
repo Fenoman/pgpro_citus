@@ -35,6 +35,8 @@
 #include "pg_version_compat.h"
 #include "pg_version_constants.h"
 
+#include "distributed/version_compat.h"
+
 PG_FUNCTION_INFO_V1(fake_am_handler);
 
 static const TableAmRoutine fake_methods;
@@ -335,8 +337,13 @@ fake_relation_set_new_filenode(Relation rel,
 }
 
 
+#ifdef HAVE_NONTRANSACTIONAL_TRUNCATE_DROP_BUFFERS
+static void
+fake_relation_nontransactional_truncate(Relation rel, bool dropBuffers)
+#else
 static void
 fake_relation_nontransactional_truncate(Relation rel)
+#endif
 {
 	elog(ERROR, "fake_relation_nontransactional_truncate not implemented");
 }
